@@ -1054,7 +1054,7 @@ def test_scan_budget_splits_new_first_then_known_due(tmp_path):
         for uid in range(1000, 1060):
             conn.execute(
                 "INSERT INTO game_analytics (universe_id, tier, ccu, visits) "
-                "VALUES (?, 1, 30, 30_000)",
+                "VALUES (?, 1, 30, 30000)",
                 (uid,),
             )
     scout_core.HYDRATION_BUDGET_PER_SYNC = 1  # ceiling: 50 games (1 batch)
