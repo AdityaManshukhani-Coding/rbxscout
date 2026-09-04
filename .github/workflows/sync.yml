@@ -1,0 +1,72 @@
+# RbxScout 24/7 sync bot
+#
+# Runs the full pipeline (game finder + tiered hydrator) on GitHub's
+# computers every 3 hours, then commits the updated SQLite catalog back
+# to this repo — the repo itself is the persistent database, so state
+# carries across runs even though the runner's disk is wiped each time.
+#
+# - Manual runs: Actions tab -> "Scheduled sync" -> "Run workflow"
+# - Every run's green/red summary is visible in the run's log output
+# - Public repo => unlimited free Actions minutes
+# - 30-min cadence: fresh runner IP per run => fresh Roblox rate-limit
+#   window each sync; the repo-as-database pattern commits the DB every
+#   run, so squash history occasionally (see README) to keep clones light
+
+name: Scheduled sync
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # every 30 minutes, UTC
+  workflow_dispatch:          # manual "Run workflow" button
+
+permissions:
+  contents: write             # the workflow may push the updated DB
+
+concurrency:
+  group: rbxscout-sync
+  cancel-in-progress: false   # never kill a sync mid-flight
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30       # pacer can stretch on 429s; 30 min is generous
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14 (matches the tested local env)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run test suite (protects the catalog from bad pushes)
+        run: python -m pytest tests -q
+
+      - name: Run live sync (finder + hydrator)
+        run: python live_sync.py --min-visits 20000 --min-ccu 25
+
+      # SQLite runs in WAL mode: fold the write-ahead log into the main
+      # .db file so the commit captures ALL new data, not just the last
+      # checkpoint.
+      - name: Checkpoint SQLite WAL
+        if: always()
+        run: python -c "import sqlite3; c = sqlite3.connect('rbx_scout.db'); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.close()"
+
+      - name: Commit updated catalog
+        if: always()
+        run: |
+          git config user.name  "rbxscout-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add rbx_scout.db rbx_scout.db.sync_state
+          if git diff --cached --quiet; then
+            echo "No catalog changes to commit."
+          else
+            git commit -m "sync: catalog update (scheduled)"
+          fi
+          git pull --rebase origin "$GITHUB_REF_NAME"
+          git push

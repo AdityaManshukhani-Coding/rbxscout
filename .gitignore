@@ -1,0 +1,34 @@
+# --- local environment ---
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+
+# --- editor / tooling noise ---
+.idea/
+.vscode/
+*.swp
+.freebuff/
+
+# --- streamlit local secrets (never commit real secrets) ---
+.streamlit/secrets.toml
+
+# --- dev scratch ---
+*.log
+/tmp/
+
+# --- sqlite WAL sidecars (folded into the .db by checkpointing) ---
+*.db-wal
+*.db-shm
+
+# --- private notes & local screenshots (delete these lines to publish) ---
+GAMES_DB_PLAN.md
+implementation_plan.md
+FIXES.md
+assets/
+
+# NOTE: rbx_scout.db and rbx_scout.db.sync_state are NOT ignored —
+# they are committed by the GitHub Actions sync (the repo is the
+# persistent database for the 24/7 bot).
