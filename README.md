@@ -63,6 +63,45 @@ Rate limiting is handled by an adaptive token-bucket pacer (stretches on 429,
 decays on 200) with `Retry-After` backoff; hydration respects Roblox's
 per-window quota and rolls overflow to the next sync.
 
+## Keyword-crawler IP pool (Cloudflare Worker proxy)
+
+GitHub Actions runners share a small egress IP range, so the omni-search
+endpoint throttles every sync to 429s. The keyword crawler therefore routes
+each request through a **fallback IP pool**: your own Cloudflare Worker
+mirror(s) first — Cloudflare's IPs, not GitHub's — and direct Roblox always
+last, so a dead proxy can never take the crawler down. A proxy that fails 3
+consecutive keywords is benched for 5 minutes. The same escape-hatch pattern
+already shields place resolution via the RoProxy mirror.
+
+The Worker lives in [`cloudflare-worker/`](cloudflare-worker/) and mirrors
+only the public, cookieless omni-search GET route (no cookies are ever
+forwarded, only exact-path GETs are proxied, and a per-IP rate limit stops
+it being abused as an open proxy).
+
+### One-time setup
+
+1. Install wrangler and deploy the worker:
+   ```bash
+   cd cloudflare-worker
+   npm install
+   npx wrangler login
+   npx wrangler deploy
+   ```
+   Note the printed URL, e.g. `https://rbx-search-proxy.<you>.workers.dev`.
+2. Smoke-test it (should return Roblox JSON):
+   ```bash
+   curl -s "https://rbx-search-proxy.<you>.workers.dev/search-api/omni-search?searchQuery=obby&pageType=all&sessionId=test" | head -c 300
+   ```
+3. In the GitHub repo: **Settings → Secrets and variables → Actions →
+   Variables → New repository variable**, name
+   `RBXSCOUT_SEARCH_PROXY_URLS`, value = the worker URL (multiple URLs,
+   comma-separated, for multiple workers/accounts).
+4. The workflow already forwards the variable to the scout. Next sync's
+   log prints the active pool, e.g.
+   `search IP pool    : rbx-search-proxy.<you>.workers.dev -> direct`.
+
+No setup? The crawler simply runs direct-only, exactly as before.
+
 ## Dashboard
 
 `streamlit run app.py` gives you the full dashboard: filterable catalog,

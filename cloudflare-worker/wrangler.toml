@@ -1,0 +1,8 @@
+name = "rbx-search-proxy"
+main = "src/index.js"
+compatibility_date = "2026-08-15"
+
+# No secrets needed: the mirrored endpoint is public and cookieless.
+
+# Optional: pin a custom route after adding your zone to the account, e.g.
+# routes = [{ pattern = "rbx-proxy.example.com", custom_domain = true }]

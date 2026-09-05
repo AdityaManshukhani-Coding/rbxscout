@@ -19,6 +19,10 @@ __pycache__/
 *.log
 /tmp/
 
+# --- cloudflare worker (tooling only; source + wrangler.toml stay committed) ---
+cloudflare-worker/node_modules/
+cloudflare-worker/.wrangler/
+
 # --- sqlite WAL sidecars (folded into the .db by checkpointing) ---
 *.db-wal
 *.db-shm

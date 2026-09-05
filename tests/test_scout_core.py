@@ -2,6 +2,7 @@ import re
 import sqlite3
 import threading
 import time
+from unittest import mock
 
 import pandas as pd
 import pytest
@@ -1090,3 +1091,207 @@ def test_sync_counter_persists_across_restarts(tmp_path):
     assert second.bump_sync_sequence() == 3
 
 
+# ---------------------------------------------------------------------------
+# Search-proxy IP pool (keyword crawler fallback)
+# ---------------------------------------------------------------------------
+
+
+OMNI_BODY = {"searchResults": [{"contents": [{"universeId": 42, "name": "G", "rootPlaceId": 7}]}]}
+
+
+def _set_proxy_env(monkeypatch, value):
+    monkeypatch.setenv("RBXSCOUT_SEARCH_PROXY_URLS", value)
+
+
+class SearchPoolScout(RobloxPlatformScout):
+    """Scout with canned responses for the search-proxy pool, keyed by leg."""
+
+    def __init__(self, behavior, db_path=":memory:"):
+        self.db_path = db_path
+        self.max_workers = 2
+        self.request_timeout = 1
+        self.session = mock.MagicMock()
+        self.has_cookie = False
+        self.behavior = behavior
+        self.calls = []
+        self._emit_pace = lambda: None
+        self._emit_ok = lambda: None
+        self._emit_throttled = lambda: None
+
+    def _get_json(self, url, retries=1):
+        """Direct-Roblox leg: dispatched by behavior["direct"]."""
+        self.calls.append(url)
+        handler = self.behavior.get("direct", lambda url: (200, OMNI_BODY))
+        return handler(url)
+
+    def _fake_response(self, url):
+        handler = self.behavior.get("proxy", lambda url: (200, OMNI_BODY))
+        status, body = handler(url)
+        response = mock.MagicMock()
+        response.status_code = status
+        if isinstance(body, Exception):
+            response.json.side_effect = body
+        else:
+            response.json.return_value = body
+        return response
+
+    def _search_pool_request(self, keyword):
+        """Run the production pool walk with the session GET mocked out."""
+        scout = self
+
+        def session_get(url, timeout=None):
+            scout.calls.append(url)
+            return scout._fake_response(url)
+
+        with mock.patch.object(self.session, "get", side_effect=session_get):
+            return RobloxPlatformScout._search_pool_request(self, keyword)
+
+
+def test_search_pool_builds_direct_url_for_keywords():
+    s = SearchPoolScout({})
+    url = s._search_request_url("direct", "steal a", "SID")
+    assert url == (
+        "https://apis.roblox.com/search-api/omni-search"
+        "?searchQuery=steal%20a&pageType=all&sessionId=SID"
+    )
+
+
+def test_search_pool_builds_proxy_url_for_keywords():
+    s = SearchPoolScout({})
+    url = s._search_request_url("https://rbx-search.example.workers.dev", "steal a", "SID")
+    assert url == (
+        "https://rbx-search.example.workers.dev/search-api/omni-search"
+        "?searchQuery=steal%20a&pageType=all&sessionId=SID"
+    )
+
+
+def test_search_pool_env_parsing_and_malformed_entries(monkeypatch):
+    _set_proxy_env(monkeypatch, "https://a.workers.dev ,;; not-a-url\nhttps://b.workers.dev/")
+    s = SearchPoolScout({})
+    pool = s._search_proxy_urls()
+    assert pool == ["https://a.workers.dev", "https://b.workers.dev", "direct"]
+
+
+def test_search_pool_empty_env_falls_back_to_direct_only(monkeypatch):
+    _set_proxy_env(monkeypatch, "")
+    s = SearchPoolScout({"direct": lambda url: (200, OMNI_BODY)})
+    out = s.fetch_search_games(["obby"])
+    assert out == {42: {"universe_id": 42, "title": "G", "root_place_id": 7}}
+    diag = s.source_diagnostics["keyword_crawl"]
+    assert diag["successful_keywords"] == 1
+    assert diag["pool"] == ["direct"]
+    assert diag["breaker_tripped"] is False
+
+
+def test_search_pool_proxy_used_before_direct(monkeypatch):
+    """With a proxy configured, direct Roblox must not be touched on success."""
+    _set_proxy_env(monkeypatch, "https://proxy-a.workers.dev")
+    s = SearchPoolScout({"direct": lambda url: pytest.fail("direct must not be called")})
+    status, data = s._search_pool_request("obby")
+    assert status == 200 and data == OMNI_BODY
+    assert len(s.calls) == 1
+    assert s.calls[0].startswith("https://proxy-a.workers.dev/search-api/omni-search")
+    assert "searchQuery=obby" in s.calls[0]
+
+
+def test_search_pool_falls_back_when_proxy_500s(monkeypatch):
+    """A 5xx proxy must be skipped and the direct leg must still serve the keyword."""
+    _set_proxy_env(monkeypatch, "https://proxy-a.workers.dev")
+    s = SearchPoolScout({
+        "proxy": lambda url: (503, None),
+        "direct": lambda url: (200, OMNI_BODY),
+    })
+    status, data = s._search_pool_request("obby")
+    assert status == 200 and data == OMNI_BODY
+    # proxy attempted (and 503'd) then direct succeeded
+    assert sum("proxy-a.workers.dev" in u for u in s.calls) == 1
+    assert any("apis.roblox.com/search-api/omni-search" in u for u in s.calls)
+
+
+def test_search_pool_bad_json_200_is_a_proxy_failure(monkeypatch):
+    """A 200 with a non-JSON body from a proxy must not be served as a result."""
+    _set_proxy_env(monkeypatch, "https://proxy-a.workers.dev")
+    s = SearchPoolScout({
+        "proxy": lambda url: (200, ValueError("bad json")),
+        "direct": lambda url: (200, OMNI_BODY),
+    })
+    status, data = s._search_pool_request("obby")
+    assert status == 200 and data == OMNI_BODY
+
+
+def test_search_pool_403_falls_through_to_direct(monkeypatch):
+    """A proxy 403 fails that proxy only; the direct leg is still attempted."""
+    _set_proxy_env(monkeypatch, "https://proxy-a.workers.dev")
+    s = SearchPoolScout({
+        "proxy": lambda url: (403, None),
+        "direct": lambda url: (200, OMNI_BODY),
+    })
+    status, data = s._search_pool_request("obby")
+    assert status == 200 and data == OMNI_BODY
+
+
+def test_search_pool_all_proxies_down_direct_still_tries(monkeypatch):
+    """Every proxy failing must not take the crawler down: direct serves the keyword."""
+    _set_proxy_env(monkeypatch, "https://proxy-a.workers.dev, https://proxy-b.workers.dev")
+    s = SearchPoolScout({
+        "proxy": lambda url: (500, None),
+        "direct": lambda url: (200, OMNI_BODY),
+    })
+    status, data = s._search_pool_request("obby")
+    assert status == 200 and data == OMNI_BODY
+    diag = s._search_pool_snapshot()
+    assert diag["pool"] == [
+        "https://proxy-a.workers.dev",
+        "https://proxy-b.workers.dev",
+        "direct",
+    ]
+
+
+def test_search_pool_degrades_after_repeated_failures(monkeypatch):
+    """3 consecutive proxy failures bench it for 5 minutes (skipped next keyword)."""
+    _set_proxy_env(monkeypatch, "https://proxy-a.workers.dev")
+    s = SearchPoolScout({
+        "proxy": lambda url: (500, None),
+        "direct": lambda url: (200, OMNI_BODY),
+    })
+    for _ in range(3):
+        s._search_pool_request("obby")
+    assert s._search_pool_benched("https://proxy-a.workers.dev") is True
+    s.calls.clear()
+    s._search_pool_request("obby")
+    assert len(s.calls) == 1  # direct only -- benched proxy skipped
+    assert s.calls[0].startswith("https://apis.roblox.com/")
+
+
+def test_search_pool_breaker_uses_fallback_pool(monkeypatch):
+    """The keyword crawler must survive a hard-failing proxy and still parse results."""
+    _set_proxy_env(monkeypatch, "https://proxy-a.workers.dev")
+    s = SearchPoolScout({
+        "proxy": lambda url: (503, None),
+        "direct": lambda url: (200, OMNI_BODY),
+    })
+    out = s.fetch_search_games(["obby", "tycoon", "simulator"])
+    assert 42 in out
+    diag = s.source_diagnostics["keyword_crawl"]
+    assert diag["breaker_tripped"] is False
+    assert diag["successful_keywords"] == 3
+    assert diag["pool"][0] == "https://proxy-a.workers.dev"
+    assert diag["pool"][-1] == "direct"
+
+
+def test_search_pool_breaker_trips_when_everything_fails(monkeypatch):
+    """Proxy + direct both hard-down -> breaker trips after 5 consecutive failures."""
+    _set_proxy_env(monkeypatch, "https://proxy-a.workers.dev")
+    s = SearchPoolScout({
+        "proxy": lambda url: (500, None),
+        "direct": lambda url: (429, None),
+    })
+    out = s.fetch_search_games([f"kw{i}" for i in range(8)])
+    assert out == {}
+    diag = s.source_diagnostics["keyword_crawl"]
+    assert diag["breaker_tripped"] is True
+    assert diag["successful_keywords"] == 0
+    # The breaker counts completed results only: 5 failures recorded, the
+    # remaining futures were cancelled and never entered the tally.
+    assert diag["failed_keywords"] == 5
+    assert diag["keywords"] == 8

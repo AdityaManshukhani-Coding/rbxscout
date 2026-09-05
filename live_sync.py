@@ -106,6 +106,16 @@ def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float) -> int:
     kw = diag.get("keyword_crawl") or {}
     print(f"keyword crawler   : {kw.get('successful', kw.get('successful_keywords', 0))}/"
           f"{kw.get('keywords', 0)} OK · breaker: {kw.get('breaker_tripped', False)}")
+    pool = kw.get("pool") or []
+    if pool:
+        benched = kw.get("benched") or []
+        pool_desc = " -> ".join(
+            "direct" if entry == "direct" else entry.split("//")[-1].split("/")[0]
+            for entry in pool
+        )
+        if benched:
+            pool_desc += f"  (benched: {', '.join(benched)})"
+        print(f"search IP pool    : {pool_desc}")
     disc = diag.get("discovery") or {}
     print(f"discovery         : HTTP {disc.get('status', '?')} · {disc.get('records', 0)} games")
 

@@ -19,6 +19,7 @@ snapshot history powers Avg CCU (1d) and Momentum (1d).
 from __future__ import annotations
 
 import logging
+import os
 import random
 import re
 import sqlite3
@@ -464,6 +465,123 @@ class RobloxPlatformScout:
                     return 0, None
                 time.sleep(0.5 * (attempt + 1))
         return status, data
+
+    # ------------------------------------------------------------------ #
+    # Search-proxy IP pool (keyword crawler escape hatch)
+    # ------------------------------------------------------------------ #
+
+    def _search_proxy_urls(self) -> List[str]:
+        """Parse RBXSCOUT_SEARCH_PROXY_URLS into an ordered proxy URL list.
+
+        Accepts comma, semicolon or newline separators; blank entries are
+        dropped. The pool always ends with the direct Roblox URL so direct is
+        the terminal fallback even when proxies are configured.
+        """
+        raw = os.environ.get(self.SEARCH_PROXY_URLS_ENV, "")
+        entries: List[str] = []
+        for part in re.split(r"[,;\n]+", raw or ""):
+            part = part.strip().rstrip("/")
+            if not part:
+                continue
+            if part == "direct" or re.match(r"^https?://[^/\s]+$", part):
+                entries.append(part)
+            else:
+                log.warning("Ignoring malformed search proxy URL: %r", part)
+        return entries + ["direct"]
+
+    def _search_request_url(self, base: str, keyword: str, sid: str) -> str:
+        """Build the omni-search URL for one pool entry.
+
+        ``direct`` goes straight to Roblox; anything else is a proxy base URL
+        that mirrors the same path+query, e.g.
+        ``https://rbx-search-proxy.<you>.workers.dev`` →
+        ``https://rbx-search-proxy.<you>.workers.dev/search-api/omni-search?...``.
+        Malformed proxy entries (no scheme/host) are skipped.
+        """
+        q = quote(keyword)
+        path_query = f"search-api/omni-search?searchQuery={q}&pageType=all&sessionId={sid}"
+        if base == "direct":
+            return f"https://apis.roblox.com/{path_query}"
+        # Entries are validated in _search_proxy_urls; belt-and-suspenders:
+        return f"{base}/{path_query}"
+
+    def _search_pool_request(self, keyword: str) -> Tuple[int, Optional[Any]]:
+        """Try the omni-search endpoint through the IP pool in order.
+
+        Pool order = every configured proxy, then direct Roblox. A proxy
+        attempt counts as failed on: network error, HTTP >= 500, or a 200
+        whose body is not the expected omni-search JSON (bad JSON with a 200
+        would otherwise poison the results). A 403/429 fails that PROXY only —
+        Roblox's own limits differ per IP pool, so those statuses do not
+        poison the direct attempt. Success = first 200 with parseable JSON.
+        Per-proxy failures are remembered on the instance so one dead proxy
+        stops costing a timeout on every keyword.
+        """
+        pool = self._search_proxy_urls()
+        sid = str(uuid.uuid4())
+        status, data = 0, None
+        for i, base in enumerate(pool):
+            if base != "direct" and self._search_pool_benched(base):
+                continue  # benched proxy: skip straight past it
+            url = self._search_request_url(base, keyword, sid)
+            if i > 0:
+                time.sleep(0.25)  # small settle between pool entries
+            try:
+                if base == "direct":
+                    self._emit_pace()
+                    status, data = self._get_json(url)
+                else:
+                    res = self.session.get(url, timeout=self.SEARCH_PROXY_TIMEOUT)
+                    if res.status_code == 200:
+                        try:
+                            status, data = 200, res.json()
+                        except ValueError:
+                            status, data = 200, None
+                    else:
+                        status = res.status_code
+                if status == 200 and data is not None:
+                    self._search_pool_ok(base)
+                    return status, data
+                if base != "direct":
+                    self._search_pool_fail(base)
+            except requests.RequestException as exc:
+                log.debug("Search proxy %s failed for %r: %s", base, keyword, exc)
+                status, data = 0, None
+                if base != "direct":
+                    self._search_pool_fail(base)
+        return status, data
+
+    def _search_pool_ok(self, base: str) -> None:
+        """A pool entry served a 200: clear its failure streak."""
+        if not hasattr(self, "_search_pool_health"):
+            self._search_pool_health = {}
+        self._search_pool_health[base] = {"fails": 0}
+
+    def _search_pool_fail(self, base: str) -> None:
+        """Record a pool-entry failure; after 3 consecutive fails the entry is
+        benched for 5 minutes so later keywords skip straight past it."""
+        if not hasattr(self, "_search_pool_health"):
+            self._search_pool_health = {}
+        entry = self._search_pool_health.setdefault(base, {"fails": 0, "bench_until": 0.0})
+        entry["fails"] = entry.get("fails", 0) + 1
+        if entry["fails"] >= 3:
+            entry["bench_until"] = time.monotonic() + 300.0
+            entry["fails"] = 0
+            log.warning("Search proxy %s benched for 5 minutes after repeated failures", base)
+
+    def _search_pool_benched(self, base: str) -> bool:
+        if not hasattr(self, "_search_pool_health"):
+            self._search_pool_health = {}
+        entry = self._search_pool_health.get(base)
+        return bool(entry and time.monotonic() < entry.get("bench_until", 0.0))
+
+    def _search_pool_snapshot(self) -> Dict[str, Any]:
+        """Diagnostics: which pool entry answered, bench state at crawl end."""
+        health = getattr(self, "_search_pool_health", {})
+        return {
+            "pool": self._search_proxy_urls(),
+            "benched": [b for b in health if self._search_pool_benched(b)],
+        }
 
     # ------------------------------------------------------------------ #
     # SQLite persistence
@@ -969,6 +1087,16 @@ class RobloxPlatformScout:
         "https://apis.roblox.com/search-api/omni-search"
         "?searchQuery={q}&pageType=all&sessionId={sid}"
     )
+    # Search-proxy fallback pool: GitHub Actions runners share a small egress
+    # IP range, so the omni-search endpoint throttles every sync to 429s
+    # (breaker trips within the first keywords). The worker proxy below is a
+    # Cloudflare Worker that mirrors the omni-search route from Cloudflare's
+    # IP pool — the same trick as the RoProxy mirror used for place
+    # resolution. Env var holds a comma/newline-separated URL list; the
+    # "direct" pool (Roblox itself) is always the last fallback so a down
+    # proxy can never take the crawler down.
+    SEARCH_PROXY_URLS_ENV = "RBXSCOUT_SEARCH_PROXY_URLS"
+    SEARCH_PROXY_TIMEOUT = 8.0  # workers cold-start; a bit above request_timeout
 
     def fetch_discovery_games(self) -> List[Dict[str, Any]]:
         """Roblox Discovery (explore-api): front-page charts incl. universeIds."""
@@ -1261,13 +1389,21 @@ class RobloxPlatformScout:
     def fetch_search_games(self, keywords: List[str]) -> Dict[int, Dict[str, Any]]:
         """Omni-search keyword crawler (Phase 2): discover games by keyword.
 
-        One request per keyword against the search API that returns universe
-        IDs DIRECTLY (no place→universe conversion needed). Threaded with a
-        circuit breaker: if the first 5 keyword calls all fail, abort the
-        slice — the endpoint is likely down or rate-limiting.
+        One request per keyword against
+        ``apis.roblox.com/search-api/omni-search?searchQuery=KW&pageType=all``.
+        The response already carries universe IDs (verified live: ~40 games per
+        keyword, no cookie, ~0.5 s per call), so no place→universe conversion
+        is needed.
 
-        Returns ``{universe_id: {"name": …}}`` (no CCU — hydration supplies
-        the live stats afterwards).
+        Every keyword request is routed through the search-proxy IP pool
+        (``_search_pool_request``): configured Cloudflare Worker proxies first
+        (GitHub Actions runners share a small egress IP range and get 429-
+        throttled), direct Roblox always last as the terminal fallback.
+        Threaded with a circuit breaker: if the first 5 keyword calls all
+        fail, abort the slice — partial results are kept.
+
+        Returns ``{universe_id: {"universe_id", "title", "root_place_id"}}``
+        (no CCU — the batch hydrator supplies live stats afterwards).
         """
         if not hasattr(self, "source_diagnostics"):
             self.source_diagnostics = {}
@@ -1276,13 +1412,12 @@ class RobloxPlatformScout:
         if not keywords:
             self.source_diagnostics["keyword_crawl"] = {
                 "keywords": 0, "records": 0, "breaker_tripped": False,
+                "pool": self._search_pool_snapshot(),
             }
             return out
 
         def work(keyword: str):
-            q = urllib.parse.quote(keyword)
-            self._emit_pace()
-            return self._get_json(self.OMNI_SEARCH_URL.format(q=q, sid=uuid.uuid4()))
+            return self._search_pool_request(keyword)
 
         consecutive_failures = 0
         breaker_tripped = False
@@ -1326,13 +1461,15 @@ class RobloxPlatformScout:
                                 "title": content.get("name") or "Unknown",
                                 "root_place_id": content.get("rootPlaceId"),
                             }
-        self.source_diagnostics["keyword_crawl"] = {
+        crawl_diag = self._search_pool_snapshot()
+        crawl_diag.update({
             "keywords": len(keywords),
             "successful_keywords": sum(200 == s for s in statuses),
             "failed_keywords": sum(200 != s for s in statuses),
             "breaker_tripped": breaker_tripped,
             "records": len(out),
-        }
+        })
+        self.source_diagnostics["keyword_crawl"] = crawl_diag
         log.info("Keyword crawler: %d keywords → %d unique games", len(keywords), len(out))
         return out
 
@@ -1599,256 +1736,6 @@ class RobloxPlatformScout:
             "tier_counts": counts,
             "sync_number": n,
         }
-
-    def fetch_search_games(self, keywords: List[str]) -> Dict[int, Dict[str, Any]]:
-        """Omni-search keyword crawler (Phase 2): discover games by keyword.
-
-        One request per keyword against
-        ``apis.roblox.com/search-api/omni-search?searchQuery=KW&pageType=all``.
-        The response already carries universe IDs (verified live: ~40 games per
-        keyword, no cookie, ~0.5 s per call), so no place→universe conversion
-        is needed. Threaded with a circuit breaker: if the first 5 keyword
-        calls all fail, abort the slice — partial results are kept.
-
-        Returns ``{universe_id: {"universe_id", "title", "root_place_id"}}``
-        (no CCU — the batch hydrator supplies live stats afterwards).
-        """
-        if not hasattr(self, "source_diagnostics"):
-            self.source_diagnostics = {}
-        out: Dict[int, Dict[str, Any]] = {}
-        statuses: List[int] = []
-        if not keywords:
-            self.source_diagnostics["keyword_crawl"] = {
-                "keywords": 0,
-                "successful": 0,
-                "failed": 0,
-                "breaker_tripped": False,
-                "records": 0,
-            }
-            return out
-
-        def work(keyword: str):
-            q = quote(keyword)
-            self._emit_pace()
-            return self._get_json(self.OMNI_SEARCH_URL.format(q=q, sid=uuid.uuid4()))
-
-        consecutive_failures = 0
-        breaker_tripped = False
-        with ThreadPoolExecutor(max_workers=min(self.max_workers, 8)) as pool:
-            futures = {pool.submit(work, kw): kw for kw in keywords}
-            for fut in as_completed(futures):
-                try:
-                    status, data = fut.result()
-                except Exception:
-                    statuses.append(0)
-                    consecutive_failures += 1
-                    if consecutive_failures >= 5 and not breaker_tripped:
-                        breaker_tripped = True
-                        for f in futures:
-                            f.cancel()
-                        break
-                    continue
-                statuses.append(status)
-                if status != 200 or not data:
-                    consecutive_failures += 1
-                    if consecutive_failures >= 5 and not breaker_tripped:
-                        breaker_tripped = True
-                        for f in futures:
-                            f.cancel()
-                        break
-                    continue
-                consecutive_failures = 0
-                # Response shape (verified live): searchResults[].contents[]
-                # each carrying universeId directly.
-                for group in data.get("searchResults") or []:
-                    for content in group.get("contents") or []:
-                        try:
-                            uid = int(content["universeId"])
-                        except (KeyError, TypeError, ValueError):
-                            continue
-                        if uid not in out:
-                            out[uid] = {
-                                "universe_id": uid,
-                                "title": content.get("name") or "Unknown",
-                                "root_place_id": content.get("rootPlaceId"),
-                            }
-        self.source_diagnostics["keyword_crawl"] = {
-            "keywords": len(keywords),
-            "successful": sum(200 == s for s in statuses),
-            "failed": sum(200 != s for s in statuses),
-            "breaker_tripped": breaker_tripped,
-            "records": len(out),
-        }
-        log.info(
-            "Keyword crawler: %d keywords → %d unique games",
-            len(keywords),
-            len(out),
-        )
-        return out
-
-    def get_keyword_slice(self) -> Tuple[List[str], int, int]:
-        """Take the next rotating slice of the keyword dictionary (Phase 2).
-
-        Reads the cursor from ``keyword_crawl_state``, returns the next
-        ~KEYWORDS_PER_SYNC keywords and advances the cursor, wrapping back to
-        the top of the dictionary after the last slice. This makes the catalog
-        grow every sync without a separate cron server.
-        """
-        total = len(KEYWORD_DICTIONARY)
-        if total == 0:
-            return [], 0, 0
-        start = self._load_keyword_cursor() % total
-        end = min(start + KEYWORDS_PER_SYNC, total)
-        keywords = KEYWORD_DICTIONARY[start:end]
-        next_index = 0 if end >= total else end
-        self._advance_keyword_cursor(next_index)
-        return keywords, start, end
-
-    def _load_keyword_cursor(self) -> int:
-        try:
-            with self._connect() as conn:
-                row = conn.execute(
-                    "SELECT next_index FROM keyword_crawl_state WHERE id = 1"
-                ).fetchone()
-                return int(row[0]) if row else 0
-        except sqlite3.Error:
-            return 0
-
-    def _advance_keyword_cursor(self, next_index: int) -> None:
-        try:
-            with self._connect() as conn:
-                conn.execute(
-                    "UPDATE keyword_crawl_state SET next_index = ?, "
-                    "updated_at = CURRENT_TIMESTAMP WHERE id = 1",
-                    (next_index,),
-                )
-        except sqlite3.Error as exc:
-            log.debug("Could not update keyword_crawl_state: %s", exc)
-
-    def fetch_search_games(self, keywords: List[str]) -> Dict[int, Dict[str, Any]]:
-        """Omni-search keyword crawler (Phase 2): discover games by keyword.
-
-        One request per keyword against
-        ``apis.roblox.com/search-api/omni-search?searchQuery=KW&pageType=all``.
-        The response already carries universe IDs (verified live: ~40 games per
-        keyword, no cookie, ~0.5 s per call), so no place→universe conversion
-        is needed. Threaded with a circuit breaker: if the first 5 keyword
-        calls all fail, abort the slice — partial results are kept.
-
-        Returns ``{universe_id: {"universe_id", "title", "root_place_id"}}``
-        (no CCU — the batch hydrator supplies live stats afterwards).
-        """
-        if not hasattr(self, "source_diagnostics"):
-            self.source_diagnostics = {}
-        out: Dict[int, Dict[str, Any]] = {}
-        statuses: List[int] = []
-        if not keywords:
-            self.source_diagnostics["keyword_crawl"] = {
-                "keywords": 0,
-                "successful": 0,
-                "failed": 0,
-                "breaker_tripped": False,
-                "records": 0,
-            }
-            return out
-
-        def work(keyword: str):
-            q = quote(keyword)
-            self._emit_pace()
-            return self._get_json(self.OMNI_SEARCH_URL.format(q=q, sid=uuid.uuid4()))
-
-        consecutive_failures = 0
-        breaker_tripped = False
-        with ThreadPoolExecutor(max_workers=min(self.max_workers, 8)) as pool:
-            futures = {pool.submit(work, kw): kw for kw in keywords}
-            for fut in as_completed(futures):
-                try:
-                    status, data = fut.result()
-                except Exception:
-                    statuses.append(0)
-                    consecutive_failures += 1
-                    if consecutive_failures >= 5 and not breaker_tripped:
-                        breaker_tripped = True
-                        for f in futures:
-                            f.cancel()
-                        break
-                    continue
-                statuses.append(status)
-                if status != 200 or not data:
-                    consecutive_failures += 1
-                    if consecutive_failures >= 5 and not breaker_tripped:
-                        breaker_tripped = True
-                        for f in futures:
-                            f.cancel()
-                        break
-                    continue
-                consecutive_failures = 0
-                # Response shape (verified live): searchResults[].contents[]
-                # each carrying universeId directly.
-                for group in data.get("searchResults") or []:
-                    for content in group.get("contents") or []:
-                        try:
-                            uid = int(content["universeId"])
-                        except (KeyError, TypeError, ValueError):
-                            continue
-                        if uid not in out:
-                            out[uid] = {
-                                "universe_id": uid,
-                                "title": content.get("name") or "Unknown",
-                                "root_place_id": content.get("rootPlaceId"),
-                            }
-        self.source_diagnostics["keyword_crawl"] = {
-            "keywords": len(keywords),
-            "successful": sum(200 == s for s in statuses),
-            "failed": sum(200 != s for s in statuses),
-            "breaker_tripped": breaker_tripped,
-            "records": len(out),
-        }
-        log.info(
-            "Keyword crawler: %d keywords → %d unique games",
-            len(keywords),
-            len(out),
-        )
-        return out
-
-    def get_keyword_slice(self) -> Tuple[List[str], int, int]:
-        """Take the next rotating slice of the keyword dictionary (Phase 2).
-
-        Reads the cursor from ``keyword_crawl_state``, returns the next
-        ~KEYWORDS_PER_SYNC keywords and advances the cursor, wrapping back to
-        the top of the dictionary after the last slice. This makes the catalog
-        grow every sync without a separate cron server.
-        """
-        total = len(KEYWORD_DICTIONARY)
-        if total == 0:
-            return [], 0, 0
-        start = self._load_keyword_cursor() % total
-        end = min(start + KEYWORDS_PER_SYNC, total)
-        keywords = KEYWORD_DICTIONARY[start:end]
-        next_index = 0 if end >= total else end
-        self._advance_keyword_cursor(next_index)
-        return keywords, start, end
-
-    def _load_keyword_cursor(self) -> int:
-        try:
-            with self._connect() as conn:
-                row = conn.execute(
-                    "SELECT next_index FROM keyword_crawl_state WHERE id = 1"
-                ).fetchone()
-                return int(row[0]) if row else 0
-        except sqlite3.Error:
-            return 0
-
-    def _advance_keyword_cursor(self, next_index: int) -> None:
-        try:
-            with self._connect() as conn:
-                conn.execute(
-                    "UPDATE keyword_crawl_state SET next_index = ?, "
-                    "updated_at = CURRENT_TIMESTAMP WHERE id = 1",
-                    (next_index,),
-                )
-        except sqlite3.Error as exc:
-            log.debug("Could not update keyword_crawl_state: %s", exc)
 
     def fetch_game_metrics(self, universe_ids: List[int]) -> Dict[int, Dict[str, Any]]:
         """Threaded batched metrics (50 universes per call — verified cap: 50→200, 100→400).

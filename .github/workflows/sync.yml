@@ -22,6 +22,15 @@ on:
 permissions:
   contents: write             # the workflow may push the updated DB
 
+env:
+  # Search-proxy fallback pool for the keyword crawler: the omni-search
+  # endpoint throttles GitHub runner IPs, so keyword requests are tried
+  # through these Cloudflare Worker mirrors first and fall back to direct
+  # Roblox last. Add a repo variable (Settings -> Secrets and variables ->
+  # Actions -> Variables) named RBXSCOUT_SEARCH_PROXY_URLS holding the
+  # worker URL(s), comma-separated. Leave empty to crawl direct-only.
+  RBXSCOUT_SEARCH_PROXY_URLS: ${{ vars.RBXSCOUT_SEARCH_PROXY_URLS || '' }}
+
 concurrency:
   group: rbxscout-sync
   cancel-in-progress: false   # never kill a sync mid-flight
