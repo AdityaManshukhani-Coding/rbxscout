@@ -84,8 +84,19 @@ jobs:
           git add rbx_scout.db rbx_scout.db.sync_state
           if git diff --cached --quiet; then
             echo "No catalog changes to commit."
-          else
-            git commit -m "sync: catalog update (finder)"
+            exit 0
           fi
-          git pull --rebase origin "$GITHUB_REF_NAME"
-          git push
+          git commit -m "sync: catalog update (finder)"
+          # A queued run keeps the head SHA it was dispatched with, so a
+          # concurrent run's DB commit can land first and the rebase hits an
+          # unmergeable BINARY conflict. A deferred finder pass is safe: the
+          # keyword cursor only advances on a successful push, so the next
+          # :13/:43 slot re-crawls the same slice. Stays green by design.
+          if git pull --rebase origin "$GITHUB_REF_NAME"; then
+            git push
+          else
+            echo "::warning::DB conflict with a concurrent run - deferring; next slot re-crawls this slice."
+            git rebase --abort || true
+            git fetch origin "$GITHUB_REF_NAME"
+            git reset --hard "origin/$GITHUB_REF_NAME"
+          fi

@@ -76,8 +76,19 @@ jobs:
           git add rbx_scout.db rbx_scout.db.sync_state
           if git diff --cached --quiet; then
             echo "No catalog changes to commit."
-          else
-            git commit -m "sync: hydrator update (5-min pass)"
+            exit 0
           fi
-          git pull --rebase origin "$GITHUB_REF_NAME"
-          git push
+          git commit -m "sync: hydrator update (5-min pass)"
+          # A queued run keeps the head SHA it was dispatched with, so a
+          # concurrent run's DB commit can land first and the rebase hits an
+          # unmergeable BINARY conflict. Hydration is idempotent and the
+          # due-queue lives in the DB: defer to the remote state and let the
+          # next 5-minute tick redo this pass. Stays green by design.
+          if git pull --rebase origin "$GITHUB_REF_NAME"; then
+            git push
+          else
+            echo "::warning::DB conflict with a concurrent run - deferring; next tick re-hydrates."
+            git rebase --abort || true
+            git fetch origin "$GITHUB_REF_NAME"
+            git reset --hard "origin/$GITHUB_REF_NAME"
+          fi
