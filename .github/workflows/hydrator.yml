@@ -1,10 +1,9 @@
 # RbxScout hydrator — the frequent pass.
 #
 # Refreshes stats (CCU / visits / favorites) for games ALREADY in the
-# catalog by draining the tier-due queue. Tier cadences are wall-clock
-# hours (T1 ≤1h, T2 ≤2h, T3 ≤4h, T4 ≤6h), so running every 5 minutes
-# keeps hot games roughly 5–15 minutes fresh without wasting requests on
-# tiers that are not due (they cost zero requests).
+# catalog by draining the tier-due queue. Cloudflare's Cron Trigger invokes
+# workflow_dispatch every 5 minutes; GitHub's internal schedule trigger is
+# intentionally disabled because GitHub does not guarantee schedule timing.
 #
 # The DB is the repo: every run commits rbx_scout.db back. Both this
 # workflow and finder.yml declare the SAME concurrency group, which acts
@@ -17,10 +16,10 @@
 name: Hydrator (5 min)
 
 on:
-  schedule:
-    # Every 5 min, offset to :02/:07/:12… — GitHub docs: schedules at the
-    # top of the hour get delayed or dropped under high load.
-    - cron: "2-59/5 * * * *"
+# Automatic dispatching is owned by the Cloudflare Worker in
+# cloudflare-worker/wrangler.toml. Keep only workflow_dispatch here: adding a
+# GitHub schedule would create duplicate Hydrator runs and compete for the
+# SQLite commit.
   workflow_dispatch:
 
 permissions:
@@ -31,7 +30,7 @@ permissions:
 # the two-writer race on rbx_scout.db.
 concurrency:
   group: rbxscout-sync
-  cancel-in-progress: false   # never kill a run mid-flight; queue instead
+  queue: max                 # retain scheduled dispatches while a run is active
 
 env:
   RBXSCOUT_SEARCH_PROXY_URLS: ''   # hydrator never touches the search API

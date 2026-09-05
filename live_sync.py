@@ -15,9 +15,10 @@ Usage:
                      zero discovery traffic — the cheap, frequent pass.
     (no flag)        full pipeline: find + hydrate in one run (UI parity).
 
-The GitHub workflows pair finder with a 30-min cron and hydrator with a
-5-min cron; both share one Actions concurrency group so two runs can never
-commit the SQLite DB at the same time.
+The Cloudflare Worker invokes the GitHub workflows via workflow_dispatch: it
+fires the hydrator every 5 minutes and the finder at UTC :00/:30. Both
+workflows share one Actions concurrency group so two runs can never commit the
+SQLite DB at the same time.
 
 Safe to re-run at any time: every sync advances the keyword slice (finder
 runs only), hydrates by tier cadence, and upserts what it finds. The DB is

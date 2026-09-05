@@ -2,7 +2,13 @@ name = "rbx-search-proxy"
 main = "src/index.js"
 compatibility_date = "2026-08-15"
 
-# No secrets needed: the mirrored endpoint is public and cookieless.
+# Cloudflare is the only automatic scheduler. Every five-minute tick
+# dispatches Hydrator; the Worker also dispatches Finder at :00/:30 UTC.
+[triggers]
+crons = ["*/5 * * * *"]
+
+# GITHUB_TOKEN is uploaded with `npx wrangler secret put GITHUB_TOKEN`.
+# It is used only by the scheduled handler for GitHub workflow_dispatch.
 
 # Optional: pin a custom route after adding your zone to the account, e.g.
 # routes = [{ pattern = "rbx-proxy.example.com", custom_domain = true }]
