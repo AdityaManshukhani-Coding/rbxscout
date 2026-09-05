@@ -20,7 +20,10 @@ name: Finder (30 min)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # unchanged discovery cadence, UTC
+    # :13 and :43 — off the high-load hour boundaries (GitHub docs), and
+    # never colliding with the hydrator's :02/:07/… slots anyway (the
+    # shared concurrency lock would queue them regardless).
+    - cron: "13,43 * * * *"
   workflow_dispatch:
 
 permissions:
