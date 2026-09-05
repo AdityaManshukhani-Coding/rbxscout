@@ -927,9 +927,10 @@ def test_prune_catalog_defaults_to_tier8_14_day_rule(tmp_path):
 
 
 def test_scheduler_picks_tiers_by_cadence_and_orders_first_in_line(tmp_path):
-    """Cadence semantics (n % N == 0): T1–T2 due every sync, T3 every 2nd,
-    T4 every 3rd, weekly bucket behind the 7-day cutoff, T8 as a rotating
-    universe_id slice. A fresh cadence test scout starts at sync 0."""
+    """T1–T4 go due on WALL-CLOCK staleness (1h/2h/4h/6h) rather than sync
+    counts, so the scheduler behaves identically whether hydration runs
+    every 5 minutes or every 30. Weekly T5–T7 and the T8 rotation stay on
+    their wall-clock / positional buckets."""
     db = str(tmp_path / "t.db")
     scout = RobloxPlatformScout(db_path=db)
     bucket_count = scout_core.TIER8_ROTATION_DAYS
@@ -937,25 +938,43 @@ def test_scheduler_picks_tiers_by_cadence_and_orders_first_in_line(tmp_path):
     uids_in = [u for u in range(100, 120) if u % bucket_count == bucket]
     uids_out = [u for u in range(100, 120) if u % bucket_count != bucket]
     t8_in, t8_out = uids_in[0], uids_out[0]  # one inside, one outside the slice
+
+    def ts(hours_ago):
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - hours_ago * 3600))
+
     with sqlite3.connect(db) as conn:
-        for uid, tier in [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7),
-                          (t8_in, 0), (t8_out, 0)]:
+        for uid, tier, hours_ago in [
+            (1, 1, 2.0),        # T1 stale past 1h -> due
+            (2, 2, 1.5),        # T2 stale under 2h -> NOT due yet
+            (3, 3, 3.0),        # T3 stale under 4h -> NOT due yet
+            (4, 4, 7.0),        # T4 stale past 6h -> due
+            (5, 5, 2.0),        # T5–T7: weekly cutoff governs, fresh -> not due
+            (6, 6, 2.0),
+            (7, 7, 2.0),
+            (t8_in, 0, 2.0),    # in this rotation bucket -> due
+            (t8_out, 0, 2.0),   # outside the bucket -> not due
+        ]:
             conn.execute(
-                "INSERT INTO game_analytics (universe_id, tier, ccu, visits) VALUES (?, ?, 100, 100)",
-                (uid, tier),
+                "INSERT INTO game_analytics (universe_id, tier, ccu, visits, last_updated) "
+                "VALUES (?, ?, 100, 100, ?)",
+                (uid, tier, ts(hours_ago)),
             )
 
-    def due(sync_number):
-        return set(scout.load_tier_refresh_ids(
-            sync_number=sync_number, batch_size=50, budget_batches=10
-        )["ids"])
+    due = set(scout.load_tier_refresh_ids(batch_size=50, budget_batches=10)["ids"])
+    assert {1, 4, t8_in}.issubset(due)      # stale T1 + T4 + the T8 slice
+    assert 2 not in due and 3 not in due    # under their staleness line yet
+    assert 5 not in due and 6 not in due and 7 not in due
+    assert t8_out not in due                # outside this rotation bucket
 
-    assert due(1) == {1, 2, t8_in}          # sync 1: T3/T4 not due yet
-    assert due(2) == {1, 2, 3, t8_in}       # T3 due (2 % 2 == 0)
-    assert due(3) == {1, 2, 4, t8_in}       # T4 due (3 % 3 == 0)
-    assert due(4) == {1, 2, 3, t8_in}       # T3 again; T4 not (4 % 3 == 1)
-    assert due(6) == {1, 2, 3, 4, t8_in}    # both due (6 % 2 == 6 % 3 == 0)
-    assert t8_out not in due(1)             # outside this rotation bucket
+    # And once T2/T3 cross their staleness line, they come due too.
+    with sqlite3.connect(db) as conn:
+        for uid in (2, 3):
+            conn.execute(
+                "UPDATE game_analytics SET last_updated = ? WHERE universe_id = ?",
+                (ts(12.0), uid),
+            )
+    due2 = set(scout.load_tier_refresh_ids(batch_size=50, budget_batches=10)["ids"])
+    assert {2, 3}.issubset(due2)
 
 
 def test_scheduler_weekly_bucket_and_t8_rotation(tmp_path):
@@ -1002,7 +1021,8 @@ def test_scheduler_budget_caps_selection(tmp_path):
     with sqlite3.connect(db) as conn:
         for uid in range(500):
             conn.execute(
-                "INSERT INTO game_analytics (universe_id, tier, ccu, visits) VALUES (?, 1, 100, 100)",
+                "INSERT INTO game_analytics (universe_id, tier, ccu, visits, last_updated) "
+                "VALUES (?, 1, 100, 100, '1970-01-01')",
                 (uid,),
             )
     schedule = scout.load_tier_refresh_ids(batch_size=50, budget_batches=4)
@@ -1054,8 +1074,8 @@ def test_scan_budget_splits_new_first_then_known_due(tmp_path):
         # them can fit after the new candidate takes the first slot.
         for uid in range(1000, 1060):
             conn.execute(
-                "INSERT INTO game_analytics (universe_id, tier, ccu, visits) "
-                "VALUES (?, 1, 30, 30000)",
+                "INSERT INTO game_analytics (universe_id, tier, ccu, visits, last_updated) "
+                "VALUES (?, 1, 30, 30000, '1970-01-01')",
                 (uid,),
             )
     scout_core.HYDRATION_BUDGET_PER_SYNC = 1  # ceiling: 50 games (1 batch)
@@ -1089,6 +1109,107 @@ def test_sync_counter_persists_across_restarts(tmp_path):
     second = RobloxPlatformScout(db_path=db)   # simulates an app restart
     assert second._sync_seq == 2
     assert second.bump_sync_sequence() == 3
+
+
+# ---------------------------------------------------------------------------
+# Finder / hydrator phase split (separate workflow cadences)
+# ---------------------------------------------------------------------------
+
+
+def test_hydrate_phase_never_calls_discovery_endpoints(tmp_path):
+    """phases=('hydrate',) must drain the tier-due queue and spend zero
+    requests on discovery: no explore-api, no omni-search, and the keyword
+    cursor must not advance. This is the contract the 5-min workflow runs on."""
+    calls = []
+
+    class ProbeScout(MockScout):
+        def _get_json(self, url, retries=1):
+            calls.append(url)
+            return super()._get_json(url, retries)
+
+    scout = ProbeScout(
+        {
+            "https://games.roblox.com/v1/games?universeIds=": {"data": []},
+        },
+        db_path=str(tmp_path / "h.db"),
+    )
+    with sqlite3.connect(tmp_path / "h.db") as conn:
+        # Stale T1 + T3 rows: both due under the wall-clock cadences.
+        conn.execute(
+            "INSERT INTO game_analytics (universe_id, tier, ccu, visits, last_updated) "
+            "VALUES (901, 1, 30, 30000, '1970-01-01')"
+        )
+        conn.execute(
+            "INSERT INTO game_analytics (universe_id, tier, ccu, visits, last_updated) "
+            "VALUES (902, 3, 30, 80000, '1970-01-01')"
+        )
+        conn.execute("UPDATE keyword_crawl_state SET next_index = 160 WHERE id = 1")
+
+    scout.scan(
+        min_visits=20_000,
+        min_ccu=25,
+        deep_contacts=False,
+        progress_cb=lambda p, m: None,
+        phases=("hydrate",),
+    )
+
+    assert scout.last_scan["status"] == "complete"
+    assert all("explore-api" not in u for u in calls)      # no discovery traffic
+    assert all("omni-search" not in u for u in calls)      # no keyword crawler
+    assert any("games.roblox.com/v1/games" in u for u in calls)  # did hydrate
+    with sqlite3.connect(tmp_path / "h.db") as conn:
+        assert conn.execute("SELECT next_index FROM keyword_crawl_state WHERE id=1").fetchone()[0] == 160
+
+
+def test_find_phase_hydrates_new_but_skips_known_due_queue(tmp_path):
+    """phases=('find',) keeps discovery (keyword cursor advances) and gives
+    every NEW candidate its mandatory first hydration, but never spends
+    budget on the known-game refresh queue — that is the hydrator's job."""
+    db = str(tmp_path / "f.db")
+    scout = BudgetScout(
+        {
+            "https://apis.roblox.com/explore-api/v1/get-sorts": {"sorts": []},
+            "https://apis.roblox.com/search-api/omni-search": (200, {"searchResults": []}),
+        },
+        db_path=db,
+    )
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO rolimons_catalog (place_id, name, playing, icon_url) "
+            "VALUES (100, 'New Hot Game', 2000, 'https://icon1')"
+        )
+        conn.execute("INSERT INTO place_map (place_id, universe_id) VALUES (100, 801)")
+        # Known stale T1 game that the FIND pass must leave untouched.
+        conn.execute(
+            "INSERT INTO game_analytics (universe_id, tier, ccu, visits, last_updated) "
+            "VALUES (7000, 1, 30, 30000, '1970-01-01')"
+        )
+    scout_core.HYDRATION_BUDGET_PER_SYNC = 1
+    try:
+        scout.scan(
+            min_visits=50_000,
+            min_ccu=50,
+            candidate_limit=5,
+            progress_cb=lambda p, m: None,
+            phases=("find",),
+        )
+    finally:
+        scout_core.HYDRATION_BUDGET_PER_SYNC = 150
+
+    assert scout.last_scan["status"] == "complete"
+    assert scout.last_scan["hydration_budget"]["known_due"] == 0  # queue untouched
+    assert scout.last_scan["keyword_slice_end"] > 0               # crawler ran
+    table = scout.load_table().set_index("universe_id")
+    assert int(table.loc[801]["visits"]) == 99_000                # new game hydrated
+    assert int(table.loc[7000]["visits"]) == 30_000               # known game untouched
+
+
+def test_invalid_phase_raises_and_full_pipeline_default(tmp_path):
+    """Unknown phases raise loudly; omitting phases keeps the historical
+    full pipeline (UI compatibility)."""
+    scout = MockScout({}, db_path=str(tmp_path / "i.db"))
+    with pytest.raises(ValueError, match="Unknown scan phases"):
+        scout.scan(progress_cb=lambda p, m: None, phases=("hydrate", "nonsense"))
 
 
 # ---------------------------------------------------------------------------

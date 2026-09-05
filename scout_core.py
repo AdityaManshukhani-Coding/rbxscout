@@ -102,6 +102,8 @@ TIER_THRESHOLDS: Dict[int, Tuple[int, int]] = {
 }
 TIER_CADENCE_SYNC: Dict[int, Optional[int]] = {
     # tier: re-hydrate every N syncs; None = weekly bucket (7-day wall clock).
+    # Kept for UI/summary compatibility; the live scheduler uses the
+    # wall-clock hours below so cadence holds at any hydrator frequency.
     1: 1,
     2: 1,
     3: 2,
@@ -109,6 +111,16 @@ TIER_CADENCE_SYNC: Dict[int, Optional[int]] = {
     5: None,
     6: None,
     7: None,
+}
+
+# Live refresh cadences for T1–T4, expressed in wall-clock hours. Floats so a
+# 5-minute hydrator can subdivide. Semantics: a tier's games enter the refresh
+# queue when last_updated is older than the tier's hours (most-stale first).
+TIER_CADENCE_WALL_HOURS: Dict[int, float] = {
+    1: 1.0,   # hot watchlist: refreshed within the hour
+    2: 2.0,
+    3: 4.0,
+    4: 6.0,
 }
 WEEKLY_TIER_REFRESH_DAYS = 7
 TIER8_ROTATION_DAYS = 3  # rotating slice every ~3–7 days
@@ -209,6 +221,7 @@ KEYWORD_DICTIONARY = [
     "quantum", "apocalyptic",
     # -- Slice 4: Emerging Meta Mechanics & RNG Hooks (words 266-335) ------
     "aura", "rolls", "spins", "luck potion", "luck boost", "admin abuse",
+    "+1",
     "admin event", "secret drop", "mythic drop", "legendary drop",
     "brainrot god drop", "pity system", "trade market", "market crash",
     "inflation", "base skin", "red carpet", "fuse machine", "rng machine",
@@ -1660,20 +1673,22 @@ class RobloxPlatformScout:
     ) -> Dict[str, Any]:
         """Pick which known games deserve re-hydration this sync.
 
-        Cadence-ordered: T1–T2 (every sync) → T3 (every 2nd) → T4 (every 3rd)
-        → T5–T7 weekly wall-clock bucket → T8 rotating 3-day slice. Tiers not
-        due under their cadence cost zero requests. The scheduler caps the
-        selected list at ``batch_size * budget_batches`` universes; the caller
-        hydrates as many of those as its own budget allows — anything beyond
-        rolls to the next sync naturally.
+        Cadence-ordered: T1–T2 (stale past 1–2 wall-clock hours) → T3 (4h)
+        → T4 (6h) → T5–T7 weekly wall-clock bucket → T8 rotating 3-day slice.
+        Tiers not due under their cadence cost zero requests. The scheduler
+        caps the selected list at ``batch_size * budget_batches`` universes;
+        the caller hydrates as many of those as its own budget allows —
+        anything beyond rolls to the next sync naturally.
 
         T8 rotation: one deterministic 3-day bucket (epoch // TIER8_ROTATION_DAYS
         mod bucket_count) so every sub-threshold game is visited at least once
         every rotation cycle without spending budget on all of them each sync.
         """
-        n = int(sync_number if sync_number is not None else self._sync_seq)
+        n = int(sync_number if sync_number is not None else self._sync_seq)  # weekly T5–T7 marker
         cap = max(0, int(batch_size) * int(budget_batches))
-        groups: Dict[str, List[int]] = {"t1_t2": [], "t3": [], "t4": [], "weekly": [], "t8": []}
+        groups: Dict[str, List[int]] = {
+            "t1_t2": [], "t2": [], "t3": [], "t4": [], "weekly": [], "t8": []
+        }
         counts: Dict[int, int] = {}
         try:
             with self._connect() as conn:
@@ -1693,16 +1708,30 @@ class RobloxPlatformScout:
                     ).fetchall()
                     return [int(r[0]) for r in rows]
 
-                groups["t1_t2"] = ids_for(
-                    "tier IN (1, 2)", (), "last_updated ASC, universe_id ASC"
-                )
-                if TIER_CADENCE_SYNC[3] and n % TIER_CADENCE_SYNC[3] == 0:
-                    groups["t3"] = ids_for(
-                        "tier = 3", (), "last_updated ASC, universe_id ASC"
+                # T1–T4 go stale on wall-clock hours, not sync counts, so the
+                # scheduler stays correct whether hydration runs every 5
+                # minutes or every 30. Most-stale game hydrates first.
+                def _stale(hours: float) -> str:
+                    return time.strftime(
+                        "%Y-%m-%d %H:%M:%S",
+                        time.gmtime(time.time() - hours * 3600),
                     )
-                if TIER_CADENCE_SYNC[4] and n % TIER_CADENCE_SYNC[4] == 0:
-                    groups["t4"] = ids_for(
-                        "tier = 4", (), "last_updated ASC, universe_id ASC"
+
+                groups["t1_t2"] = ids_for(
+                    "tier = 1 AND COALESCE(last_updated, '1970-01-01') <= ?",
+                    (_stale(TIER_CADENCE_WALL_HOURS[1]),),
+                    "last_updated ASC, universe_id ASC",
+                )
+                groups["t2"] = ids_for(
+                    "tier = 2 AND COALESCE(last_updated, '1970-01-01') <= ?",
+                    (_stale(TIER_CADENCE_WALL_HOURS[2]),),
+                    "last_updated ASC, universe_id ASC",
+                )
+                for key, tier in (("t3", 3), ("t4", 4)):
+                    groups[key] = ids_for(
+                        f"tier = {tier} AND COALESCE(last_updated, '1970-01-01') <= ?",
+                        (_stale(TIER_CADENCE_WALL_HOURS[tier]),),
+                        "last_updated ASC, universe_id ASC",
                     )
                 weekly_cutoff = time.strftime(
                     "%Y-%m-%d %H:%M:%S",
@@ -1727,7 +1756,7 @@ class RobloxPlatformScout:
         except sqlite3.Error as exc:
             log.debug("tier scheduler failed: %s", exc)
         selected: List[int] = []
-        for key in ("t1_t2", "t3", "t4", "weekly", "t8"):
+        for key in ("t1_t2", "t2", "t3", "t4", "weekly", "t8"):
             selected.extend(groups[key])
         selected = list(dict.fromkeys(selected))[:cap]
         return {
@@ -2055,6 +2084,7 @@ class RobloxPlatformScout:
         candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
         initial_contact_limit: int = 20,
         progress_cb: Optional[Callable[[float, str], None]] = None,
+        phases: Optional[Iterable[str]] = None,
     ) -> pd.DataFrame:
         """Fetch metrics, apply target thresholds, and optionally check contacts.
 
@@ -2062,7 +2092,24 @@ class RobloxPlatformScout:
         Roblox/Rolimon's sources do not expose one public, bulk endpoint for all
         visit metrics, so resolving every catalog entry would be needlessly slow.
         Contact requests are separate so the UI can load them page by page.
+
+        ``phases`` splits the two jobs that used to share one run budget:
+        - ``"hydrate"`` — drain the tier-due refresh queue for games ALREADY
+          in the catalog. No discovery requests; the cheap, fast pass the
+          5-minute cron runs. Tier cadences are wall-clock hours, so this
+          stays correct at any call frequency.
+        - ``"find"`` — discovery charts + Rolimons + the next keyword slice;
+          every candidate found is hydrated immediately (a mandatory one-time
+          pass — a game with no stats cannot be tiered).
+        - ``None`` (default) — the historical full pipeline: find + hydrate.
         """
+        selected = [p.strip().lower() for p in (phases or ()) if p and p.strip()]
+        invalid = [p for p in selected if p not in ("find", "hydrate")]
+        if invalid:
+            raise ValueError(f"Unknown scan phases: {invalid}. Use 'find', 'hydrate', or None.")
+        phase_set = set(selected) or {"find", "hydrate"}
+        do_find = "find" in phase_set
+        do_hydrate = "hydrate" in phase_set
         report = progress_cb or (lambda p, m: None)
         run_id = self._begin_scan()
         started_at = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -2102,14 +2149,17 @@ class RobloxPlatformScout:
             "pruned_stale": 0,
             "blowup_watch_count": 0,
         }
-        # The sync counter drives tier cadences (every 2nd/3rd sync) and
-        # persists across restarts via the .sync_state sidecar file.
+        # The sync counter persists across restarts via the .sync_state
+        # sidecar file (still used as the weekly T5–T7 marker).
         sync_number = self.bump_sync_sequence()
         self.last_scan["sync_number"] = sync_number
 
         try:
-            report(0.02, "Fetching Discovery charts…")
-            discovery = self.fetch_discovery_games()
+            if do_find:
+                report(0.02, "Fetching Discovery charts…")
+                discovery = self.fetch_discovery_games()
+            else:
+                discovery = []  # hydrate-only: zero discovery traffic
             self.last_scan["keyword_slice_start"] = 0
             self.last_scan["keyword_slice_end"] = 0
             self.last_scan["keyword_discovered"] = 0
@@ -2119,7 +2169,7 @@ class RobloxPlatformScout:
             # ------------------------------------------------------------------
             catalog_count = self.catalog_place_count()
             catalog_loaded = catalog_count > 0
-            if not catalog_loaded:
+            if do_find and not catalog_loaded:
                 report(0.05, "Importing full Rolimon's catalog…")
                 catalog_count = self.import_rolimons_catalog()
                 catalog_loaded = catalog_count > 0
@@ -2148,6 +2198,8 @@ class RobloxPlatformScout:
                 discovery_ranked = [
                     g for g in discovery_ranked if int(g.get("playing") or 0) >= min_ccu
                 ]
+            if not do_find:
+                discovery_ranked = []
             for game in discovery_ranked:
                 uid = int(game["universe_id"])
                 if uid in candidates:
@@ -2159,11 +2211,15 @@ class RobloxPlatformScout:
             # DB-backed Rolimon's pool.
             # Discovery already filled candidates from the front page; if slots
             # remain, Rolimon's catalog entries are added with full resolution so
-            # more niche games can enter the candidate pool.
+            # more niche games can enter the candidate pool. (Find phase only.)
             slots = max(0, candidate_limit - len(candidates))
-            roli_pool = self.build_rolimons_candidate_pool(
-                min_ccu=min_ccu,
-                candidate_limit=slots,
+            roli_pool = (
+                self.build_rolimons_candidate_pool(
+                    min_ccu=min_ccu,
+                    candidate_limit=slots,
+                )
+                if do_find
+                else {}
             )
             for uid, meta in roli_pool.items():
                 if uid in candidates:
@@ -2177,14 +2233,19 @@ class RobloxPlatformScout:
             # cursor, wrapping back to the top of the dictionary after the
             # last slice. This makes the catalog grow every sync without a
             # separate cron server.
-            keywords, kw_start, kw_end = self.next_keyword_slice()
-            report(0.12, f"Keyword slice {kw_start + 1}–{kw_end} of {len(KEYWORD_DICTIONARY)}…")
-            search_games = self.fetch_search_games(keywords)
-            self.last_scan.update({
-                "keyword_slice_start": kw_start,
-                "keyword_slice_end": kw_end,
-                "keyword_discovered": len(search_games),
-            })
+            # separate cron server. (Find phase only; the throttled omni-search
+            # endpoint never runs on hydrate-only passes, and the cursor must
+            # not advance on those either.)
+            kw_start, kw_end, search_games = 0, 0, {}
+            if do_find:
+                keywords, kw_start, kw_end = self.next_keyword_slice()
+                report(0.12, f"Keyword slice {kw_start + 1}–{kw_end} of {len(KEYWORD_DICTIONARY)}…")
+                search_games = self.fetch_search_games(keywords)
+                self.last_scan.update({
+                    "keyword_slice_start": kw_start,
+                    "keyword_slice_end": kw_end,
+                    "keyword_discovered": len(search_games),
+                })
             for uid, info in search_games.items():
                 if uid not in candidates:
                     candidates[uid] = {
@@ -2200,7 +2261,10 @@ class RobloxPlatformScout:
             )[:candidate_limit]
             universe_ids = [int(g["universe_id"]) for g in ranked]
             self.last_scan["candidate_count"] = len(universe_ids)
-            if not universe_ids:
+            if not universe_ids and not do_hydrate:
+                # Find/full runs with zero candidates have nothing to do.
+                # A hydrate-only run EXPECTS zero candidates (no discovery)
+                # and falls through to drain the tier-due queue instead.
                 report(1.0, "No games sourced.")
                 self.last_scan.update({"status": "complete", "metrics_count": 0, "matched_count": 0})
                 self._finish_scan()
@@ -2211,11 +2275,16 @@ class RobloxPlatformScout:
             # stats yet, so they cannot be tiered — a mandatory one-time pass),
             # then known games selected by tier cadence until the per-sync
             # request budget is spent. Whatever does not fit rolls to the next
-            # sync; tiers not due cost zero requests.
+            # sync; tiers not due cost zero requests. Find-only runs skip
+            # draining the known-game queue entirely — that is the hydrator's
+            # job now, so discovery can never starve it.
             # ------------------------------------------------------------------
-            schedule = self.load_tier_refresh_ids(
-                sync_number=sync_number, budget_batches=HYDRATION_BUDGET_PER_SYNC
-            )
+            if do_hydrate:
+                schedule = self.load_tier_refresh_ids(
+                    sync_number=sync_number, budget_batches=HYDRATION_BUDGET_PER_SYNC
+                )
+            else:
+                schedule = {"ids": [], "groups": {}, "tier_counts": {}}
             self.last_scan["tier_schedule"] = schedule["groups"]
             self.last_scan["tier_counts"] = schedule["tier_counts"]
             known_due = schedule["ids"]
@@ -2233,9 +2302,8 @@ class RobloxPlatformScout:
             except sqlite3.Error:
                 existing = set()
             new_ids = [uid for uid in universe_ids if uid not in existing]
-            new_set = set(new_ids)
             budget_cap = HYDRATION_BUDGET_PER_SYNC * 50
-            budget_ids = new_ids + [uid for uid in known_due if uid not in new_set]
+            budget_ids = new_ids + known_due  # known_due are catalog rows; no overlap with new_ids
             hydration_ids = budget_ids[:budget_cap]
             self.last_scan["hydration_budget"] = {
                 "new": len(new_ids),
@@ -2245,6 +2313,19 @@ class RobloxPlatformScout:
                 "budget_batches": HYDRATION_BUDGET_PER_SYNC,
             }
 
+            if not hydration_ids:
+                # Nothing due (or nothing new to hydrate): finish cleanly
+                # without spending a single request — the normal 5-minute
+                # hydrator outcome once the due-queue is drained.
+                self.last_scan.update({
+                    "status": "complete",
+                    "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "matched_count": 0,
+                    "metrics_count": 0,
+                })
+                self._finish_scan()
+                report(1.0, "Hydration pass complete — nothing was due.")
+                return pd.DataFrame()
             report(0.35, f"Fetching metrics for {len(hydration_ids)} games (tier-budgeted)…")
             all_metrics = self.fetch_game_metrics(hydration_ids)
 

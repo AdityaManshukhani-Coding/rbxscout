@@ -1,0 +1,81 @@
+# RbxScout hydrator — the frequent pass.
+#
+# Refreshes stats (CCU / visits / favorites) for games ALREADY in the
+# catalog by draining the tier-due queue. Tier cadences are wall-clock
+# hours (T1 ≤1h, T2 ≤2h, T3 ≤4h, T4 ≤6h), so running every 5 minutes
+# keeps hot games roughly 5–15 minutes fresh without wasting requests on
+# tiers that are not due (they cost zero requests).
+#
+# The DB is the repo: every run commits rbx_scout.db back. Both this
+# workflow and finder.yml declare the SAME concurrency group, which acts
+# as a repo-wide mutex — a run of either waits for the other, so two
+# runs can never push the SQLite file simultaneously. Queued runs are
+# harmless: hydration is catch-up from the DB queue by design.
+#
+# Manual runs: Actions tab -> "Hydrator (5 min)" -> "Run workflow"
+
+name: Hydrator (5 min)
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # GitHub's minimum cadence, UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# ⚠️ Keep this group IDENTICAL to finder.yml — the shared literal string
+# IS the cross-workflow mutex. Changing one without the other re-opens
+# the two-writer race on rbx_scout.db.
+concurrency:
+  group: rbxscout-sync
+  cancel-in-progress: false   # never kill a run mid-flight; queue instead
+
+env:
+  RBXSCOUT_SEARCH_PROXY_URLS: ''   # hydrator never touches the search API
+
+jobs:
+  hydrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10   # a hydration pass is minutes of work, not 30
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14 (matches the tested local env)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # No pytest on hydrator ticks: the runner boot + install already eat
+      # a chunk of the 5-minute cadence, and the finder workflow guards
+      # the code/schema where test-relevant changes actually land.
+
+      - name: Run hydrator (known games only)
+        run: python live_sync.py --only hydrator
+
+      # SQLite runs in WAL mode: fold the write-ahead log into the main
+      # .db file so the commit captures ALL new data, not just the last
+      # checkpoint.
+      - name: Checkpoint SQLite WAL
+        if: always()
+        run: python -c "import sqlite3; c = sqlite3.connect('rbx_scout.db'); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.close()"
+
+      - name: Commit updated catalog
+        if: always()
+        run: |
+          git config user.name  "rbxscout-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add rbx_scout.db rbx_scout.db.sync_state
+          if git diff --cached --quiet; then
+            echo "No catalog changes to commit."
+          else
+            git commit -m "sync: hydrator update (5-min pass)"
+          fi
+          git pull --rebase origin "$GITHUB_REF_NAME"
+          git push

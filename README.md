@@ -13,23 +13,44 @@ around the clock by **GitHub Actions** — no server, no machine left on.
 
 ## How it runs 24/7
 
-- `.github/workflows/sync.yml` runs the full pipeline **every 30 minutes** on
-  GitHub's runners (free for public repos).
-- Each run: run tests → discover (front-page charts + next 100-keyword slice
-  of the 661-word dictionary) → hydrate new finds + tier-due games within the
-  per-sync budget → tier-stamp → blow-up-flag → prune → **commit the updated
-  DB back to this repo**.
-- The repo *is* the persistent database: every run starts from the last
-  committed catalog, so nothing is ever lost between runs.
-- Watch any run live in the **Actions** tab; failures email the repo owner.
+Two workflows split the two jobs so neither can starve the other (both free
+on GitHub's runners for public repos):
+
+- **Hydrator** — `.github/workflows/hydrator.yml`, **every 5 minutes**
+  (GitHub's minimum cadence). Refreshes stats for games *already* in the
+  catalog by draining the tier-due queue. No discovery traffic; tier
+  cadences are wall-clock hours, so a 5-min pass just checks "who's stale
+  now" — tiers that aren't due cost zero requests. Skips the test suite so
+  the tick isn't eaten by runner overhead.
+- **Finder** — `.github/workflows/finder.yml`, **every 30 minutes**.
+  Discovers games: front-page charts + Rolimons pool + the next 100-keyword
+  slice of the 661-word dictionary, then gives every new candidate its
+  mandatory first hydration. Runs the test suite to guard the catalog.
+
+Each run: work → tier-stamp → blow-up-flag → prune → **commit the updated
+DB back to this repo**. The repo *is* the persistent database: every run
+starts from the last committed catalog, so nothing is ever lost between
+runs. Watch any run live in the **Actions** tab; failures email the repo
+owner.
+
+**Race safety:** the DB is one binary SQLite file — git cannot line-merge
+it, so two workflows pushing simultaneously would silently drop one run's
+data. Both workflows therefore declare the *same* Actions concurrency
+group (`rbxscout-sync`), which GitHub enforces as a repo-wide mutex: runs
+queue, never overlap. Keep that string identical in both files. Because
+cron starts are best-effort, "every 5 minutes" is really "stats roughly
+5–15 minutes fresh". The ~6× more frequent DB commits also make the
+periodic history squash (see below) mandatory rather than optional.
 
 ## The tiered catalog
 
 | Tier | Meaning | Refresh cadence |
 |---|---|---|
-| New | not yet hydrated | first, every sync |
-| T1–T2 | the pre-blowup watchlist (small + qualifying) | every sync |
-| T3–T4 | warm | every 2nd / 3rd sync |
+| New | not yet hydrated | first, every finder run |
+| T1 | hot watchlist | when stale > 1h |
+| T2 | pre-blowup watchlist | when stale > 2h |
+| T3 | warm | when stale > 4h |
+| T4 | warm | when stale > 6h |
 | T5–T7 | big games | weekly |
 | T8 | below all thresholds | slow rotating slice; pruned after 14 days stale |
 

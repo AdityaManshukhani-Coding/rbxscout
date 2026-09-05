@@ -1,26 +1,30 @@
-# RbxScout 24/7 sync bot
+# RbxScout finder — the discovery pass.
 #
-# Runs the full pipeline (game finder + tiered hydrator) on GitHub's
-# computers every 3 hours, then commits the updated SQLite catalog back
-# to this repo — the repo itself is the persistent database, so state
-# carries across runs even though the runner's disk is wiped each time.
+# Grows the catalog: front-page charts + Rolimons pool + the next
+# 100-keyword slice of the 661-word dictionary. Every candidate found is
+# hydrated immediately (a new game has no stats yet, so it cannot be
+# tiered — that first hydration is mandatory). The known-game refresh
+# queue is NOT drained here: that is the hydrator workflow's job, so a
+# slow keyword crawl can never starve hot games' stats again.
 #
-# - Manual runs: Actions tab -> "Scheduled sync" -> "Run workflow"
-# - Every run's green/red summary is visible in the run's log output
-# - Public repo => unlimited free Actions minutes
-# - 30-min cadence: fresh runner IP per run => fresh Roblox rate-limit
-#   window each sync; the repo-as-database pattern commits the DB every
-#   run, so squash history occasionally (see README) to keep clones light
+# The DB is the repo: every run commits rbx_scout.db back. Both this
+# workflow and hydrator.yml declare the SAME concurrency group, which
+# acts as a repo-wide mutex — a run of either waits for the other, so
+# two runs can never push the SQLite file simultaneously. (Git cannot
+# line-merge a binary DB; this lock is what makes the two-writer setup
+# safe.)
+#
+# Manual runs: Actions tab -> "Finder (30 min)" -> "Run workflow"
 
-name: Scheduled sync
+name: Finder (30 min)
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # every 30 minutes, UTC
-  workflow_dispatch:          # manual "Run workflow" button
+    - cron: "*/30 * * * *"   # unchanged discovery cadence, UTC
+  workflow_dispatch:
 
 permissions:
-  contents: write             # the workflow may push the updated DB
+  contents: write
 
 env:
   # Search-proxy fallback pool for the keyword crawler: the omni-search
@@ -31,12 +35,15 @@ env:
   # worker URL(s), comma-separated. Leave empty to crawl direct-only.
   RBXSCOUT_SEARCH_PROXY_URLS: ${{ vars.RBXSCOUT_SEARCH_PROXY_URLS || '' }}
 
+# ⚠️ Keep this group IDENTICAL to hydrator.yml — the shared literal string
+# IS the cross-workflow mutex. Changing one without the other re-opens
+# the two-writer race on rbx_scout.db.
 concurrency:
   group: rbxscout-sync
-  cancel-in-progress: false   # never kill a sync mid-flight
+  cancel-in-progress: false   # never kill a run mid-flight; queue instead
 
 jobs:
-  sync:
+  find:
     runs-on: ubuntu-latest
     timeout-minutes: 30       # pacer can stretch on 429s; 30 min is generous
 
@@ -56,8 +63,8 @@ jobs:
       - name: Run test suite (protects the catalog from bad pushes)
         run: python -m pytest tests -q
 
-      - name: Run live sync (finder + hydrator)
-        run: python live_sync.py --min-visits 20000 --min-ccu 25
+      - name: Run finder (discovery + keyword crawl)
+        run: python live_sync.py --only finder --min-visits 20000 --min-ccu 25
 
       # SQLite runs in WAL mode: fold the write-ahead log into the main
       # .db file so the commit captures ALL new data, not just the last
@@ -75,7 +82,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No catalog changes to commit."
           else
-            git commit -m "sync: catalog update (scheduled)"
+            git commit -m "sync: catalog update (finder)"
           fi
           git pull --rebase origin "$GITHUB_REF_NAME"
           git push

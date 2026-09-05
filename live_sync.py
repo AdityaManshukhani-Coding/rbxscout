@@ -1,20 +1,33 @@
 """Live sync runner — the pipeline's "on switch" outside the Streamlit UI.
 
-Runs exactly what the dashboard's "🔄 Sync live data" button runs
-(scout.scan with the session's targets), then prints a green/red summary:
-keyword slice coverage, catalog growth, hydration budget spend, tier
-stamping, blow-up flags, 429/error counters.
+Runs what the dashboard's "🔄 Sync live data" button runs (scout.scan with
+the session's targets), then prints a green/red summary: keyword slice
+coverage, catalog growth, hydration budget spend, tier stamping, blow-up
+flags, 429/error counters.
 
 Usage:
     .venv/bin/python live_sync.py [--min-visits 20000] [--min-ccu 25]
+                                  [--only finder|hydrator]
 
-Safe to re-run at any time: every sync advances the keyword slice, hydrates
-by tier cadence, and upserts what it finds. The DB is the source of truth.
+    --only finder    discovery + keyword crawl only; finds and hydrates NEW
+                     games, never drains the known-game refresh queue.
+    --only hydrator  refreshes games already in the catalog (tier-due queue);
+                     zero discovery traffic — the cheap, frequent pass.
+    (no flag)        full pipeline: find + hydrate in one run (UI parity).
+
+The GitHub workflows pair finder with a 30-min cron and hydrator with a
+5-min cron; both share one Actions concurrency group so two runs can never
+commit the SQLite DB at the same time.
+
+Safe to re-run at any time: every sync advances the keyword slice (finder
+runs only), hydrates by tier cadence, and upserts what it finds. The DB is
+the source of truth.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -68,19 +81,20 @@ def reset_keyword_cursor_if_stale(scout: RobloxPlatformScout) -> None:
         print(f"[warn] cursor rewind skipped: {exc}")
 
 
-def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float) -> int:
+def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float, mode: str) -> int:
     scan = scout.last_scan or {}
     diag = scout.source_diagnostics or {}
     status = scan.get("status", "unknown")
     ok = status == "complete"
 
     print("\n" + "=" * 62)
-    print(f"SYNC #{scan.get('sync_number', '?')} — {'GREEN ✅' if ok else 'FAILED ❌'} ({elapsed:.0f}s)")
+    print(f"SYNC #{scan.get('sync_number', '?')} [{mode}] — {'GREEN ✅' if ok else 'FAILED ❌'} ({elapsed:.0f}s)")
     print("=" * 62)
     print(f"status            : {status}" + (f" — {scan['error']}" if scan.get("error") else ""))
     print(f"keyword slice     : {scan.get('keyword_slice_start', 0) + 1}–"
           f"{scan.get('keyword_slice_end', 0)} of {len(KEYWORD_DICTIONARY)} · "
-          f"{scan.get('keyword_discovered', 0)} games discovered")
+          f"{scan.get('keyword_discovered', 0)} games discovered"
+          + ("  (skipped: hydrator run)" if mode == "hydrator" else ""))
     print(f"candidates        : {scan.get('candidate_count', 0):,}")
     hyd = scan.get("hydration_budget") or {}
     print(f"hydration budget  : {hyd.get('new', 0)} new + {hyd.get('known_due', 0)} known-due "
@@ -92,7 +106,7 @@ def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float) -> int:
     print(f"matches/target    : {scan.get('matched_count', 0):,} · pruned stale: {scan.get('pruned_stale', 0):,}")
     sched = scan.get("tier_schedule") or {}
     if sched:
-        print(f"refresh queue     : T1–2 {sched.get('t1_t2', 0):,} · T3 {sched.get('t3', 0):,} · "
+        print(f"refresh queue     : T1 {sched.get('t1_t2', 0):,} · T2 {sched.get('t2', 0):,} · T3 {sched.get('t3', 0):,} · "
               f"T4 {sched.get('t4', 0):,} · weekly {sched.get('weekly', 0):,} · T8 {sched.get('t8', 0):,}")
     counts = scan.get("tier_counts") or {}
     if counts:
@@ -132,12 +146,34 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run one live sync of the scouting pipeline.")
     parser.add_argument("--min-visits", type=int, default=20_000)
     parser.add_argument("--min-ccu", type=int, default=25)
+    parser.add_argument(
+        "--only",
+        choices=("finder", "hydrator"),
+        default=None,
+        help="finder = discover new games only; hydrator = refresh known games "
+        "only; omit for the full pipeline.",
+    )
     args = parser.parse_args()
+    phases = {
+        "finder": ("find",),
+        "hydrator": ("hydrate",),
+        None: None,
+    }[args.only]
+    mode = args.only or "full"
 
     print(f"db: {DB_PATH}")
+    print(f"mode: {mode}")
     before = snapshot()
-    scout = RobloxPlatformScout(db_path=DB_PATH)
-    reset_keyword_cursor_if_stale(scout)
+    # Optional credential via environment (RBXSCOUT_COOKIE). The .ROBLOSECURITY
+    # cookie is scoped to *.roblox.com only and is never sent to third parties;
+    # leave unset for anonymous scans (public endpoints all work without it).
+    scout = RobloxPlatformScout(
+        db_path=DB_PATH,
+        roblox_cookie=os.environ.get("RBXSCOUT_COOKIE") or None,
+    )
+    if args.only != "hydrator":
+        # Keyword-cursor maintenance only matters when the crawler runs.
+        reset_keyword_cursor_if_stale(scout)
 
     started = time.time()
 
@@ -150,11 +186,12 @@ def main() -> int:
             min_ccu=args.min_ccu,
             deep_contacts=False,          # contacts stay lazy, per page, in the UI
             progress_cb=progress,
+            phases=phases,
         )
     except Exception as exc:
         print(f"\nSYNC CRASHED: {exc}")
-        return summarize(scout, before, time.time() - started) or 1
-    return summarize(scout, before, time.time() - started)
+        return summarize(scout, before, time.time() - started, mode) or 1
+    return summarize(scout, before, time.time() - started, mode)
 
 
 if __name__ == "__main__":
