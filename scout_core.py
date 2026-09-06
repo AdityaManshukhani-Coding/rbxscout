@@ -320,9 +320,11 @@ from keyword_expansion import KEYWORD_EXPANSION  # noqa: E402
 KEYWORD_DICTIONARY = _SEED_KEYWORDS + KEYWORD_EXPANSION
 
 # Number of keywords to crawl per sync (rotating slice) — the ~14.7k-word
-# dictionary swept 100 words at a time = full coverage in ~147 syncs,
-# i.e. a complete sweep about once a day at the 10-minute finder cadence.
-KEYWORDS_PER_SYNC = 100
+# dictionary swept 200 words at a time = full coverage in ~74 syncs, i.e. a
+# complete sweep in ~12h at the 10-minute finder cadence. 200 is a MONITORED
+# TRIAL: capacity_pilot.py tracks keyword success/benching/breaker rates and
+# renders a keep-or-revert verdict into every finder run's log.
+KEYWORDS_PER_SYNC = 200
 
 # --------------------------------------------------------------------------- #
 # Small helpers
@@ -737,6 +739,27 @@ class RobloxPlatformScout:
                     id INTEGER PRIMARY KEY CHECK (id = 1),
                     next_index INTEGER DEFAULT 0,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sync_health_log (
+                    run_id       INTEGER PRIMARY KEY,
+                    mode         TEXT,
+                    ts           TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    kw_total     INTEGER DEFAULT 0,
+                    kw_ok        INTEGER DEFAULT 0,
+                    kw_benched   INTEGER DEFAULT 0,
+                    kw_breaker   INTEGER DEFAULT 0,
+                    metrics_failed INTEGER DEFAULT 0,
+                    metrics_total  INTEGER DEFAULT 0,
+                    known_due    INTEGER DEFAULT 0,
+                    hydrated     INTEGER DEFAULT 0,
+                    deferred     INTEGER DEFAULT 0,
+                    utilization_pct REAL DEFAULT 0,
+                    recommendations TEXT,
+                    extra TEXT
                 )
                 """
             )

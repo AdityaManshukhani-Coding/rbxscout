@@ -37,6 +37,7 @@ APP_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(APP_DIR))
 
 from scout_core import KEYWORD_DICTIONARY, RobloxPlatformScout  # noqa: E402
+import capacity_pilot  # noqa: E402
 DB_PATH = str(APP_DIR / "rbx_scout.db")
 
 
@@ -140,6 +141,16 @@ def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float, mode: st
     rate = (failed / total_batches * 100) if total_batches else 0.0
     print(f"failure rate      : {rate:.1f}% of metric batches ({failed}/{total_batches})"
           + ("  — above the 2% escalation line, watch next sync" if rate > 2 else ""))
+    # Phase-1 capacity pilot: record this run's telemetry, then print the
+    # observe-only report (keyword-trial verdict + utilization + recs).
+    try:
+        capacity_pilot.record_run(
+            DB_PATH, mode, int(scan.get("run_id") or 0), scan, diag,
+            tier_schedule=scan.get("tier_schedule") or {},
+        )
+    except Exception as exc:  # telemetry must never fail a sync
+        print(f"[pilot] record skipped: {exc}")
+    print(capacity_pilot.report(DB_PATH))
     return 0 if ok else 1
 
 
@@ -193,7 +204,6 @@ def main() -> int:
         print(f"\nSYNC CRASHED: {exc}")
         return summarize(scout, before, time.time() - started, mode) or 1
     return summarize(scout, before, time.time() - started, mode)
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
