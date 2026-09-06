@@ -12,6 +12,7 @@ from scout_core import (
     TIER_THRESHOLDS,
     TIER_CADENCE_SYNC,
     TIER8_STALE_PRUNE_DAYS,
+    ZERO_CCU_STRIKES_TO_PRUNE,
     HYDRATION_BUDGET_PER_SYNC,
     classify_tier,
     tier_jump_count,
@@ -907,23 +908,47 @@ def test_blowup_flag_is_sticky_and_watchlist_reads_db(tmp_path):
     assert "discord_url" in watch.columns and "icon_url" in watch.columns
 
 
-def test_prune_catalog_defaults_to_tier8_14_day_rule(tmp_path):
-    """The tightened 14-day floor: 0-CCU rows untouched for 14+ days are
-    removed; fresh rows and live rows survive."""
+def test_prune_catalog_observed_death_rule(tmp_path):
+    """A game dies from being OBSERVED dead repeatedly (4 consecutive 0-CCU
+    visits), not from being ignored — otherwise the fast T8 rotation keeps
+    corpses alive forever. Fresh zeros and live games survive."""
     db = str(tmp_path / "t.db")
     scout = RobloxPlatformScout(db_path=db)
     old_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 20 * 86400))
-    scout.upsert_game({"universe_id": 10, "title": "Corpse", "ccu": 0, "visits": 900})
+    scout.upsert_game({"universe_id": 10, "title": "Dead by strikes", "ccu": 0, "visits": 900})
     scout.upsert_game({"universe_id": 11, "title": "Fresh zero", "ccu": 0, "visits": 900})
     scout.upsert_game({"universe_id": 12, "title": "Alive", "ccu": 50, "visits": 900})
     with sqlite3.connect(db) as conn:
+        # A corpse that was never re-observed still dies by staleness fallback.
         conn.execute("UPDATE game_analytics SET last_updated=? WHERE universe_id=10", (old_ts,))
 
-    removed = scout.prune_catalog()  # no arg: default must be 14 days
-    assert removed == 1
+    removed = scout.prune_catalog()
+    assert removed == 1  # the 20-day-old zero dies via the fallback rule
     ids = set(scout.load_table()["universe_id"])
     assert 10 not in ids and {11, 12}.issubset(ids)
-    assert TIER8_STALE_PRUNE_DAYS == 14
+
+    # Strike accumulation: three more observed visits to the fresh zero.
+    for _ in range(3):
+        scout.upsert_game({"universe_id": 11, "title": "Fresh zero", "ccu": 0, "visits": 900})
+    assert scout.prune_catalog() == 0          # 3 strikes < 4: still alive
+    scout.upsert_game({"universe_id": 11, "title": "Fresh zero", "ccu": 0, "visits": 900})
+    assert scout.prune_catalog() == 1          # 4th consecutive zero: dead
+    assert 11 not in set(scout.load_table()["universe_id"])
+
+    # Revival resets the counter — a game that comes back does not carry
+    # its old strikes to the grave.
+    scout.upsert_game({"universe_id": 13, "title": "Revivor", "ccu": 0, "visits": 10})
+    for _ in range(3):
+        scout.upsert_game({"universe_id": 13, "title": "Revivor", "ccu": 0, "visits": 10})
+    scout.upsert_game({"universe_id": 13, "title": "Revivor", "ccu": 7, "visits": 900})
+    scout.upsert_game({"universe_id": 13, "title": "Revivor", "ccu": 0, "visits": 10})
+    with sqlite3.connect(db) as conn:
+        strikes = conn.execute(
+            "SELECT zero_ccu_strikes FROM game_analytics WHERE universe_id=13"
+        ).fetchone()[0]
+    assert strikes == 1
+    assert scout.prune_catalog() == 0
+    assert TIER8_STALE_PRUNE_DAYS == 14 and ZERO_CCU_STRIKES_TO_PRUNE == 4
 
 
 def test_scheduler_picks_tiers_by_cadence_and_orders_first_in_line(tmp_path):

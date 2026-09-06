@@ -124,7 +124,8 @@ TIER_CADENCE_WALL_HOURS: Dict[int, float] = {
 }
 WEEKLY_TIER_REFRESH_DAYS = 7
 TIER8_ROTATION_DAYS = 2  # cold games all revisited within ~2 days
-TIER8_STALE_PRUNE_DAYS = 14  # below-threshold games untouched for 14d get pruned
+TIER8_STALE_PRUNE_DAYS = 14  # unobserved 0-CCU fallback prune age
+ZERO_CCU_STRIKES_TO_PRUNE = 4  # consecutive observed 0-CCU visits = dead (~8d under 2d rotation)
 NEW_TIER = 0  # never-hydrated (no stats yet); always first in line
 
 
@@ -640,6 +641,7 @@ class RobloxPlatformScout:
                     found_via        TEXT,
                     has_social_links BOOLEAN,
                     contacts_checked_at TIMESTAMP,
+                    zero_ccu_strikes INTEGER DEFAULT 0,
                     last_updated     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -649,6 +651,16 @@ class RobloxPlatformScout:
                 conn.execute("ALTER TABLE game_analytics ADD COLUMN description TEXT")
             if "contact_schema_version" not in columns:
                 conn.execute("ALTER TABLE game_analytics ADD COLUMN contact_schema_version INTEGER DEFAULT 0")
+            if "zero_ccu_strikes" not in columns:
+                conn.execute("ALTER TABLE game_analytics ADD COLUMN zero_ccu_strikes INTEGER DEFAULT 0")
+                # One-time backfill: every existing cold catalog row gets two
+                # strikes so the observed-death prune (4 strikes) cleanses the
+                # accumulated corpse stock within ~4 days of re-observations
+                # instead of ~8, without purging unverified rows.
+                conn.execute(
+                    "UPDATE game_analytics SET zero_ccu_strikes = 2 "
+                    "WHERE COALESCE(ccu, 0) = 0 AND COALESCE(tier, 0) = 0"
+                )
             # Tier stamping (free, pure DB logic after hydration): `tier` is the
             # current stamp, `prev_tier` is the stamp before the most recent
             # re-hydration (powers 2+-tier climb detection), `tier_since` is
@@ -890,7 +902,11 @@ class RobloxPlatformScout:
         uid = record.get("universe_id")
         if uid is not None and record.get("tier") is None:
             record = {**record, **self._tier_stamp_for(int(uid), record)}
-        # 24 bind values + CURRENT_TIMESTAMP for last_updated = 25 columns.
+        # 24 bind values + a strike update + CURRENT_TIMESTAMP.
+        # zero_ccu_strikes counts CONSECUTIVE observed 0-CCU visits: reset to 0
+        # whenever the game has players, +1 when it is seen empty. This is what
+        # makes prune_catalog work under the fast T8 rotation — a game dies from
+        # being OBSERVED dead repeatedly, not from being ignored.
         placeholders = ",".join("?" for _ in range(24))
         with self._connect() as conn:
             conn.execute(
@@ -928,6 +944,9 @@ class RobloxPlatformScout:
                     blowup_flag    = CASE WHEN COALESCE(excluded.blowup_flag, 0) = 1
                                           THEN 1 ELSE COALESCE(game_analytics.blowup_flag, 0) END,
                     blowup_at      = COALESCE(excluded.blowup_at, game_analytics.blowup_at),
+                    zero_ccu_strikes = CASE WHEN COALESCE(excluded.ccu, 0) = 0
+                                            THEN COALESCE(game_analytics.zero_ccu_strikes, 0) + 1
+                                            ELSE 0 END,
                     last_updated    = CURRENT_TIMESTAMP
                 """,
                 (
@@ -1646,23 +1665,33 @@ class RobloxPlatformScout:
                 break
         return pool
 
-    def prune_catalog(self, max_age_days: int = TIER8_STALE_PRUNE_DAYS) -> int:
+    def prune_catalog(self, max_strikes: int = ZERO_CCU_STRIKES_TO_PRUNE) -> int:
         """Floor-prune the catalog (RoTrends-style): drop dead games.
 
-        Removes rows where ccu = 0 AND untouched for ``max_age_days`` — the
-        40M abandoned baseplates never enter the DB. Defaults to the Tier 8
-        14-day rule (tightened from the original 30 days): below-threshold
-        games that stay cold self-clean. Returns rows removed.
+        A game is dead when it has been OBSERVED at 0 CCU on
+        ``ZERO_CCU_STRIKES_TO_PRUNE`` consecutive visits (~8 days with the
+        2-day T8 rotation) — the old 14-days-untouched rule never fired once
+        rotation started refreshing every cold game, which let corpses
+        accumulate and inflate the catalog count. Games that were dead but
+        never re-observed are caught by ``max_age_days`` staleness as a
+        fallback: 0-CCU rows not seen for 14 days still die.
+        Returns rows removed.
         """
         try:
             with self._connect() as conn:
                 cursor = conn.execute(
                     "DELETE FROM game_analytics "
-                    "WHERE COALESCE(ccu, 0) = 0 "
-                    "AND COALESCE(last_updated, '1970-01-01') < datetime('now', ?)",
-                    (f"-{int(max_age_days)} days",),
+                    "WHERE COALESCE(ccu, 0) = 0 AND COALESCE(zero_ccu_strikes, 0) >= ?",
+                    (int(max_strikes),),
                 )
                 removed = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+                cursor = conn.execute(
+                    "DELETE FROM game_analytics "
+                    "WHERE COALESCE(ccu, 0) = 0 "
+                    "AND COALESCE(last_updated, '1970-01-01') < datetime('now', ?)",
+                    (f"-{int(TIER8_STALE_PRUNE_DAYS)} days",),
+                )
+                removed += cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
             if removed:
                 log.info("Catalog floor-prune removed %d dead games", removed)
             return removed
