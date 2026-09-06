@@ -5,11 +5,16 @@
 # workflow_dispatch every 5 minutes; GitHub's internal schedule trigger is
 # intentionally disabled because GitHub does not guarantee schedule timing.
 #
-# The DB is the repo: every run commits rbx_scout.db back. Both this
-# workflow and finder.yml declare the SAME concurrency group, which acts
-# as a repo-wide mutex — a run of either waits for the other, so two
-# runs can never push the SQLite file simultaneously. Queued runs are
-# harmless: hydration is catch-up from the DB queue by design.
+# The catalog no longer lives in git commits. It is the `rbx_scout.db`
+# asset of the rolling Release tag `catalog-latest` in this repo:
+#   pull (asset -> rbx_scout.db) -> sync -> push (rbx_scout.db -> asset).
+# A 2 GiB release asset with no bandwidth limit replaces the old
+# "repo as database" commit every 5 minutes. No LFS, no R2, no card.
+#
+# Race safety is unchanged: both workflows declare the SAME Actions
+# concurrency group (`rbxscout-sync`), a repo-wide mutex, so only one
+# pull/sync/push cycle can ever run at a time. `queue: max` retains
+# pending dispatches while a run is active.
 #
 # Manual runs: Actions tab -> "Hydrator (5 min)" -> "Run workflow"
 
@@ -17,17 +22,15 @@ name: Hydrator (5 min)
 
 on:
 # Automatic dispatching is owned by the Cloudflare Worker in
-# cloudflare-worker/wrangler.toml. Keep only workflow_dispatch here: adding a
-# GitHub schedule would create duplicate Hydrator runs and compete for the
-# SQLite commit.
+# cloudflare-worker/wrangler.toml. Keep only workflow_dispatch here.
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write   # create/update the catalog-latest release assets
 
 # ⚠️ Keep this group IDENTICAL to finder.yml — the shared literal string
 # IS the cross-workflow mutex. Changing one without the other re-opens
-# the two-writer race on rbx_scout.db.
+# the two-writer race on the catalog release.
 concurrency:
   group: rbxscout-sync
   queue: max                 # retain scheduled dispatches while a run is active
@@ -44,6 +47,11 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v4
 
+      # The runner's GITHUB_TOKEN: full read/write on this repo's releases.
+      # db_sync.py picks it up from the environment automatically.
+      - name: Export release-store credentials
+        run: echo "RBXSCOUT_GITHUB_TOKEN=${{ github.token }}" >> "$GITHUB_ENV"
+
       - name: Set up Python 3.14 (matches the tested local env)
         uses: actions/setup-python@v5
         with:
@@ -53,6 +61,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Pull the current catalog from the catalog-latest release. This runs
+      # AFTER the concurrency mutex is held, so it always sees the asset
+      # written by the previous serialized run (no stale-checkout problem).
+      - name: Pull catalog from release store
+        run: python db_sync.py pull
+
       # No pytest on hydrator ticks: the runner boot + install already eat
       # a chunk of the 5-minute cadence, and the finder workflow guards
       # the code/schema where test-relevant changes actually land.
@@ -60,34 +74,8 @@ jobs:
       - name: Run hydrator (known games only)
         run: python live_sync.py --only hydrator
 
-      # SQLite runs in WAL mode: fold the write-ahead log into the main
-      # .db file so the commit captures ALL new data, not just the last
-      # checkpoint.
-      - name: Checkpoint SQLite WAL
+      # One-way door: the workflow is only green if the fresh catalog
+      # actually landed on the release. A failed upload must fail the run.
+      - name: Push catalog to release store
         if: always()
-        run: python -c "import sqlite3; c = sqlite3.connect('rbx_scout.db'); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.close()"
-
-      - name: Commit updated catalog
-        if: always()
-        run: |
-          git config user.name  "rbxscout-bot"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add rbx_scout.db rbx_scout.db.sync_state
-          if git diff --cached --quiet; then
-            echo "No catalog changes to commit."
-            exit 0
-          fi
-          git commit -m "sync: hydrator update (5-min pass)"
-          # A queued run keeps the head SHA it was dispatched with, so a
-          # concurrent run's DB commit can land first and the rebase hits an
-          # unmergeable BINARY conflict. Hydration is idempotent and the
-          # due-queue lives in the DB: defer to the remote state and let the
-          # next 5-minute tick redo this pass. Stays green by design.
-          if git pull --rebase origin "$GITHUB_REF_NAME"; then
-            git push
-          else
-            echo "::warning::DB conflict with a concurrent run - deferring; next tick re-hydrates."
-            git rebase --abort || true
-            git fetch origin "$GITHUB_REF_NAME"
-            git reset --hard "origin/$GITHUB_REF_NAME"
-          fi
+        run: python db_sync.py push

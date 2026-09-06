@@ -6,10 +6,14 @@ favorites, creator), **classifies** every game into a refresh tier, and flags
 the ones blowing up into a **New and Upcoming** watchlist — with Discord
 contact discovery on top.
 
-The catalog lives in this repo (`rbx_scout.db`, SQLite) and is refreshed
+The catalog (`rbx_scout.db`, SQLite) is stored as the **first asset of a
+rolling GitHub Release** (tag `catalog-latest`) in this repo, refreshed
 around the clock by a **Cloudflare Cron Trigger dispatching GitHub Actions**.
 Cloudflare owns the clock; GitHub Actions remains the execution engine and
-commits the database back to this repo.
+swaps the release asset after every run. No credit card, no LFS, no
+third-party database — a release asset gives 2 GiB of headroom with no
+bandwidth limit, authenticated by the `GITHUB_TOKEN` the workflows already
+have.
 
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue) ![Streamlit](https://img.shields.io/badge/streamlit-1.39%2B-red)
 
@@ -30,10 +34,11 @@ The GitHub workflow files intentionally contain **no `schedule:` triggers**.
 They retain `workflow_dispatch` for Cloudflare and manual runs only, so an
 old GitHub cron cannot wake up later and fight the Cloudflare scheduler.
 
-Each run: work → tier-stamp → blow-up-flag → prune → **commit the updated
-DB back to this repo**. The repo *is* the persistent database: every run
-starts from the last committed catalog, so nothing is ever lost between
-runs.
+Each run: **pull the catalog from the `catalog-latest` release** → work →
+tier-stamp → blow-up-flag → prune → **push the catalog back to the release**.
+The release asset *is* the persistent database: every run starts from the
+last pushed catalog, so nothing is ever lost between runs. Git history now
+carries only code — the database never bloats a commit again.
 
 **Race safety:** the DB is one binary SQLite file — git cannot line-merge
 it, so two workflows pushing simultaneously would silently drop one run's
@@ -41,7 +46,32 @@ data. Both workflows therefore declare the same Actions concurrency group
 (`rbxscout-sync`), which GitHub enforces as a repo-wide mutex. Cloudflare may
 dispatch Hydrator and Finder together at `:00`/`:30`; GitHub serializes them.
 The workflows also use GitHub's `queue: max` setting so pending dispatches are
-not silently replaced while another run owns the lock.
+not silently replaced while another run owns the lock. The pull → sync →
+push cycle runs entirely inside that mutex, so the release asset can never
+catch two writers.
+
+## The catalog release store
+
+`rbx_scout.db` lives on the rolling GitHub Release **`catalog-latest`** as
+two assets: `rbx_scout.db` (the catalog itself) and `rbx_scout.db.sync_state`
+(a tiny sync counter, kept for continuity with the old repo-based DB). The
+workflows read and write them through `db_sync.py` using the runner's own
+`GITHUB_TOKEN` — nothing to sign up for beyond the GitHub repo you already
+have.
+
+Locally:
+
+```bash
+export RBXSCOUT_GITHUB_TOKEN=ghp_...   # a PAT with repo access (or skip: your git credential store is tried too)
+python db_sync.py pull                 # release asset -> local rbx_scout.db
+python db_sync.py status               # compare local copy vs the release
+python db_sync.py push                 # local rbx_scout.db -> release asset (clobbers)
+```
+
+Without a token in the environment, `db_sync.py` falls back to your local
+git credential store — the same credential `git push` uses. The release is
+self-describing: `python db_sync.py status` shows which sync produced the
+stored catalog.
 
 
 ## The tiered catalog
@@ -66,9 +96,10 @@ syncs get flagged → **New and Upcoming**.
 
 ```bash
 pip install -r requirements.txt
+python db_sync.py pull       # fetch the current catalog from the release store
 python live_sync.py          # one full sync from the terminal
 python -m pytest tests -q    # test suite
-streamlit run app.py         # the dashboard (reads the committed DB too)
+streamlit run app.py         # the dashboard (reads the local catalog copy)
 ```
 
 ## Data sources
@@ -97,32 +128,37 @@ becomes the only automatic clock for RbxScout.
 1. Push the workflow and Worker changes to the repository's `main` branch.
    Until the new workflow files are on `main`, GitHub may still have the old
    schedule definitions.
-2. Create a GitHub **fine-grained personal access token** for only
+2. Seed the catalog release once, from your machine (creates the
+   `catalog-latest` release and uploads your current `rbx_scout.db`):
+   ```bash
+   python db_sync.py push
+   ```
+3. Create a GitHub **fine-grained personal access token** for only
    `AdityaManshukhani-Coding/rbxscout` with **Actions: Read and write**
    permission. Use an expiration and rotate it periodically.
-3. From `cloudflare-worker/`, install Wrangler and authenticate:
+4. From `cloudflare-worker/`, install Wrangler and authenticate:
    ```bash
    npm install
    npx wrangler login
    ```
-4. Store the token as a Cloudflare secret. Do not put it in this repository,
+5. Store the token as a Cloudflare secret. Do not put it in this repository,
    `wrangler.toml`, GitHub Actions variables, or frontend code:
    ```bash
    npx wrangler secret put GITHUB_TOKEN
    ```
    Paste the token only when Wrangler prompts for it.
-5. Deploy the Worker:
+6. Deploy the Worker:
    ```bash
    npx wrangler deploy
    ```
    The `wrangler.toml` configuration creates one UTC Cron Trigger:
    `*/5 * * * *`. Cloudflare invokes Hydrator on every tick and Finder at
    UTC `:00` and `:30`. Trigger changes can take several minutes to propagate.
-6. Confirm the Worker deployment's **Cron Triggers** page shows exactly one
+7. Confirm the Worker deployment's **Cron Triggers** page shows exactly one
    trigger: `*/5 * * * *`.
-7. Confirm GitHub Actions shows both workflows as active and that their files
+8. Confirm GitHub Actions shows both workflows as active and that their files
    list only `workflow_dispatch` under `on:`—there must be no `schedule:`.
-8. Use **Run workflow** once manually for each workflow to validate the
+9. Use **Run workflow** once manually for each workflow to validate the
    GitHub token, permissions, Python environment, database commit, and push.
    Then watch the next Cloudflare tick in the Actions tab.
 

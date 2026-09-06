@@ -7,12 +7,14 @@
 # queue is NOT drained here: that is the hydrator workflow's job, so a
 # slow keyword crawl can never starve hot games' stats again.
 #
-# The DB is the repo: every run commits rbx_scout.db back. Both this
-# workflow and hydrator.yml declare the SAME concurrency group, which
-# acts as a repo-wide mutex — a run of either waits for the other, so
-# two runs can never push the SQLite file simultaneously. (Git cannot
-# line-merge a binary DB; this lock is what makes the two-writer setup
-# safe.)
+# The catalog lives on the rolling Release `catalog-latest` in this repo
+# (asset rbx_scout.db), NOT in git commits: pull -> sync -> push. The
+# keyword-crawl cursor advances inside the SQLite file, so it persists in
+# the release asset — push happens on every run, success or not.
+#
+# Race safety is unchanged: both workflows declare the SAME Actions
+# concurrency group (`rbxscout-sync`), a repo-wide mutex enforced by
+# GitHub, so two pull/sync/push cycles can never interleave.
 #
 # Manual runs: Actions tab -> "Finder (30 min)" -> "Run workflow"
 
@@ -20,13 +22,11 @@ name: Finder (30 min)
 
 on:
 # Automatic dispatching is owned by the Cloudflare Worker in
-# cloudflare-worker/wrangler.toml. Keep only workflow_dispatch here: adding a
-# GitHub schedule would create duplicate Finder runs and compete for the
-# SQLite commit.
+# cloudflare-worker/wrangler.toml. Keep only workflow_dispatch here.
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write   # create/update the catalog-latest release assets
 
 env:
   # Search-proxy fallback pool for the keyword crawler: the omni-search
@@ -39,7 +39,7 @@ env:
 
 # ⚠️ Keep this group IDENTICAL to hydrator.yml — the shared literal string
 # IS the cross-workflow mutex. Changing one without the other re-opens
-# the two-writer race on rbx_scout.db.
+# the two-writer race on the catalog release.
 concurrency:
   group: rbxscout-sync
   queue: max                 # retain dispatches while another workflow runs
@@ -53,6 +53,9 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v4
 
+      - name: Export release-store credentials
+        run: echo "RBXSCOUT_GITHUB_TOKEN=${{ github.token }}" >> "$GITHUB_ENV"
+
       - name: Set up Python 3.14 (matches the tested local env)
         uses: actions/setup-python@v5
         with:
@@ -62,40 +65,17 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Pull catalog from release store
+        run: python db_sync.py pull
+
       - name: Run test suite (protects the catalog from bad pushes)
         run: python -m pytest tests -q
 
       - name: Run finder (discovery + keyword crawl)
         run: python live_sync.py --only finder --min-visits 20000 --min-ccu 25
 
-      # SQLite runs in WAL mode: fold the write-ahead log into the main
-      # .db file so the commit captures ALL new data, not just the last
-      # checkpoint.
-      - name: Checkpoint SQLite WAL
+      # One-way door: a finder pass that crawls but fails to persist would
+      # re-crawl the same keyword slice next run. Fail visibly instead.
+      - name: Push catalog to release store
         if: always()
-        run: python -c "import sqlite3; c = sqlite3.connect('rbx_scout.db'); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.close()"
-
-      - name: Commit updated catalog
-        if: always()
-        run: |
-          git config user.name  "rbxscout-bot"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add rbx_scout.db rbx_scout.db.sync_state
-          if git diff --cached --quiet; then
-            echo "No catalog changes to commit."
-            exit 0
-          fi
-          git commit -m "sync: catalog update (finder)"
-          # A queued run keeps the head SHA it was dispatched with, so a
-          # concurrent run's DB commit can land first and the rebase hits an
-          # unmergeable BINARY conflict. A deferred finder pass is safe: the
-          # keyword cursor only advances on a successful push, so the next
-          # :13/:43 slot re-crawls the same slice. Stays green by design.
-          if git pull --rebase origin "$GITHUB_REF_NAME"; then
-            git push
-          else
-            echo "::warning::DB conflict with a concurrent run - deferring; next slot re-crawls this slice."
-            git rebase --abort || true
-            git fetch origin "$GITHUB_REF_NAME"
-            git reset --hard "origin/$GITHUB_REF_NAME"
-          fi
+        run: python db_sync.py push

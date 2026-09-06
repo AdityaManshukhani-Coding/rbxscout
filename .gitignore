@@ -26,6 +26,7 @@ cloudflare-worker/.wrangler/
 # --- sqlite WAL sidecars (folded into the .db by checkpointing) ---
 *.db-wal
 *.db-shm
+*.db.tmp
 
 # --- private notes & local screenshots (delete these lines to publish) ---
 GAMES_DB_PLAN.md
@@ -33,6 +34,9 @@ implementation_plan.md
 FIXES.md
 assets/
 
-# NOTE: rbx_scout.db and rbx_scout.db.sync_state are NOT ignored —
-# they are committed by the GitHub Actions sync (the repo is the
-# persistent database for the 24/7 bot).
+# NOTE: rbx_scout.db and rbx_scout.db.sync_state are NOT in git anymore.
+# The catalog is the `rbx_scout.db` asset of the rolling Release tag
+# `catalog-latest` in this repo — pull/push it with `python db_sync.py`.
+# Git stays for code; the Release asset is the database.
+rbx_scout.db
+rbx_scout.db.sync_state
