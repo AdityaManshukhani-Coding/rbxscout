@@ -7,9 +7,10 @@
  *    keyword crawler can use Cloudflare's IP pool instead of the shared
  *    GitHub Actions runner IP range.
  * 2. Scheduler: every five minutes, dispatches the Hydrator workflow through
- *    GitHub's workflow_dispatch API. At UTC minute 00 and 30 it also
- *    dispatches Finder. GitHub's internal `schedule` triggers are disabled
- *    in this repository, so Cloudflare is the only automatic clock.
+ *    GitHub's workflow_dispatch API. Every ten minutes (:00, :10, :20, :30,
+ *    :40, :50) it also dispatches Finder. GitHub's internal `schedule`
+ *    triggers are disabled in this repository, so Cloudflare is the only
+ *    automatic clock.
  *
  * The GitHub token is a Worker secret (`GITHUB_TOKEN`) and is never returned
  * in a response or written to logs.
@@ -132,9 +133,11 @@ async function dispatchDueWorkflows(controller, env) {
     ["hydrator", GITHUB_WORKFLOWS.hydrator],
   ];
 
-  // Finder runs on the same five-minute clock, but only at :00 and :30 UTC.
-  // Keeping one Cloudflare trigger avoids two independent scheduler clocks.
-  if (minute % 30 === 0) {
+  // Finder runs on the same five-minute clock, but only every ten minutes
+  // (:00, :10, :20, :30, :40, :50 UTC). Keeping one Cloudflare trigger avoids
+  // two independent scheduler clocks; the shared rbxscout-sync Actions
+  // concurrency group serializes finder/hydrator when ticks coincide.
+  if (minute % 10 === 0) {
     due.push(["finder", GITHUB_WORKFLOWS.finder]);
   }
 

@@ -1,11 +1,13 @@
-# RbxScout finder — the discovery pass.
+# RbxScout finder — the discovery pass (every 10 minutes).
 #
 # Grows the catalog: front-page charts + Rolimons pool + the next
-# 100-keyword slice of the 661-word dictionary. Every candidate found is
-# hydrated immediately (a new game has no stats yet, so it cannot be
-# tiered — that first hydration is mandatory). The known-game refresh
-# queue is NOT drained here: that is the hydrator workflow's job, so a
-# slow keyword crawl can never starve hot games' stats again.
+# 100-keyword slice of the ~14.7k-word dictionary (662 curated seeds + a
+# deterministic bases×modifiers expansion — a full sweep takes ~24h at
+# this cadence). Every candidate found is hydrated immediately (a new game
+# has no stats yet, so it cannot be tiered — that first hydration is
+# mandatory). The known-game refresh queue is NOT drained here: that is
+# the hydrator workflow's job, so a slow keyword crawl can never starve
+# hot games' stats again.
 #
 # The catalog lives on the rolling Release `catalog-latest` in this repo
 # (asset rbx_scout.db), NOT in git commits: pull -> sync -> push. The
@@ -16,9 +18,9 @@
 # concurrency group (`rbxscout-sync`), a repo-wide mutex enforced by
 # GitHub, so two pull/sync/push cycles can never interleave.
 #
-# Manual runs: Actions tab -> "Finder (30 min)" -> "Run workflow"
+# Manual runs: Actions tab -> "Finder (10 min)" -> "Run workflow"
 
-name: Finder (30 min)
+name: Finder (10 min)
 
 on:
 # Automatic dispatching is owned by the Cloudflare Worker in

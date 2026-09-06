@@ -26,9 +26,12 @@ runs every five minutes in UTC:
   5 minutes through GitHub's `workflow_dispatch` API. It refreshes stats for
   games *already* in the catalog by draining the tier-due queue. No discovery
   traffic; tiers that are not due cost zero requests.
-- **Finder** — at UTC minute `00` and `30`, the same Worker also dispatches
+- **Finder** — every ten minutes (UTC `:00`, `:10`, `:20`, `:30`, `:40`,
+  `:50`), the same Worker also dispatches
   `.github/workflows/finder.yml`. It discovers games from front-page charts,
-  the Rolimons pool, and the next 100-keyword slice, then hydrates new games.
+  the Rolimons pool, and the next 100-keyword slice of the ~14.7k-word
+  dictionary (662 curated seeds + a deterministic bases×modifiers expansion;
+  a full sweep takes ~24h at the 10-minute cadence), then hydrates new games.
 
 The GitHub workflow files intentionally contain **no `schedule:` triggers**.
 They retain `workflow_dispatch` for Cloudflare and manual runs only, so an
@@ -44,7 +47,8 @@ carries only code — the database never bloats a commit again.
 it, so two workflows pushing simultaneously would silently drop one run's
 data. Both workflows therefore declare the same Actions concurrency group
 (`rbxscout-sync`), which GitHub enforces as a repo-wide mutex. Cloudflare may
-dispatch Hydrator and Finder together at `:00`/`:30`; GitHub serializes them.
+dispatch Hydrator and Finder together at every ten-minute boundary; GitHub
+serializes them.
 The workflows also use GitHub's `queue: max` setting so pending dispatches are
 not silently replaced while another run owns the lock. The pull → sync →
 push cycle runs entirely inside that mutex, so the release asset can never
@@ -152,8 +156,9 @@ becomes the only automatic clock for RbxScout.
    npx wrangler deploy
    ```
    The `wrangler.toml` configuration creates one UTC Cron Trigger:
-   `*/5 * * * *`. Cloudflare invokes Hydrator on every tick and Finder at
-   UTC `:00` and `:30`. Trigger changes can take several minutes to propagate.
+   `*/5 * * * *`. Cloudflare invokes Hydrator on every tick and Finder every
+   ten minutes (UTC `:00`, `:10`, `:20`, `:30`, `:40`, `:50`). Trigger changes
+   can take several minutes to propagate.
 7. Confirm the Worker deployment's **Cron Triggers** page shows exactly one
    trigger: `*/5 * * * *`.
 8. Confirm GitHub Actions shows both workflows as active and that their files

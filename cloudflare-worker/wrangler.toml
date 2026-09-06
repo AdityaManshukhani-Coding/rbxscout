@@ -3,7 +3,8 @@ main = "src/index.js"
 compatibility_date = "2026-08-15"
 
 # Cloudflare is the only automatic scheduler. Every five-minute tick
-# dispatches Hydrator; the Worker also dispatches Finder at :00/:30 UTC.
+# dispatches Hydrator; the Worker also dispatches Finder every ten minutes
+# (:00, :10, :20, :30, :40, :50 UTC).
 [triggers]
 crons = ["*/5 * * * *"]
 

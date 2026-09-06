@@ -166,11 +166,13 @@ def tier_jump_count(previous: Optional[int], current: Optional[int]) -> int:
     return int(current) - int(previous)
 
 # Keyword dictionary for the omni-search crawler (Phase 2).
-# 9 themed slices, deduped (675 raw → 661 unique; first occurrence kept).
+# = curated seeds (below, 662 words — positions are STABLE because the crawl
+#   cursor keyword_crawl_state.next_index is positional) appended with the
+#   deterministic expansion from keyword_expansion.py (~14k bases×modifiers).
 # Each sync crawls the next KEYWORDS_PER_SYNC-word slice of this list.
-# NOTE: slice rotation is positional — keep edits append-only, or reset
+# NOTE: keep edits append-only (seeds first, expansion last), or reset
 # keyword_crawl_state.next_index to 0 after big mid-list edits.
-KEYWORD_DICTIONARY = [
+_SEED_KEYWORDS = [
     # -- Slice 1: Action Prefixes & Core Mechanics (words 1-87) ------------
     "steal a", "rob a", "grow a", "build a", "escape the", "survive the",
     "raise a", "feed a", "catch a", "collect the", "upgrade your", "buy a",
@@ -306,13 +308,20 @@ KEYWORD_DICTIONARY = [
     "tryhard", "mechanics", "tech", "animation cancel", "combo extender",
     "passive skill", "ultimate", "cooldown", "stamina bar", "health bar",
     "shield", "armor pen", "lifesteal", "critical hit", "headshot",
-    "true damage", "stun", "freeze", "burn", "poison", "shock", "wall run",
-    "double jump", "grappling hook", "jetpack", "glider", "slide", "mantle",
+    "true damage", "stun", "freeze", "burn", "poison", "shock", "wall run",    "double jump", "grappling hook", "jetpack", "glider", "slide", "mantle",
     "vault", "sprint",
 ]
 
-# Number of keywords to crawl per sync (rotating slice) — a 661-word
-# dictionary swept 100 words at a time = full coverage in 7 syncs.
+# Full dictionary = seeds + expansion (appended, never reshuffled — the DB
+# crawl cursor is a position, so the live cursor keeps working unchanged:
+# it simply continues from wherever it is into the expansion, then wraps).
+from keyword_expansion import KEYWORD_EXPANSION  # noqa: E402
+
+KEYWORD_DICTIONARY = _SEED_KEYWORDS + KEYWORD_EXPANSION
+
+# Number of keywords to crawl per sync (rotating slice) — the ~14.7k-word
+# dictionary swept 100 words at a time = full coverage in ~147 syncs,
+# i.e. a complete sweep about once a day at the 10-minute finder cadence.
 KEYWORDS_PER_SYNC = 100
 
 # --------------------------------------------------------------------------- #
