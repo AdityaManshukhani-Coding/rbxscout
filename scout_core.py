@@ -123,7 +123,7 @@ TIER_CADENCE_WALL_HOURS: Dict[int, float] = {
     4: 6.0,
 }
 WEEKLY_TIER_REFRESH_DAYS = 7
-TIER8_ROTATION_DAYS = 3  # rotating slice every ~3–7 days
+TIER8_ROTATION_DAYS = 2  # cold games all revisited within ~2 days
 TIER8_STALE_PRUNE_DAYS = 14  # below-threshold games untouched for 14d get pruned
 NEW_TIER = 0  # never-hydrated (no stats yet); always first in line
 
@@ -1683,13 +1683,13 @@ class RobloxPlatformScout:
         """Pick which known games deserve re-hydration this sync.
 
         Cadence-ordered: T1–T2 (stale past 1–2 wall-clock hours) → T3 (4h)
-        → T4 (6h) → T5–T7 weekly wall-clock bucket → T8 rotating 3-day slice.
+        → T4 (6h) → T5–T7 weekly wall-clock bucket → T8 rotating 2-day slice.
         Tiers not due under their cadence cost zero requests. The scheduler
         caps the selected list at ``batch_size * budget_batches`` universes;
         the caller hydrates as many of those as its own budget allows —
         anything beyond rolls to the next sync naturally.
 
-        T8 rotation: one deterministic 3-day bucket (epoch // TIER8_ROTATION_DAYS
+        T8 rotation: one deterministic 2-day bucket (epoch // TIER8_ROTATION_DAYS
         mod bucket_count) so every sub-threshold game is visited at least once
         every rotation cycle without spending budget on all of them each sync.
         """

@@ -88,7 +88,7 @@ stored catalog.
 | T3 | warm | when stale > 4h |
 | T4 | warm | when stale > 6h |
 | T5–T7 | big games | weekly |
-| T8 | below all thresholds | slow rotating slice; pruned after 14 days stale |
+| T8 | below all thresholds | 2-day rotating slice; pruned after 14 days stale |
 
 Classification is **higher-axis**: a game's tier is the higher of its
 visits-axis tier and CCU-axis tier (CCU is the leading indicator of a
