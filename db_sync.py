@@ -265,12 +265,17 @@ def stats_payloads(db: Path) -> dict[str, dict]:
         return {}
     payloads: dict[str, dict] = {
         ASSET_STATS: {
+            # shields.io endpoint schema…
             "schemaVersion": 1,
             "label": "catalog",
             "message": f"{int(games):,} games",
-            "color": "brightgreen",
-            # Extra keys are ignored by shields.io but make the file
-            # self-describing for humans and other consumers.
+            "color": "green",
+            # …plus badgen.net schema (the README uses badgen because
+            # shields.io blocks github.com release URLs). Unknown keys are
+            # ignored by either renderer, so one file feeds both.
+            "subject": "catalog",
+            "status": f"{int(games):,} games",
+            # Self-describing extras for humans and other consumers.
             "games": int(games),
             "last_sync_utc": last or "",
         },
@@ -281,6 +286,8 @@ def stats_payloads(db: Path) -> dict[str, dict]:
             "label": f"match {TARGET_MIN_VISITS // 1000}k visits / {TARGET_MIN_CCU} CCU",
             "message": f"{int(passing):,} games",
             "color": "blue",
+            "subject": f"match {TARGET_MIN_VISITS // 1000}k visits / {TARGET_MIN_CCU} CCU",
+            "status": f"{int(passing):,} games",
             "games": int(passing),
             "last_sync_utc": last or "",
         }

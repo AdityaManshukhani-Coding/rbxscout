@@ -22,15 +22,15 @@ have.
 Every Hydrator/Finder push regenerates `stats.json` + `stats_target.json` as
 release assets, so these badges track the catalog in near-real time — no
 commits, no manual updates. (They can lag a few minutes behind the last sync
-because shields.io caches.): the raw feeds are the
+because the badge CDN caches.) The raw feeds are the
 [`stats.json`](https://github.com/AdityaManshukhani-Coding/rbxscout/releases/download/catalog-latest/stats.json)
 and
 [`stats_target.json`](https://github.com/AdityaManshukhani-Coding/rbxscout/releases/download/catalog-latest/stats_target.json)
 assets of the [`catalog-latest` release](https://github.com/AdityaManshukhani-Coding/rbxscout/releases/tag/catalog-latest),
 whose page header also shows the counts + last-sync time.
 
-[![Catalog size](https://img.shields.io/endpoint?url=https%3A%2F%2Fgithub.com%2FAdityaManshukhani-Coding%2Frbxscout%2Freleases%2Fdownload%2Fcatalog-latest%2Fstats.json&cacheSeconds=300)](https://github.com/AdityaManshukhani-Coding/rbxscout/releases/tag/catalog-latest)
-[![Games matching target](https://img.shields.io/endpoint?url=https%3A%2F%2Fgithub.com%2FAdityaManshukhani-Coding%2Frbxscout%2Freleases%2Fdownload%2Fcatalog-latest%2Fstats_target.json&cacheSeconds=300)](https://github.com/AdityaManshukhani-Coding/rbxscout/releases/tag/catalog-latest)
+[![Catalog size](https://badgen.net/https/github.com/AdityaManshukhani-Coding/rbxscout/releases/download/catalog-latest/stats.json?icon=roblox)](https://github.com/AdityaManshukhani-Coding/rbxscout/releases/tag/catalog-latest)
+[![Games matching target](https://badgen.net/https/github.com/AdityaManshukhani-Coding/rbxscout/releases/download/catalog-latest/stats_target.json)](https://github.com/AdityaManshukhani-Coding/rbxscout/releases/tag/catalog-latest)
 
 ## How it runs 24/7
 
