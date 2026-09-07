@@ -68,9 +68,7 @@ class FakeGitHubHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _asset_payload(self, name: str) -> bytes:
-        if name == db_sync.ASSET_DB:
-            return self.assets.get("db", b"")
-        return self.assets.get("state", b"")
+        return self.assets.get(name, b"")
 
     # -- routing ----------------------------------------------------------
     def do_GET(self):
@@ -100,10 +98,7 @@ class FakeGitHubHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", 0))
             name = self.path.split("name=")[-1]
             data = self.rfile.read(length)
-            if name == db_sync.ASSET_DB:
-                self.assets["db"] = data
-            else:
-                self.assets["state"] = data
+            self.assets[name] = data
             FakeGitHubHandler.next_id += 1
             asset = {
                 "id": FakeGitHubHandler.next_id, "name": name, "size": len(data),
@@ -129,6 +124,19 @@ class FakeGitHubHandler(BaseHTTPRequestHandler):
             }
             self.releases[tag] = rel
             return self._json(201, rel)
+        self._json(404, {"message": "Not Found"})
+
+    def do_PATCH(self):
+        self.requests.append(("PATCH", self.path))
+        if self.path.startswith("/repos/x/y/releases/"):
+            rid = int(self.path.rstrip("/").rsplit("/", 1)[-1])
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
+            for rel in self.releases.values():
+                if rel["id"] == rid:
+                    rel.update(body)
+                    return self._json(200, rel)
+            return self._json(404, {"message": "Not Found"})
         self._json(404, {"message": "Not Found"})
 
     def do_DELETE(self):
@@ -182,7 +190,7 @@ class DBSyncTest(unittest.TestCase):
 
     def setUp(self):
         FakeGitHubHandler.releases = {}
-        FakeGitHubHandler.assets = {"db": b"", "state": b""}
+        FakeGitHubHandler.assets = {db_sync.ASSET_DB: b"", db_sync.ASSET_STATE: b""}
         FakeGitHubHandler.requests = []
         FakeGitHubHandler.next_id = 100
         self._env = {k: os.environ.pop(k, None) for k in
@@ -219,9 +227,18 @@ class TestPush(DBSyncTest):
         self.assertEqual(rc, 0)
         rel = self.release()
         self.assertEqual(rel["tag_name"], "catalog-latest")
-        self.assertEqual(len(rel["assets"]), 2)
-        self.assertEqual(FakeGitHubHandler.assets["db"], db_sync.DB_PATH.read_bytes())
-        self.assertEqual(FakeGitHubHandler.assets["state"], b"41\n")
+        # db + sync_state + stats.json (stats_target.json is skipped: the
+        # minimal test DB has no visits/ccu columns to count against).
+        self.assertEqual(len(rel["assets"]), 3)
+        self.assertEqual(FakeGitHubHandler.assets[db_sync.ASSET_DB], db_sync.DB_PATH.read_bytes())
+        self.assertEqual(FakeGitHubHandler.assets[db_sync.ASSET_STATE], b"41\n")
+        stats = json.loads(FakeGitHubHandler.assets[db_sync.ASSET_STATS].decode())
+        self.assertEqual(stats["games"], 5)
+        self.assertTrue(stats["message"].startswith("5"))
+        # the release page's 📊 counts line was refreshed via PATCH
+        patch_calls = [r for r in FakeGitHubHandler.requests if r[0] == "PATCH"]
+        self.assertTrue(patch_calls)
+        self.assertTrue(rel["body"].startswith("📊 **5 games**"))
         # asset API urls must point at the fake host, not the real one
         self.assertIn(self.base, rel["upload_url"])
 
@@ -232,8 +249,8 @@ class TestPush(DBSyncTest):
         db_sync.STATE_PATH.write_text("42\n")
         db_sync.main(["db_sync.py", "push"])
         rel = self.release()
-        self.assertEqual(len(rel["assets"]), 2)  # replaced, not duplicated
-        blob = FakeGitHubHandler.assets["db"]
+        self.assertEqual(len(rel["assets"]), 3)  # replaced, not duplicated
+        blob = FakeGitHubHandler.assets[db_sync.ASSET_DB]
         self.assertEqual(len(blob), db_sync.DB_PATH.stat().st_size)
 
     def test_push_refuses_non_sqlite_file(self):
@@ -276,7 +293,7 @@ class TestPull(DBSyncTest):
                         "url": f"{self.base}/api/assets/1/{db_sync.ASSET_DB}",
                         "updated_at": "2026-09-06T00:00:00Z"}],
         }
-        FakeGitHubHandler.assets["db"] = b"<html>not a db</html>"
+        FakeGitHubHandler.assets[db_sync.ASSET_DB] = b"<html>not a db</html>"
         with self.assertRaises(db_sync.SyncError):
             db_sync.cmd_pull()
 

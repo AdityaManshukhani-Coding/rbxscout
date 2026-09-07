@@ -6,8 +6,11 @@ in every sync commit). Now the catalog is the **first asset** of a GitHub
 Release tagged ``catalog-latest``:
 
     Release catalog-latest
-    ├── rbx_scout.db           <- the catalog itself (asset 1)
-    └── rbx_scout.db.sync_state  <- tiny marker: how many syncs wrote this asset
+    ├── rbx_scout.db             <- the catalog itself (asset 1)
+    ├── rbx_scout.db.sync_state  <- tiny marker: how many syncs wrote this asset
+    └── stats.json               <- tiny badge feed: live catalog counts
+                                   (drives the README shields.io badges +
+                                    the counts at the top of the release page)
 
 Why a Release asset instead of a commit?
   * 2 GiB per asset, no bandwidth limit, no LFS quota, no credit card.
@@ -54,7 +57,14 @@ RELEASE_TAG = "catalog-latest"
 RELEASE_NAME = "RbxScout catalog (rolling)"
 ASSET_DB = "rbx_scout.db"
 ASSET_STATE = "rbx_scout.db.sync_state"
+ASSET_STATS = "stats.json"
 API = "https://api.github.com"
+
+# The “meets the target” line uses the pipeline's standard entry bar
+# (live_sync.py defaults). Kept in one place so the badge and the release
+# page always agree with what the finder actually enforces.
+TARGET_MIN_VISITS = 20_000
+TARGET_MIN_CCU = 25
 
 
 class SyncError(RuntimeError):
@@ -158,6 +168,8 @@ def release_body() -> str:
         "Rolling catalog storage for RbxScout — written by the Hydrator/Finder "
         "workflows, read by db_sync.py. The 'rbx_scout.db' asset is the current "
         "catalog and 'rbx_scout.db.sync_state' counts the syncs that wrote it. "
+        "The 📊 line at the top shows the live catalog counts (stats.json is "
+        "the machine-readable feed behind the README badges). "
         "Do not edit this release manually; each push replaces the assets."
     )
 
@@ -211,6 +223,93 @@ def _asset_state(rel: dict, token: str) -> str | None:
                         accept="application/octet-stream")
             return data.decode("utf-8", "replace").strip() or None
     return None
+
+
+# --------------------------------------------------------------------------
+# Live counts (stats.json badge feed + release-page line)
+# --------------------------------------------------------------------------
+
+def stats_payloads(db: Path) -> dict[str, dict]:
+    """Build the badge-feed JSON files from the local catalog.
+
+    ``stats.json``      -> shields.io endpoint badge: total games.
+    ``stats_target.json`` -> badge: games meeting the 20k visits / 25 CCU bar.
+
+    Read-only and defensive: a missing table/column degrades that field, and
+    an unreadable DB returns {} so a stats hiccup can NEVER block the
+    catalog push itself.
+    """
+    import sqlite3
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            games = conn.execute("SELECT COUNT(*) FROM game_analytics").fetchone()[0]
+            passing = last = None
+            try:
+                passing = conn.execute(
+                    "SELECT COUNT(*) FROM game_analytics "
+                    "WHERE visits >= ? AND ccu >= ?",
+                    (TARGET_MIN_VISITS, TARGET_MIN_CCU),
+                ).fetchone()[0]
+            except sqlite3.Error:
+                pass
+            try:
+                last = conn.execute(
+                    "SELECT MAX(finished_at) FROM scan_runs WHERE status = 'complete'"
+                ).fetchone()[0]
+            except sqlite3.Error:
+                pass
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {}
+    payloads: dict[str, dict] = {
+        ASSET_STATS: {
+            "schemaVersion": 1,
+            "label": "catalog",
+            "message": f"{int(games):,} games",
+            "color": "brightgreen",
+            # Extra keys are ignored by shields.io but make the file
+            # self-describing for humans and other consumers.
+            "games": int(games),
+            "last_sync_utc": last or "",
+        },
+    }
+    if passing is not None:
+        payloads["stats_target.json"] = {
+            "schemaVersion": 1,
+            "label": f"match {TARGET_MIN_VISITS // 1000}k visits / {TARGET_MIN_CCU} CCU",
+            "message": f"{int(passing):,} games",
+            "color": "blue",
+            "games": int(passing),
+            "last_sync_utc": last or "",
+        }
+    return payloads
+
+
+def _update_release_stats_line(rel: dict, token: str, payloads: dict[str, dict]) -> None:
+    """Best-effort: show the live counts at the top of the release page.
+
+    Cosmetic only — any failure here is reported and skipped, never allowed
+    to fail the catalog push.
+    """
+    try:
+        stats = payloads.get(ASSET_STATS) or {}
+        target = payloads.get("stats_target.json") or {}
+        games = int(stats.get("games") or 0)
+        passing = int(target.get("games") or 0)
+        last = str(stats.get("last_sync_utc") or "unknown")
+        lines = [l for l in (rel.get("body") or "").splitlines()
+                 if not l.startswith("📊")]
+        body = (
+            f"📊 **{games:,} games** · **{passing:,}** meet the "
+            f"{TARGET_MIN_VISITS:,} visits / {TARGET_MIN_CCU} CCU target · "
+            f"last sync {last} UTC\n\n" + "\n".join(lines).strip()
+        )
+        _api("PATCH", f"/repos/{repo_slug()}/releases/{rel['id']}", token,
+             body={"body": body})
+    except Exception as exc:  # cosmetic: never block the push
+        print(f"stats line on release page skipped: {exc}")
 
 
 # --------------------------------------------------------------------------
@@ -279,8 +378,15 @@ def cmd_push() -> int:
     old_state = _asset_state(rel, token)
     upload_asset(rel, token, ASSET_DB, blob)
     upload_asset(rel, token, ASSET_STATE, (state + "\n").encode())
+    payloads = stats_payloads(DB_PATH)
+    for name, payload in payloads.items():
+        upload_asset(rel, token, name, (json.dumps(payload) + "\n").encode())
+    if payloads:
+        _update_release_stats_line(rel, token, payloads)
     print(f"push: {DB_PATH.name}  {len(blob)/1e6:.1f} MB  sync #{state}"
           + (f"  (replaces sync #{old_state or 'none'})" if old_state and old_state != state else ""))
+    for name, payload in payloads.items():
+        print(f"push: {name}  games={payload.get('games'):,}")
     return 0
 
 

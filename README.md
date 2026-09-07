@@ -17,6 +17,21 @@ have.
 
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue) ![Streamlit](https://img.shields.io/badge/streamlit-1.39%2B-red)
 
+### Live catalog counts (auto-refresh)
+
+Every Hydrator/Finder push regenerates `stats.json` + `stats_target.json` as
+release assets, so these badges track the catalog in near-real time — no
+commits, no manual updates. (They can lag a few minutes behind the last sync
+because shields.io caches.): the raw feeds are the
+[`stats.json`](https://github.com/AdityaManshukhani-Coding/rbxscout/releases/download/catalog-latest/stats.json)
+and
+[`stats_target.json`](https://github.com/AdityaManshukhani-Coding/rbxscout/releases/download/catalog-latest/stats_target.json)
+assets of the [`catalog-latest` release](https://github.com/AdityaManshukhani-Coding/rbxscout/releases/tag/catalog-latest),
+whose page header also shows the counts + last-sync time.
+
+[![Catalog size](https://img.shields.io/endpoint?url=https%3A%2F%2Fgithub.com%2FAdityaManshukhani-Coding%2Frbxscout%2Freleases%2Fdownload%2Fcatalog-latest%2Fstats.json&cacheSeconds=300)](https://github.com/AdityaManshukhani-Coding/rbxscout/releases/tag/catalog-latest)
+[![Games matching target](https://img.shields.io/endpoint?url=https%3A%2F%2Fgithub.com%2FAdityaManshukhani-Coding%2Frbxscout%2Freleases%2Fdownload%2Fcatalog-latest%2Fstats_target.json&cacheSeconds=300)](https://github.com/AdityaManshukhani-Coding/rbxscout/releases/tag/catalog-latest)
+
 ## How it runs 24/7
 
 A Cloudflare Worker is the only automatic scheduler. Its one Cron Trigger
@@ -28,10 +43,12 @@ runs every five minutes in UTC:
   traffic; tiers that are not due cost zero requests.
 - **Finder** — every ten minutes (UTC `:00`, `:10`, `:20`, `:30`, `:40`,
   `:50`), the same Worker also dispatches
-  `.github/workflows/finder.yml`. It discovers games from front-page charts,
-  the Rolimons pool, and the next 100-keyword slice of the ~14.7k-word
+  `.github/workflows/finder.yml`. It discovers games from the DEEP charts
+  (the full leaderboard taxonomy — ~26 sorts / ~770 games per run), the
+  Rolimons pool, and the next 200-keyword slice of the ~14.7k-word
   dictionary (662 curated seeds + a deterministic bases×modifiers expansion;
-  a full sweep takes ~24h at the 10-minute cadence), then hydrates new games.
+  a full sweep takes ~12h at the 10-minute cadence, each keyword read to
+  page 2), then hydrates new games.
 
 The GitHub workflow files intentionally contain **no `schedule:` triggers**.
 They retain `workflow_dispatch` for Cloudflare and manual runs only, so an
