@@ -122,6 +122,9 @@ def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float, mode: st
     kw = diag.get("keyword_crawl") or {}
     print(f"keyword crawler   : {kw.get('successful', kw.get('successful_keywords', 0))}/"
           f"{kw.get('keywords', 0)} OK · breaker: {kw.get('breaker_tripped', False)}")
+    if kw.get("search_depth", 1) > 1 or kw.get("page2_new") is not None:
+        print(f"keyword pages     : depth {kw.get('search_depth', 1)} · {kw.get('pages_fetched', 0)} pages "
+              f"fetched · +{kw.get('page2_new', 0)} new games from page 2+")
     pool = kw.get("pool") or []
     if pool:
         benched = kw.get("benched") or []
@@ -133,7 +136,8 @@ def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float, mode: st
             pool_desc += f"  (benched: {', '.join(benched)})"
         print(f"search IP pool    : {pool_desc}")
     disc = diag.get("discovery") or {}
-    print(f"discovery         : HTTP {disc.get('status', '?')} · {disc.get('records', 0)} games")
+    print(f"discovery         : HTTP {disc.get('status', '?')} · {disc.get('records', 0)} games · "
+          f"{disc.get('sorts', 0)} sorts across {disc.get('pages', 0)} chart page(s)")
 
     # 429 sanity: counts come from the diagnostics the engine records.
     total_batches = metrics.get("batches", 0) or 0

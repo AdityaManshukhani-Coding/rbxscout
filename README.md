@@ -112,7 +112,7 @@ All public, cookieless endpoints — no credentials anywhere in this repo:
 
 | Stage | Source |
 |---|---|
-| Discovery | `apis.roblox.com/explore-api/v1/get-sorts`, `search-api/omni-search` |
+| Discovery | `apis.roblox.com/explore-api/v1/get-sorts` (deep charts: follows `nextSortsPageToken` through the full leaderboard taxonomy — Top Earning, Top Rated, Most Popular and every genre chart, ~26 sorts / ~770 games per run), `search-api/omni-search` (depth 2: page 1 + `nextPageToken` page 2 per keyword) |
 | Bulk index | `api.rolimons.com/games/v1/gamelist` |
 | Metrics | `games.roblox.com/v1/games` (50 universes/batch) |
 | Icons | `thumbnails.roblox.com/v1/games/icons` |

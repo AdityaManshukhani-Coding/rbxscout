@@ -361,6 +361,22 @@ KEYWORD_DICTIONARY = _SEED_KEYWORDS + KEYWORD_EXPANSION
 # renders a keep-or-revert verdict into every finder run's log.
 KEYWORDS_PER_SYNC = 200
 
+# --- Deep charts (explore-api) ---------------------------------------------- #
+# get-sorts page 1 embeds only 5 sorts (~465 games). Its response carries a
+# nextSortsPageToken cursor that walks the FULL chart taxonomy — Top Earning,
+# Top Rated, Most Popular, Top Paid Access and every genre leaderboard
+# ("Trending in RPG", …). Roblox serves ~26 sorts / ~770 unique games over
+# ~5 pages today; the cap below is only a runaway-cursor safety ceiling.
+# The charts endpoint is the polite one (no 429 tantrums like omni-search),
+# so the whole walk costs a handful of lenient requests per finder run.
+CHARTS_SORT_PAGES = 8
+
+# Keyword-crawl depth: page 1 + pageToken follow-ups per keyword. omni-search
+# returns nextPageToken; page 2 catches games ranked just past the first page
+# for that keyword. Quality decays fast per page and the search budget is the
+# fragile one, so depth is capped at 2 by design (decision 2026-09-07).
+SEARCH_PAGES_PER_KEYWORD = 2
+
 # --------------------------------------------------------------------------- #
 # Small helpers
 # --------------------------------------------------------------------------- #
@@ -566,24 +582,31 @@ class RobloxPlatformScout:
                 log.warning("Ignoring malformed search proxy URL: %r", part)
         return entries + ["direct"]
 
-    def _search_request_url(self, base: str, keyword: str, sid: str) -> str:
+    def _search_request_url(self, base: str, keyword: str, sid: str, page_token: Optional[str] = None) -> str:
         """Build the omni-search URL for one pool entry.
 
         ``direct`` goes straight to Roblox; anything else is a proxy base URL
         that mirrors the same path+query, e.g.
         ``https://rbx-search-proxy.<you>.workers.dev`` →
         ``https://rbx-search-proxy.<you>.workers.dev/search-api/omni-search?...``.
-        Malformed proxy entries (no scheme/host) are skipped.
+        ``page_token`` paginates past result page 1 (omni-search returns a
+        ``nextPageToken``). Malformed proxy entries (no scheme/host) are
+        skipped.
         """
         q = quote(keyword)
         path_query = f"search-api/omni-search?searchQuery={q}&pageType=all&sessionId={sid}"
+        if page_token:
+            path_query += f"&pageToken={quote(str(page_token), safe='')}"
         if base == "direct":
             return f"https://apis.roblox.com/{path_query}"
         # Entries are validated in _search_proxy_urls; belt-and-suspenders:
         return f"{base}/{path_query}"
 
-    def _search_pool_request(self, keyword: str) -> Tuple[int, Optional[Any]]:
+    def _search_pool_request(self, keyword: str, page_token: Optional[str] = None) -> Tuple[int, Optional[Any]]:
         """Try the omni-search endpoint through the IP pool in order.
+
+        ``page_token`` fetches a later result page for the same keyword
+        (page 1 response carries ``nextPageToken``).
 
         Pool order = every configured proxy, then direct Roblox. A proxy
         attempt counts as failed on: network error, HTTP >= 500, or a 200
@@ -600,7 +623,7 @@ class RobloxPlatformScout:
         for i, base in enumerate(pool):
             if base != "direct" and self._search_pool_benched(base):
                 continue  # benched proxy: skip straight past it
-            url = self._search_request_url(base, keyword, sid)
+            url = self._search_request_url(base, keyword, sid, page_token=page_token)
             if i > 0:
                 time.sleep(0.25)  # small settle between pool entries
             try:
@@ -1215,15 +1238,46 @@ class RobloxPlatformScout:
     SEARCH_PROXY_TIMEOUT = 8.0  # workers cold-start; a bit above request_timeout
 
     def fetch_discovery_games(self) -> List[Dict[str, Any]]:
-        """Roblox Discovery (explore-api): front-page charts incl. universeIds."""
-        status, data = self._get_json(
-            "https://apis.roblox.com/explore-api/v1/get-sorts?sessionId=rbxscout"
+        """Roblox Discovery (explore-api): DEEP charts crawl.
+
+        Page 1 of get-sorts embeds only 5 sorts (~465 games). The response
+        carries a ``nextSortsPageToken`` cursor that walks the FULL chart
+        taxonomy — Top Earning, Top Rated, Most Popular, Top Paid Access and
+        every genre leaderboard ("Trending in RPG", …): ~26 sorts and ~770
+        unique games over ~5 polite requests today. Every page embeds its
+        sorts' games with universeId + playerCount, so no per-sort follow-up
+        requests are needed. Leaderboards rank by players playing right now,
+        which makes them exactly the net that catches successful games our
+        keyword crawl is blind to (search matches names; charts rank players).
+
+        The cursor must ride the SAME sessionId it was minted for, so one
+        UUID session id is generated per crawl and reused for every page.
+        ``CHARTS_SORT_PAGES`` caps the walk as a runaway-cursor ceiling. A
+        failed page keeps the results gathered so far — the charts endpoint
+        is the lenient one and partial data still widens the pond.
+        """
+        sid = str(uuid.uuid4())
+        url: Optional[str] = (
+            f"https://apis.roblox.com/explore-api/v1/get-sorts?sessionId={sid}"
         )
         games: Dict[int, Dict[str, Any]] = {}
-        self.source_diagnostics["discovery"] = {"status": status}
-        if status == 200 and data:
+        status = 0
+        pages = 0
+        sort_count = 0
+        for _ in range(max(1, CHARTS_SORT_PAGES)):
+            page_status, data = self._get_json(url)
+            if page_status != 200 or not data:
+                if pages == 0:
+                    status = page_status  # page 1 dead: report the failure
+                break
+            status = 200
+            pages += 1
             for sort in data.get("sorts") or []:
-                for g in sort.get("games") or []:
+                sort_games = sort.get("games") or []
+                if not sort_games:
+                    continue  # filters/metadata sorts carry no games
+                sort_count += 1
+                for g in sort_games:
                     uid = g.get("universeId")
                     if not uid:
                         continue
@@ -1244,8 +1298,25 @@ class RobloxPlatformScout:
                             playing=g.get("playerCount"),
                             root_place_id=g.get("rootPlaceId"),
                         )
-        self.source_diagnostics["discovery"]["records"] = len(games)
-        log.info("Discovery API returned %d games", len(games))
+            token = data.get("nextSortsPageToken")
+            if not token:
+                break
+            url = (
+                "https://apis.roblox.com/explore-api/v1/get-sorts"
+                f"?sessionId={sid}&sortsPageToken={token}"
+            )
+        self.source_diagnostics["discovery"] = {
+            "status": status,
+            "records": len(games),
+            "sorts": sort_count,
+            "pages": pages,
+        }
+        log.info(
+            "Discovery deep charts: %d page(s) -> %d sorts, %d games",
+            pages,
+            sort_count,
+            len(games),
+        )
         return list(games.values())
 
     def fetch_rolimons_games(self) -> Dict[int, Dict[str, Any]]:
@@ -1505,11 +1576,15 @@ class RobloxPlatformScout:
     def fetch_search_games(self, keywords: List[str]) -> Dict[int, Dict[str, Any]]:
         """Omni-search keyword crawler (Phase 2): discover games by keyword.
 
-        One request per keyword against
-        ``apis.roblox.com/search-api/omni-search?searchQuery=KW&pageType=all``.
-        The response already carries universe IDs (verified live: ~40 games per
-        keyword, no cookie, ~0.5 s per call), so no place→universe conversion
-        is needed.
+        Up to ``SEARCH_PAGES_PER_KEYWORD`` (2) requests per keyword against
+        ``apis.roblox.com/search-api/omni-search?searchQuery=KW&pageType=all``:
+        page 1, then a ``pageToken`` follow-up using the response's
+        ``nextPageToken`` to catch games ranked just past the first page.
+        Page 2 failures never trip the circuit breaker and never poison page
+        1's success; their contribution is counted in diagnostics
+        (``page2_new``). The response already carries universe IDs (verified
+        live: ~40 games per keyword, no cookie, ~0.5 s per call), so no
+        place→universe conversion is needed.
 
         Every keyword request is routed through the search-proxy IP pool
         (``_search_pool_request``): configured Cloudflare Worker proxies first
@@ -1525,6 +1600,8 @@ class RobloxPlatformScout:
             self.source_diagnostics = {}
         out: Dict[int, Dict[str, Any]] = {}
         statuses: List[int] = []
+        pages_fetched = 0
+        page2_new = 0
         if not keywords:
             self.source_diagnostics["keyword_crawl"] = {
                 "keywords": 0, "records": 0, "breaker_tripped": False,
@@ -1532,61 +1609,117 @@ class RobloxPlatformScout:
             }
             return out
 
+        def parse_payload(data: Any) -> int:
+            """Merge one omni-search payload into ``out``; return new-uid count."""
+            fresh = 0
+            # Response shape (verified live): searchResults[] each with
+            # contents[] carrying universeId + name.
+            for group in data.get("searchResults") or []:
+                for content in group.get("contents") or []:
+                    try:
+                        uid = int(content["universeId"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if uid not in out:
+                        out[uid] = {
+                            "universe_id": uid,
+                            "title": content.get("name") or "Unknown",
+                            "root_place_id": content.get("rootPlaceId"),
+                        }
+                        fresh += 1
+            return fresh
+
         def work(keyword: str):
-            return self._search_pool_request(keyword)
+            """Page 1 + (depth-capped) pageToken follow-up for one keyword."""
+            results = []
+            depth = max(1, SEARCH_PAGES_PER_KEYWORD)
+            token: Optional[str] = None
+            for _ in range(depth):
+                # Only pass page_token when following up: calling with an
+                # explicit None kwarg would still break callers that override
+                # _search_pool_request with the original one-arg signature.
+                if token:
+                    status, data = self._search_pool_request(keyword, page_token=token)
+                else:
+                    status, data = self._search_pool_request(keyword)
+                results.append((status, data))
+                if status != 200 or not data:
+                    break
+                token = data.get("nextPageToken")
+                if not token:
+                    break
+            return results
 
         consecutive_failures = 0
         breaker_tripped = False
+        successful_keywords = 0
+        failed_keywords = 0
         with ThreadPoolExecutor(max_workers=min(self.max_workers, 8)) as pool:
             futures = {pool.submit(work, kw): kw for kw in keywords}
+
+            def trip_breaker() -> None:
+                nonlocal breaker_tripped
+                breaker_tripped = True
+                log.warning(
+                    "Keyword crawler circuit breaker tripped after %d consecutive failures; "
+                    "cancelling remaining keyword requests",
+                    consecutive_failures,
+                )
+                for f in futures:
+                    f.cancel()
+
             for fut in as_completed(futures):
                 kw = futures[fut]
                 try:
-                    status, data = fut.result()
+                    page_results = fut.result()
                 except Exception as exc:  # network-level failure counts as a miss
                     log.debug("Keyword %r failed: %s", kw, exc)
                     statuses.append(0)
-                    consecutive_failures += 1
-                    continue
-                statuses.append(status)
-                if status != 200 or not data:
+                    failed_keywords += 1
                     consecutive_failures += 1
                     if consecutive_failures >= 5 and not breaker_tripped:
-                        breaker_tripped = True
-                        log.warning(
-                            "Keyword crawler circuit breaker tripped after %d consecutive failures; "
-                            "cancelling remaining keyword requests",
-                            consecutive_failures,
-                        )
-                        for f in futures:
-                            f.cancel()
+                        trip_breaker()
                         break
                     continue
-                consecutive_failures = 0
-                # Response shape (verified live): searchResults[] each with
-                # contents[] carrying universeId + name.
-                for group in data.get("searchResults") or []:
-                    for content in group.get("contents") or []:
-                        try:
-                            uid = int(content["universeId"])
-                        except (KeyError, TypeError, ValueError):
-                            continue
-                        if uid not in out:
-                            out[uid] = {
-                                "universe_id": uid,
-                                "title": content.get("name") or "Unknown",
-                                "root_place_id": content.get("rootPlaceId"),
-                            }
+                keyword_ok = False
+                for page_no, (status, data) in enumerate(page_results, start=1):
+                    statuses.append(status)
+                    if status != 200 or not data:
+                        continue  # a dead page 2 must not poison page 1's success
+                    keyword_ok = True
+                    pages_fetched += 1
+                    fresh = parse_payload(data)
+                    if page_no > 1:
+                        page2_new += fresh  # requests beyond page 1 = deep pages
+                if keyword_ok:
+                    successful_keywords += 1
+                    consecutive_failures = 0
+                else:
+                    failed_keywords += 1
+                    consecutive_failures += 1
+                    if consecutive_failures >= 5 and not breaker_tripped:
+                        trip_breaker()
+                        break
         crawl_diag = self._search_pool_snapshot()
         crawl_diag.update({
             "keywords": len(keywords),
-            "successful_keywords": sum(200 == s for s in statuses),
-            "failed_keywords": sum(200 != s for s in statuses),
+            "successful_keywords": successful_keywords,
+            "failed_keywords": failed_keywords,
             "breaker_tripped": breaker_tripped,
             "records": len(out),
+            "pages_fetched": pages_fetched,
+            "page2_new": page2_new,
+            "search_depth": max(1, SEARCH_PAGES_PER_KEYWORD),
         })
         self.source_diagnostics["keyword_crawl"] = crawl_diag
-        log.info("Keyword crawler: %d keywords → %d unique games", len(keywords), len(out))
+        log.info(
+            "Keyword crawler: %d keywords x %d page(s) -> %d unique games "
+            "(%d from page 2+)",
+            len(keywords),
+            max(1, SEARCH_PAGES_PER_KEYWORD),
+            len(out),
+            page2_new,
+        )
         return out
 
     def _load_keyword_cursor(self) -> int:
@@ -2269,7 +2402,7 @@ class RobloxPlatformScout:
 
         try:
             if do_find:
-                report(0.02, "Fetching Discovery charts…")
+                report(0.02, "Crawling deep charts (full leaderboard taxonomy)…")
                 discovery = self.fetch_discovery_games()
             else:
                 discovery = []  # hydrate-only: zero discovery traffic

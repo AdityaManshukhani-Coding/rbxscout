@@ -1,9 +1,12 @@
 # RbxScout finder — the discovery pass (every 10 minutes).
 #
-# Grows the catalog: front-page charts + Rolimons pool + the next
-# 100-keyword slice of the ~14.7k-word dictionary (662 curated seeds + a
-# deterministic bases×modifiers expansion — a full sweep takes ~24h at
-# this cadence). Every candidate found is hydrated immediately (a new game
+# Grows the catalog: DEEP charts (get-sorts follows its nextSortsPageToken
+# cursor through the full leaderboard taxonomy — ~26 sorts / ~770 games per
+# run, catching genre charts and Top Earning/Rated that page 1 alone hides)
+# + Rolimons pool + the next 200-keyword slice of the ~14.7k-word dictionary
+# (662 curated seeds + a deterministic bases×modifiers expansion — a full
+# sweep takes ~12h at this cadence), each keyword read to page 2. Every
+# candidate found is hydrated immediately (a new game
 # has no stats yet, so it cannot be tiered — that first hydration is
 # mandatory). The known-game refresh queue is NOT drained here: that is
 # the hydrator workflow's job, so a slow keyword crawl can never starve
