@@ -50,6 +50,40 @@ DISCORD_REGEX = (
 
 DISCORD_LOGO_URL = "https://cdn.simpleicons.org/discord/5865F2"
 
+# Default outreach message copied per game in the dashboard. The [Your Name]
+# and [Game Name] tags are placeholders: they are filled in automatically
+# when the user copies a message (name from the welcome flow, game from the
+# row's title). Users may edit the template freely in the welcome flow or
+# sidebar, but the tags must stay for auto-fill to keep working.
+DEFAULT_MESSAGE_TEMPLATE = """\
+Hey,
+
+I'm [Your Name] from Studio Scouts. We help Roblox developers scale, fund, and monetize their games by connecting them with leading industry partners.
+
+We’ve been following your progress and are really impressed by **[Game Name]**. I'm reaching out to see if you'd be open to discussing potential growth opportunities—whether that's selling a percentage of the game, securing investment/funding, or tapping into LiveOps, publishing, and marketing support.
+
+I directly represent studios and investors like Jae Studio, Khalid Games, Ascend Studios, and several others (portfolio references below):
+
+* https://jaeceo.com/
+* https://spong.pro/
+* https://www.vexedinteractive.com/
+* https://summitinteractive.co.uk/
+* https://playastudios.org/
+* https://games.worldent.online/
+
+If you're open to exploring options, I'd love to share a few details and see what makes the most sense for your project.
+
+Looking forward to connecting!
+
+Best regards,
+
+**[Your Name]**
+
+Studio Scouts"""
+
+NAME_TAG_REGEX = re.compile(r"\[(?:your name|name)\]", re.IGNORECASE)
+GAME_TAG_REGEX = re.compile(r"\[(?:game name|game)\]", re.IGNORECASE)
+
 BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -346,6 +380,24 @@ def truncate(text: str, max_len: int, suffix: str = "...") -> str:
     if len(text) <= max_len:
         return text
     return text[: max(0, max_len - len(suffix))].rstrip() + suffix
+
+
+def render_outreach_message(template: str, scout_name: str, game_title: str) -> str:
+    """Fill a message template's [Your Name] and [Game Name] tags for one game.
+
+    The scout name comes from the welcome-flow Discord question and the game
+    title from each table row. Missing values leave the corresponding tag in
+    place so a broken message is never copied silently. An empty template
+    falls back to the default.
+    """
+    text = (template or "").strip() or DEFAULT_MESSAGE_TEMPLATE
+    name = (scout_name or "").strip()
+    game = (game_title or "").strip()
+    if name:
+        text = NAME_TAG_REGEX.sub(lambda _match: name, text)
+    if game:
+        text = GAME_TAG_REGEX.sub(lambda _match: game, text)
+    return text
 
 
 def escape_md(text: str) -> str:

@@ -7,6 +7,7 @@ Run: streamlit run app.py
 from __future__ import annotations
 
 import html
+import json
 import logging
 import time
 from pathlib import Path
@@ -17,6 +18,7 @@ import streamlit as st
 
 from scout_core import (
     DEFAULT_CANDIDATE_LIMIT,
+    DEFAULT_MESSAGE_TEMPLATE,
     DISCORD_FILTER_ALL,
     DISCORD_FILTER_FALSE,
     DISCORD_FILTER_TRUE,
@@ -24,6 +26,7 @@ from scout_core import (
     RobloxPlatformScout,
     apply_filters,
     compact_num,
+    render_outreach_message,
     truncate,
 )
 
@@ -143,7 +146,8 @@ def initialize_session() -> None:
         "target_min_visits": DEFAULT_MIN_VISITS,
         "target_min_ccu": DEFAULT_MIN_CCU,
         "onboarding_cookie": "",
-        "discord_name": "",  # reserved for a future workflow; intentionally hidden
+        "discord_name": "",  # asked in the welcome flow; auto-fills the outreach message
+        "message_template": DEFAULT_MESSAGE_TEMPLATE,
         "guide_step": 1,
         "pending_initial_scan": False,
     "welcome_scan_started": False,
@@ -198,7 +202,7 @@ def render_onboarding() -> bool:
         st.subheader("to the Studio Scouts Website")
         st.write("Find Roblox games that fit your targets, then check only the results you care about.")
         st.info("Your first scan uses the targets you choose next. Contact lookups are loaded page by page.")
-        if st.button("Next", type="primary", width="stretch"):
+        if st.button("Next", type="primary", width="stretch", key="onb0_next"):
             st.session_state.onboarding_step = 1
             st.rerun()
         return False
@@ -245,11 +249,83 @@ def render_onboarding() -> bool:
         )
         if int(st.session_state.target_min_visits) == 0 and int(st.session_state.target_min_ccu) == 0:
             st.warning("Set at least one target before continuing.")
-        if st.button("Next", type="primary", width="stretch"):
+        if st.button("Next", type="primary", width="stretch", key="onb1_next"):
             if int(st.session_state.target_min_visits) or int(st.session_state.target_min_ccu):
                 st.session_state.onboarding_step = 2
                 st.session_state.guide_step = 1
                 st.rerun()
+        return False
+
+    if step == 3:
+        st.title("What is your Discord username?")
+        st.caption(
+            "Your username is filled into the outreach message automatically, so game "
+            "owners see who is contacting them. You can change it later in the sidebar."
+        )
+        st.text_input(
+            "Discord username",
+            key="discord_name",
+            max_chars=64,
+            placeholder="e.g. dev_razor10 or rip_indra",
+        )
+        if not str(st.session_state.discord_name or "").strip():
+            st.caption("Tip: add your username so the message template can fill it in for you.")
+        back, next_column = st.columns(2)
+        if back.button("Back", width="stretch", key="onb3_back"):
+            st.session_state.onboarding_step = 2
+            st.session_state.guide_step = 4
+            st.rerun()
+        if next_column.button("Next", type="primary", width="stretch", key="onb3_next"):
+            st.session_state.onboarding_step = 4
+            st.rerun()
+        return False
+
+    if step == 4:
+        st.title("Your outreach message")
+        st.caption(
+            "This is the message the Copy button prepares for each game. Edit it "
+            "however you like, or continue with the default."
+        )
+        st.text_area(
+            "Message template",
+            key="message_template",
+            height=430,
+        )
+        st.caption(
+            "Make sure you use the [Your Name] tag for your Discord username and the "
+            "[Game Name] tag for the game's name — both are filled in automatically "
+            "when you copy a message, so keep them if you edit the text."
+        )
+        preview = render_outreach_message(
+            st.session_state.message_template,
+            st.session_state.discord_name,
+            "Blox Fruits",
+        )
+        with st.expander("Preview — your name + a sample game", expanded=False):
+            st.code(preview, language="markdown")
+        back, next_column = st.columns(2)
+        if back.button("Back", width="stretch", key="onb4_back"):
+            st.session_state.onboarding_step = 3
+            st.rerun()
+        if next_column.button("Start my first scan", type="primary", width="stretch", key="onb4_start"):
+            # Bulletproof target capture: read the live onboarding widget
+            # values at this exact moment and copy them into the canonical
+            # keys that the sidebar and the first scan consume.
+            st.session_state.target_min_visits = int(
+                st.session_state.get("onboard_visits", st.session_state.target_min_visits)
+            )
+            st.session_state.target_min_ccu = int(
+                st.session_state.get("onboard_ccu", st.session_state.target_min_ccu)
+            )
+            st.session_state.onboarding_complete = True
+            # Run the real first scan on the post-onboarding rerun with the
+            # captured targets. The dashboard paints as soon as it finishes;
+            # speed hardening in scout_core keeps that well under a minute.
+            st.session_state.pending_initial_scan = True
+            st.session_state.contact_page = 1
+            st.session_state.contact_loaded = set()
+            st.session_state.contact_signature = ""
+            st.rerun()
         return False
 
     st.title("Connect your Roblox session")
@@ -293,28 +369,11 @@ def render_onboarding() -> bool:
         else:
             st.session_state.guide_step = guide_step - 1
         st.rerun()
-    next_label = "Start my first scan" if guide_step == 4 else "Next"
-    if next_column.button(next_label, type="primary", width="stretch"):
+    if next_column.button("Next", type="primary", width="stretch", key="onb2_next"):
         if guide_step < 4:
             st.session_state.guide_step = guide_step + 1
         else:
-            # Bulletproof target capture: read the live onboarding widget
-            # values at this exact moment and copy them into the canonical
-            # keys that the sidebar and the first scan consume.
-            st.session_state.target_min_visits = int(
-                st.session_state.get("onboard_visits", st.session_state.target_min_visits)
-            )
-            st.session_state.target_min_ccu = int(
-                st.session_state.get("onboard_ccu", st.session_state.target_min_ccu)
-            )
-            st.session_state.onboarding_complete = True
-            # Run the real first scan on the post-onboarding rerun with the
-            # captured targets. The dashboard paints as soon as it finishes;
-            # speed hardening in scout_core keeps that well under a minute.
-            st.session_state.pending_initial_scan = True
-            st.session_state.contact_page = 1
-            st.session_state.contact_loaded = set()
-            st.session_state.contact_signature = ""
+            st.session_state.onboarding_step = 3
         st.rerun()
     if guide_step == 4 and not st.session_state.onboarding_cookie:
         st.caption("You can continue without a cookie; public descriptions will still be checked.")
@@ -488,6 +547,14 @@ with st.sidebar.expander("⚙️ Scan settings", expanded=False):
     if apply_cookie:
         scout.set_cookie(cookie)
         st.toast("Cookie applied to the active Roblox session.")
+
+with st.sidebar.expander("✉️ Outreach message", expanded=False):
+    st.text_input("Discord username", key="discord_name", max_chars=64)
+    st.text_area("Message template", key="message_template", height=250)
+    st.caption(
+        "Keep the [Your Name] and [Game Name] tags — they auto-fill when you "
+        "copy a message from the results table."
+    )
 
 sync = st.sidebar.button("🔄 Sync live data", type="primary", width="stretch")
 check_contacts = st.sidebar.button(
@@ -814,6 +881,14 @@ TABLE_STYLE = """
 .ss-discord img { width: 18px; height: 18px; }
 .ss-discord span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 240px; }
 .ss-discord:hover span { text-decoration: underline; }
+.ss-copy {
+  font-size: 0.8rem; padding: 5px 10px; border-radius: 8px; cursor: pointer;
+  border: 1px solid rgba(128, 128, 128, 0.5); background: transparent;
+  color: inherit; white-space: nowrap; font-family: inherit;
+}
+.ss-copy:hover { background: rgba(128, 128, 128, 0.15); }
+.ss-copied { color: #22c55e; border-color: #22c55e; }
+.ss-copyfail { color: #ef4444; border-color: #ef4444; }
 .ss-none { opacity: 0.55; }
 </style>
 """
@@ -876,6 +951,45 @@ def discord_cell_html(url) -> str:
     )
 
 
+# Inline copy handler for the Message column. It must live in the onclick
+# attribute (not a <script> tag) because Streamlit renders markdown HTML via
+# innerHTML, which never executes script elements. Tries the async clipboard
+# API first, then falls back to a hidden-textarea execCommand copy, and shows
+# one-shot "Copied" feedback on the button itself.
+_COPY_JS = (
+    "(async function(btn){var msg=JSON.parse(btn.dataset.msg),label=btn.textContent,ok=false;"
+    "try{await navigator.clipboard.writeText(msg);ok=true}catch(e){}"
+    "if(!ok){var ta=document.createElement('textarea');ta.value=msg;"
+    "ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);"
+    "ta.focus();ta.select();try{ok=document.execCommand('copy')}catch(e2){}ta.remove()}"
+    "btn.textContent=ok?'✓ Copied!':'✗ Copy failed';"
+    "btn.classList.add(ok?'ss-copied':'ss-copyfail');"
+    "setTimeout(function(){btn.textContent=label;"
+    "btn.classList.remove('ss-copied','ss-copyfail')},1600)})(this)"
+)
+
+
+def copy_cell_html(row: pd.Series) -> str:
+    """One cell: a button that copies the outreach message for this game.
+
+    The message is rendered from the user's editable template with their
+    Discord name (welcome flow) and this row's game title, JSON-encoded into
+    a data attribute so quotes and newlines survive the HTML round-trip.
+    """
+    message = render_outreach_message(
+        st.session_state.get("message_template", DEFAULT_MESSAGE_TEMPLATE),
+        st.session_state.get("discord_name", ""),
+        _text(row.get("title"), "this game"),
+    )
+    payload = html.escape(json.dumps(message), quote=True)
+    return (
+        '<button type="button" class="ss-copy" '
+        f'data-msg="{payload}" '
+        f'onclick="{_COPY_JS}">'
+        "📋 Copy message</button>"
+    )
+
+
 def render_table(frame: pd.DataFrame) -> None:
     """Render the visible page as an HTML table.
 
@@ -884,7 +998,7 @@ def render_table(frame: pd.DataFrame) -> None:
     could never display inline. HTML keeps the merged thumbnail+name and
     logo+invite cells working in every Streamlit version.
     """
-    head = ["Game", "Genre", "Total visits", "CCU", "Peak CCU", "Favorites", "Discord", "Creator"]
+    head = ["Game", "Genre", "Total visits", "CCU", "Peak CCU", "Favorites", "Discord", "Message", "Creator"]
     rows = []
     for _, row in frame.iterrows():
         rows.append(
@@ -896,6 +1010,7 @@ def render_table(frame: pd.DataFrame) -> None:
             f"<td class='ss-num'>{_num_cell(row.get('peak_ccu'))}</td>"
             f"<td class='ss-num'>{_num_cell(row.get('favorites'))}</td>"
             f"<td>{discord_cell_html(row.get('discord_url'))}</td>"
+            f"<td>{copy_cell_html(row)}</td>"
             f"<td>{_esc(_text(row.get('creator_name'), '-'))}</td>"
             "</tr>"
         )
