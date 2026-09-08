@@ -205,6 +205,11 @@ curl -s "https://rbx-search-proxy.<you>.workers.dev/search-api/omni-search?searc
 
 No proxy variable? The crawler falls back to direct Roblox requests.
 
+Want a second IP pool? `cloudflare-worker/deno-mirror.ts` is a paste-ready
+Deno Deploy mirror (free 1M req/month, Google infra) — deploy it from the
+browser in ~2 minutes and append its URL to the same variable, before
+`direct`. See `cloudflare-worker/MIRRORS.md` (Option B) for the walkthrough.
+
 ## Keyword-crawler IP pool (Cloudflare Worker proxy)
 
 GitHub Actions runners share a small egress IP range, so the omni-search

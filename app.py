@@ -956,17 +956,50 @@ def discord_cell_html(url) -> str:
 # innerHTML, which never executes script elements. Tries the async clipboard
 # API first, then falls back to a hidden-textarea execCommand copy, and shows
 # one-shot "Copied" feedback on the button itself.
-_COPY_JS = (
-    "(async function(btn){var msg=JSON.parse(btn.dataset.msg),label=btn.textContent,ok=false;"
-    "try{await navigator.clipboard.writeText(msg);ok=true}catch(e){}"
-    "if(!ok){var ta=document.createElement('textarea');ta.value=msg;"
-    "ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);"
-    "ta.focus();ta.select();try{ok=document.execCommand('copy')}catch(e2){}ta.remove()}"
-    "btn.textContent=ok?'✓ Copied!':'✗ Copy failed';"
-    "btn.classList.add(ok?'ss-copied':'ss-copyfail');"
-    "setTimeout(function(){btn.textContent=label;"
-    "btn.classList.remove('ss-copied','ss-copyfail')},1600)})(this)"
-)
+# Copy handling for the Message column, injected as a <script> by
+# render_table. Inline onclick attributes are stripped by DOMPurify even
+# with unsafe_allow_javascript=True, so a delegated click listener is used
+# instead: it copies the JSON-encoded message from the button's data-msg,
+# tries the async clipboard API first and falls back to a hidden-textarea
+# execCommand copy, then shows one-shot "Copied" feedback on the button.
+_COPY_SCRIPT = """
+<script>
+window.__ssCopyReady = true;
+document.addEventListener('click', function (event) {
+  var btn = event.target && event.target.closest ? event.target.closest('button.ss-copy') : null;
+  if (!btn) { return; }
+  var msg, label = btn.textContent, ok = false;
+  try { msg = JSON.parse(btn.dataset.msg); } catch (err) { return; }
+  // Freshness override: a Streamlit text_input only commits on blur/rerun,
+  // so a name typed just before clicking Copy may not be in data-msg yet.
+  // Prefer the live sidebar input value when it differs.
+  var nameInput = document.querySelector('[data-testid="stSidebar"] input[aria-label*="Discord username"], aside input[aria-label*="Discord username"]');
+  var name = nameInput && nameInput.value.trim();
+  if (name) {
+    msg = msg.replace(/\[Your Name\]/gi, name).replace(/\[Name\]/gi, name);
+  }
+  var finish = function () {
+    btn.textContent = ok ? '✓ Copied!' : '✗ Copy failed';
+    btn.classList.add(ok ? 'ss-copied' : 'ss-copyfail');
+    setTimeout(function () {
+      btn.textContent = label;
+      btn.classList.remove('ss-copied', 'ss-copyfail');
+    }, 1600);
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(msg).then(function () { ok = true; finish(); },
+      function () { fallback(); });
+  } else { fallback(); }
+  function fallback() {
+    var ta = document.createElement('textarea');
+    ta.value = msg; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
+    ta.remove(); finish();
+  }
+});
+</script>
+"""
 
 
 def copy_cell_html(row: pd.Series) -> str:
@@ -984,8 +1017,7 @@ def copy_cell_html(row: pd.Series) -> str:
     payload = html.escape(json.dumps(message), quote=True)
     return (
         '<button type="button" class="ss-copy" '
-        f'data-msg="{payload}" '
-        f'onclick="{_COPY_JS}">'
+        f'data-msg="{payload}">'
         "📋 Copy message</button>"
     )
 
@@ -1014,14 +1046,20 @@ def render_table(frame: pd.DataFrame) -> None:
             f"<td>{_esc(_text(row.get('creator_name'), '-'))}</td>"
             "</tr>"
         )
-    st.markdown(
+    # st.html with unsafe_allow_javascript=True is required for the copy
+    # buttons: Streamlit's DOMPurify sanitization strips inline event
+    # handlers (onclick) and st.markdown never executes scripts. All cell
+    # content is escaped above; the only script is the fixed copy handler
+    # in _COPY_SCRIPT.
+    st.html(
         TABLE_STYLE
         + '<div class="ss-wrap"><table class="ss-table"><thead><tr>'
         + "".join(f"<th>{_esc(label)}</th>" for label in head)
         + "</tr></thead><tbody>"
         + "".join(rows)
-        + "</tbody></table></div>",
-        unsafe_allow_html=True,
+        + "</tbody></table></div>"
+        + _COPY_SCRIPT,
+        unsafe_allow_javascript=True,
     )
 
 st.title("🚀 New and Upcoming" if is_watch_view else "Games matching your target")

@@ -136,13 +136,19 @@ def test_onboarding_asks_discord_name_then_template():
     assert any("[Your Name]" in value and "[Game Name]" in value for value in captions)
 
 
+def _table_html(at: AppTest) -> str:
+    """Return the results-table HTML from the app's st.html element."""
+    html_blocks = at.main.get("html")
+    joined = "".join(el.proto.body for el in html_blocks)
+    assert "ss-table" in joined, "results table should render after onboarding"
+    return joined
+
+
 def test_results_table_has_copy_message_column():
     at = _render_dashboard()
     assert not at.exception
 
-    tables = [element.value for element in at.markdown if "ss-table" in element.value]
-    assert tables, "results table should render after onboarding"
-    table_html = tables[0]
+    table_html = _table_html(at)
 
     assert "Copy message" in table_html
     match = re.search(r'data-msg="([^"]+)"', table_html)
@@ -166,9 +172,7 @@ def test_sidebar_edits_name_and_template():
     at.sidebar.text_input(key="discord_name").set_value("rip_indra").run()
     assert not at.exception
 
-    tables = [element.value for element in at.markdown if "ss-table" in element.value]
-    assert tables
-    match = re.search(r'data-msg="([^"]+)"', tables[0])
+    match = re.search(r'data-msg="([^"]+)"', _table_html(at))
     message = json.loads(html_module.unescape(match.group(1)))
     assert message.startswith("Yo rip_indra here")
     assert "Blox Fruits" in message
