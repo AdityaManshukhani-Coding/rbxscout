@@ -37,23 +37,30 @@ npx wrangler deploy --config wrangler.mirror.toml
 
 Free limits: 100k req/day (we use ~58k) — covers full load.
 
-## Option B — Deno Deploy (new IP pool: Google infra) ✅ READY
+## Option B — Deno Deploy (new IP pool: Google infra)
 
 ~20 lines, paste-in-browser deploy, **1M requests/month free** → use as
-**overflow only** (after Cloudflare). The paste-ready file is already in the
-repo: **`deno-mirror.ts`** (next to this file) — same route guard, one 429
-retry, and a per-isolate 120 req/min limiter so stray public traffic can't
-burn the monthly quota.
+**overflow only** (after Cloudflare). Create `mirror.ts`:
 
-Deploy:
-1. Sign in at https://dash.deno.com with GitHub (free account).
-2. **New Playground** → name it e.g. `rbx-search-mirror`.
-3. Delete the sample code, paste all of `deno-mirror.ts`, **Save & Deploy**.
-4. Note the URL: `https://rbx-search-mirror.<you>.deno.dev`
+```ts
+Deno.serve(async (req: Request) => {
+  const url = new URL(req.url);
+  if (url.pathname !== "/search-api/omni-search" || !url.searchParams.get("searchQuery")) {
+    return new Response("not found", { status: 404 });
+  }
+  const upstream = await fetch("https://apis.roblox.com" + url.pathname + url.search, {
+    headers: { Accept: "application/json", "User-Agent": "rbxscout-proxy" },
+  });
+  return new Response(upstream.body, {
+    status: upstream.status,
+    headers: { "Content-Type": upstream.headers.get("content-type") ?? "application/json" },
+  });
+});
+```
 
-Limits: 1M req/mo, 100 GB egress — overflow-only fits easily (failures are
-~5% of requests → ~90k/mo). No cron to worry about: a Playground is
-fetch-only, so it can never double-fire the dispatcher.
+Deploy: `deno deploy` → paste file at dash.deno.com (free account). Limits:
+1M req/mo, 100 GB egress — overflow-only fits easily (failures are ~5% of
+requests → ~90k/mo).
 
 ## Option C — Oracle Cloud Always Free VPS (new IP pool: Oracle ASN)
 
@@ -125,7 +132,6 @@ Append the URL to `RBXSCOUT_SEARCH_PROXY_URLS` in
 ```yaml
 RBXSCOUT_SEARCH_PROXY_URLS: >-
   https://rbx-search-proxy.thegamingbuddiesarethebest.workers.dev,
-  https://rbx-search-mirror.<you>.deno.dev,
   https://rbx-search-proxy-mirror.<other-subdomain>.workers.dev,
   direct
 ```
