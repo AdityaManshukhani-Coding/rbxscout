@@ -29,11 +29,41 @@ from scout_core import (
     render_outreach_message,
     truncate,
 )
+import catalog_fetch
 
 logging.basicConfig(level=logging.INFO)
 
 APP_DIR = Path(__file__).resolve().parent
-DB_PATH = str(APP_DIR / "rbx_scout.db")
+
+
+def _resolve_catalog() -> tuple[str, bool]:
+    """Point the dashboard at the right catalog and make sure it exists.
+
+    Local mode (repo has rbx_scout.db, or RBXSCOUT_LOCAL_DB=1): read the local
+    file, exactly as before. Hosted mode (Streamlit Cloud): download the
+    public release asset into a cache dir and keep it fresh there. Cached, so
+    the ~5-min freshness check and any download happen once per process —
+    not once per user, page view, or rerun.
+    """
+
+    @st.cache_resource(show_spinner=False)
+    def _ensure(_version: int) -> tuple[str, bool]:
+        if not catalog_fetch.is_hosted():
+            return str(APP_DIR / "rbx_scout.db"), False
+        try:
+            path = catalog_fetch.ensure_catalog()
+        except catalog_fetch.CatalogFetchError as exc:
+            stale = catalog_fetch.stale_cache_fallback(exc)
+            if stale is not None:
+                return str(stale), True
+            raise
+        return str(path), False
+
+    return _ensure(1)
+
+
+DB_PATH, _USING_STALE_CATALOG = _resolve_catalog()
+_HOSTED_MODE = catalog_fetch.is_hosted()
 PAGE_SIZE = 20
 DEFAULT_MIN_VISITS = 20_000
 DEFAULT_MIN_CCU = 25
@@ -1063,6 +1093,77 @@ def render_table(frame: pd.DataFrame) -> None:
     )
 
 st.title("🚀 New and Upcoming" if is_watch_view else "Games matching your target")
+
+# Live catalog tracker — like a subscriber counter: a big number that grows
+# as the 24/7 pipeline discovers games. Reads only the cached catalog copy,
+# so it costs nothing per user and never triggers a download by itself.
+_tracker = catalog_fetch.catalog_counts(DB_PATH)
+if _tracker["games"] is not None:
+    _target, _found, _last = (
+        _tracker.get("target"),
+        _tracker.get("found_today") or 0,
+        _tracker.get("last_sync"),
+    )
+    _games_fmt = f"{_tracker['games']:,}"
+    _badges = []
+    if _target is not None:
+        _badges.append(f"🎯 {_target:,} meet the 20k visits / 25 CCU target")
+    if _found:
+        _badges.append(f"✨ +{_found:,} discovered today (UTC)")
+    if _last:
+        _badges.append(f"🕒 last pipeline sync {_last} UTC")
+    if _USING_STALE_CATALOG:
+        _badges.append("⚠️ showing the last cached catalog — refresh failed")
+    _badges_html = (
+        '<div class="ss-tracker-badges">' + " · ".join(_badges) + "</div>"
+        if _badges else ""
+    )
+    st.markdown(
+        """
+<style>
+.ss-tracker {
+  display: inline-block; padding: 14px 26px; margin-bottom: 6px;
+  border: 1px solid rgba(128,128,128,0.35); border-radius: 12px;
+  background: linear-gradient(180deg, rgba(88,101,242,0.10), rgba(88,101,242,0.03));
+}
+.ss-tracker-num {
+  font-size: 3.1rem; font-weight: 800; line-height: 1.1; letter-spacing: 0.5px;
+  font-variant-numeric: tabular-nums; color: #e6edf3;
+}
+.ss-digit {
+  display: inline-block;
+  animation: ss-pop 600ms cubic-bezier(0.2, 0.9, 0.25, 1.2) backwards;
+}
+.ss-digit:nth-child(1) { animation-delay: 0ms; }
+.ss-digit:nth-child(2) { animation-delay: 45ms; }
+.ss-digit:nth-child(3) { animation-delay: 90ms; }
+.ss-digit:nth-child(4) { animation-delay: 135ms; }
+.ss-digit:nth-child(5) { animation-delay: 180ms; }
+.ss-digit:nth-child(6) { animation-delay: 225ms; }
+.ss-digit:nth-child(7) { animation-delay: 270ms; }
+@keyframes ss-pop {
+  from { opacity: 0; transform: translateY(0.45em) scale(0.92); }
+  to   { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ss-digit { animation: none; }
+}
+.ss-tracker-sub { font-size: 0.92rem; color: rgba(230,237,243,0.65); margin-top: 2px; }
+.ss-tracker-badges { font-size: 0.82rem; color: rgba(230,237,243,0.8); margin-top: 8px; }
+</style>
+"""
+        + '<div class="ss-tracker">'
+        + '<div class="ss-tracker-num">'
+        + f'<span class="ss-digit">{_games_fmt[0]}</span>'
+        + "".join(f'<span class="ss-digit">{ch}</span>' for ch in _games_fmt[1:])
+        + '</div>'
+        + '<div class="ss-tracker-sub">games in the catalog &amp; growing</div>'
+        + _badges_html
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+else:
+    st.info("Catalog counters unavailable — the catalog did not load this session.")
 if is_watch_view:
     st.caption(
         "Games that climbed 2+ tiers or tripled their CCU between syncs. "

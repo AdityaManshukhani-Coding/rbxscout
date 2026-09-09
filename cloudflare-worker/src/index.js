@@ -33,6 +33,34 @@ const GITHUB_DISPATCH_ATTEMPTS = 3;
 const GITHUB_RETRY_MAX_DELAY_MS = 30_000;
 const GITHUB_RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 
+// Keep-alive: ping the hosted Streamlit dashboard on every 10-minute tick so
+// Community Cloud never hibernates it (its idle timeout is 12 h — this fires
+// ~144×/day). The URL is a Worker VARIABLE (not a secret — it is public
+// anyway) so it can be added without redeploying code:
+//   npx wrangler vars put DASHBOARD_KEEPALIVE_URL
+// Leave the variable unset to disable the ping entirely.
+const DASHBOARD_KEEPALIVE_URL_KEY = "DASHBOARD_KEEPALIVE_URL";
+
+async function pingDashboard(env) {
+  const url = env[DASHBOARD_KEEPALIVE_URL_KEY];
+  if (!url) return; // not configured — keep-alive disabled
+  try {
+    const response = await fetch(url, {
+      method: "GET",
+      headers: { "User-Agent": "rbxscout-keepalive" },
+      // Streamlit's HTTP layer answers health checks without rendering a
+      // session; a plain GET (no _stcore stream upgrade) is enough to count
+      // as app traffic for hibernation purposes.
+      redirect: "follow",
+    });
+    console.log(`dashboard keep-alive ping -> ${response.status}`);
+  } catch (error) {
+    // Never let a dashboard hiccup fail the Cron Event: the workflow
+    // dispatches above are the job that matters.
+    console.error(`dashboard keep-alive ping failed: ${error}`);
+  }
+}
+
 /** Simple per-isolate sliding-window limiter (per data-center, per client IP). */
 const rateBuckets = new Map();
 
@@ -147,6 +175,10 @@ async function dispatchDueWorkflows(controller, env) {
       console.log(`dispatched ${name} via workflow_dispatch (${status})`);
     }),
   );
+
+  // Same tick also pings the hosted dashboard so it never sleeps. Fire-and-
+  // forget: its outcome is logged, never thrown.
+  await pingDashboard(env);
 
   const failures = [];
   for (let i = 0; i < results.length; i += 1) {

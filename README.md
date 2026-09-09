@@ -205,11 +205,6 @@ curl -s "https://rbx-search-proxy.<you>.workers.dev/search-api/omni-search?searc
 
 No proxy variable? The crawler falls back to direct Roblox requests.
 
-Want a second IP pool? `cloudflare-worker/deno-mirror.ts` is a paste-ready
-Deno Deploy mirror (free 1M req/month, Google infra) — deploy it from the
-browser in ~2 minutes and append its URL to the same variable, before
-`direct`. See `cloudflare-worker/MIRRORS.md` (Option B) for the walkthrough.
-
 ## Keyword-crawler IP pool (Cloudflare Worker proxy)
 
 GitHub Actions runners share a small egress IP range, so the omni-search
@@ -225,3 +220,50 @@ the same deployment provides both capabilities.
 per-page Discord contact checks, per-tier diagnostics, and the **New and
 Upcoming** tab (the blow-up watch). It reads the same SQLite catalog this
 repo keeps fresh.
+
+### Hosted dashboard (Streamlit Community Cloud, free)
+
+The dashboard also runs hosted at `https://rbxscout.streamlit.app` — no
+laptop required. Same app, same catalog, two source modes chosen
+automatically:
+
+| Mode | When | Catalog source |
+|---|---|---|
+| **Local** | `rbx_scout.db` exists in the repo (your laptop), or `RBXSCOUT_LOCAL_DB=1` | the local file, exactly as before |
+| **Hosted** | no local DB (Streamlit Cloud container) | anonymous download of the `catalog-latest` release asset into `~/.cache/rbxscout/`, refreshed via a tiny metadata check every 5 min |
+
+Hosted mode needs **no secrets** — the repo and release are public. The
+5-minute throttle plus Streamlit's `st.cache_resource` means 2–3 users cause
+about one metadata request per 5 minutes (the ~40 MB file is re-downloaded
+only when the pipeline actually replaced the asset).
+
+Deploy / redeploy it in two minutes:
+
+1. Push the latest `main` (the app auto-redeploys on every `git push`).
+2. [share.streamlit.io](https://share.streamlit.io) → sign in with GitHub →
+   **Create app** → *Yup, I have an app*.
+3. Repo `AdityaManshukhani-Coding/rbxscout`, branch `main`, file `app.py`.
+4. **App URL**: set the subdomain to `rbxscout`. Python: pick the newest
+   offered (the Actions runners use 3.14). No secrets needed.
+5. Deploy — the URL is `https://rbxscout.streamlit.app`.
+
+The **live catalog tracker** at the top of the dashboard is the
+subscriber-counter-style number: total cataloged games, how many meet the
+20k visits / 25 CCU target, how many were discovered today (UTC, first seen
+in `ccu_history`), and the last pipeline sync time. It reads the cached
+catalog copy, so it costs nothing per visitor.
+
+### Never-sleep keep-alive (Cloudflare Worker)
+
+Community Cloud hibernates apps after 12 h without traffic; the scheduler
+Worker pings the dashboard on every 10-minute tick so it never does:
+
+```bash
+cd cloudflare-worker
+npx wrangler vars put DASHBOARD_KEEPALIVE_URL
+# paste: https://rbxscout.streamlit.app
+```
+
+The Worker picks the variable up on the next cron tick — no redeploy needed.
+Leave it unset to disable. (A `vars put` does trigger one Worker roll; the
+cron keeps firing throughout.)
