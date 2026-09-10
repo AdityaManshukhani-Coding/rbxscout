@@ -28,11 +28,12 @@ cloudflare-worker/.wrangler/
 *.db-shm
 *.db.tmp
 
-# --- private notes & local screenshots (delete these lines to publish) ---
+# --- private notes (delete these lines to publish) ---
 GAMES_DB_PLAN.md
 implementation_plan.md
 FIXES.md
-assets/
+# assets/ IS published: the welcome-flow cookie-guide screenshots
+# (Step 1-4 SS.png) must ship with the app for the guide to render.
 
 # NOTE: rbx_scout.db and rbx_scout.db.sync_state are NOT in git anymore.
 # The catalog is the `rbx_scout.db` asset of the rolling Release tag

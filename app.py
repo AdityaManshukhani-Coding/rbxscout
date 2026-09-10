@@ -17,7 +17,6 @@ import pandas as pd
 import streamlit as st
 
 from scout_core import (
-    DEFAULT_CANDIDATE_LIMIT,
     DEFAULT_MESSAGE_TEMPLATE,
     DISCORD_FILTER_ALL,
     DISCORD_FILTER_FALSE,
@@ -26,6 +25,7 @@ from scout_core import (
     RobloxPlatformScout,
     apply_filters,
     compact_num,
+    normalize_discord_user_id,
     render_outreach_message,
     truncate,
 )
@@ -190,6 +190,7 @@ def initialize_session() -> None:
         "target_min_ccu": DEFAULT_MIN_CCU,
         "onboarding_cookie": "",
         "discord_name": "",  # asked in the welcome flow; auto-fills the outreach message
+        "discord_user_id": "",  # optional; turns [Your Name] into a real <@ID> mention
         "message_template": DEFAULT_MESSAGE_TEMPLATE,
         "guide_step": 1,
         "pending_initial_scan": False,
@@ -310,9 +311,34 @@ def render_onboarding() -> bool:
             key="discord_name",
             max_chars=64,
             placeholder="e.g. dev_razor10 or rip_indra",
+            persist_state="session",
         )
         if not str(st.session_state.discord_name or "").strip():
             st.caption("Tip: add your username so the message template can fill it in for you.")
+        st.text_input(
+            "Discord User ID (optional)",
+            key="discord_user_id",
+            max_chars=32,
+            placeholder="e.g. 53908099506183680",
+            persist_state="session",
+        )
+        st.caption(
+            "How to find it: 1) Discord → User Settings → Advanced → turn on Developer Mode. "
+            "2) Right-click your own name anywhere in a server or DM. "
+            "3) Click “Copy User ID” and paste it here."
+        )
+        st.caption(
+            "Why an ID? Pasting “@username” into Discord is plain text — only messages "
+            "carrying your numeric ID ping and link to you. Leave it blank and your plain "
+            "username is used instead; this field is always optional."
+        )
+        if str(st.session_state.discord_user_id or "").strip() and not normalize_discord_user_id(
+            st.session_state.discord_user_id
+        ):
+            st.warning(
+                "That doesn't look like a User ID (it should be 15–21 digits). "
+                "It will be ignored and your plain username used — or clear the field."
+            )
         back, next_column = st.columns(2)
         if back.button("Back", width="stretch", key="onb3_back"):
             st.session_state.onboarding_step = 2
@@ -333,16 +359,22 @@ def render_onboarding() -> bool:
             "Message template",
             key="message_template",
             height=430,
+            persist_state="session",
         )
         st.caption(
             "Make sure you use the [Your Name] tag for your Discord username and the "
             "[Game Name] tag for the game's name — both are filled in automatically "
             "when you copy a message, so keep them if you edit the text."
         )
+        st.caption(
+            "With a User ID saved, [Your Name] copies as a real @mention; without one, "
+            "your plain username is used. Both work — the ID is optional."
+        )
         preview = render_outreach_message(
             st.session_state.message_template,
             st.session_state.discord_name,
             "Blox Fruits",
+            discord_user_id=st.session_state.get("discord_user_id", ""),
         )
         with st.expander("Preview — your name + a sample game", expanded=False):
             st.code(preview, language="markdown")
@@ -458,38 +490,6 @@ def get_scout() -> RobloxPlatformScout:
     return st.session_state.scout
 
 
-def run_metric_scan(
-    scout: RobloxPlatformScout,
-    min_visits: int,
-    min_ccu: int,
-    deep: bool,
-    force: bool,
-) -> pd.DataFrame:
-    progress = st.progress(0.0, text="Starting targeted scan...")
-    status = st.empty()
-
-    def callback(percent: float, message: str) -> None:
-        progress.progress(min(1.0, percent), text=message)
-        status.caption(message)
-
-    try:
-        # The page renderer performs the first contact lookup after metrics
-        # are ready. Keeping this pass metric-only prevents duplicate requests.
-        return scout.scan(
-            limit=None,
-            deep_contacts=False,
-            force_contacts=force,
-            min_visits=min_visits,
-            min_ccu=min_ccu,
-            candidate_limit=DEFAULT_CANDIDATE_LIMIT,
-            initial_contact_limit=PAGE_SIZE,
-            progress_cb=callback,
-        )
-    finally:
-        progress.empty()
-        status.empty()
-
-
 def run_contact_scan(
     scout: RobloxPlatformScout,
     page_ids: list[int],
@@ -585,7 +585,7 @@ with st.sidebar.expander("🎯 Current target", expanded=True):
         key="target_min_ccu",
         persist_state="session",
     )
-    st.caption("Targets apply to the next live sync. Existing results are not expanded until you sync.")
+    st.caption("Targets filter your results the moment you sync. New games appear as the 24/7 pipeline discovers them.")
 
 with st.sidebar.expander("⚙️ Scan settings", expanded=False):
     deep = st.toggle("Check Discord contacts", value=True, key="deep_contacts")
@@ -607,14 +607,25 @@ with st.sidebar.expander("⚙️ Scan settings", expanded=False):
         st.toast("Cookie applied to the active Roblox session.")
 
 with st.sidebar.expander("✉️ Outreach message", expanded=False):
-    st.text_input("Discord username", key="discord_name", max_chars=64)
-    st.text_area("Message template", key="message_template", height=250)
+    st.text_input("Discord username", key="discord_name", max_chars=64, persist_state="session")
+    st.text_input(
+        "Discord User ID (optional)",
+        key="discord_user_id",
+        max_chars=32,
+        help="Pasted “@username” is plain text in Discord — real pings need your numeric ID.",
+        persist_state="session",
+    )
+    st.caption(
+        "ID set → [Your Name] copies as a clickable, pingable @mention. "
+        "Find it: Developer Mode → right-click your name → Copy User ID."
+    )
+    st.text_area("Message template", key="message_template", height=250, persist_state="session")
     st.caption(
         "Keep the [Your Name] and [Game Name] tags — they auto-fill when you "
         "copy a message from the results table."
     )
 
-sync = st.sidebar.button("🔄 Sync live data", type="primary", width="stretch")
+sync = st.sidebar.button("🔄 Sync live data", type="primary", width="stretch", key="sync_live_data")
 check_contacts = st.sidebar.button(
     "🔎 Check Discord servers",
     width="stretch",
@@ -627,14 +638,16 @@ if sync or st.session_state.pending_initial_scan:
     st.session_state.pending_initial_scan = False
     st.session_state.welcome_scan_started = True
     st.session_state.scan_error = ""
-    with st.spinner("Scanning games that meet your targets..."):
+    with st.spinner("Loading games that meet your targets..."):
         try:
-            data = run_metric_scan(
-                scout,
+            # Read-only catalog query — no discovery, no keyword crawl, no
+            # Roblox requests. The 24/7 pipeline (Cloudflare cron → finder
+            # and hydrator workflows) owns discovery and hydration; this
+            # button only pulls what it already stored. Results page one is
+            # ready instantly; contacts still load page by page below.
+            data = scout.load_catalog_matches(
                 min_visits=int(min_visits),
                 min_ccu=int(min_ccu),
-                deep=deep,
-                force=force,
             )
             st.session_state.data = data if not data.empty else empty_dataframe()
             # Keep the exact onboarding targets attached to the result set so
@@ -642,7 +655,7 @@ if sync or st.session_state.pending_initial_scan:
             st.session_state.result_target_min_visits = int(min_visits)
             st.session_state.result_target_min_ccu = int(min_ccu)
             st.session_state.source = "live"
-            st.session_state.active_run_id = scout.last_scan.get("run_id")
+            st.session_state.active_run_id = None
             reset_contact_page()
         except Exception as exc:
             st.session_state.scan_error = str(exc)
@@ -1071,6 +1084,7 @@ def copy_cell_html(row: pd.Series) -> str:
         st.session_state.get("message_template", DEFAULT_MESSAGE_TEMPLATE),
         st.session_state.get("discord_name", ""),
         _text(row.get("title"), "this game"),
+        discord_user_id=st.session_state.get("discord_user_id", ""),
     )
     payload = html.escape(json.dumps(message), quote=True)
     return (
@@ -1234,11 +1248,11 @@ st.caption("  ·  ".join(meta_bits) + f"  ·  {badge}")
 
 if source == "demo":
     st.warning("Live sources were unavailable, so demo data is shown. Run Sync live data to retry.")
-if DEFAULT_CANDIDATE_LIMIT <= 10_000:
-    st.caption(
-        f"Metric scan checks up to {DEFAULT_CANDIDATE_LIMIT:,} ranked source candidates. "
-        "Discord lookups are requested only for the visible page."
-    )
+st.caption(
+    "Results come from the always-on catalog pipeline — discovery and metric "
+    "refreshes run around the clock; this button just reads them. "
+    "Discord lookups are requested only for the visible page."
+)
 if discord_filter != DISCORD_FILTER_ALL:
     st.info("Discord filters apply to the currently checked page; advancing pages checks more games.")
 

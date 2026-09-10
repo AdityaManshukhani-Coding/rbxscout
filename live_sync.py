@@ -1,9 +1,12 @@
 """Live sync runner — the pipeline's "on switch" outside the Streamlit UI.
 
-Runs what the dashboard's "🔄 Sync live data" button runs (scout.scan with
-the session's targets), then prints a green/red summary: keyword slice
-coverage, catalog growth, hydration budget spend, tier stamping, blow-up
-flags, 429/error counters.
+Runs the full pipeline (discovery charts + Rolimons + the rotating keyword
+slice, then the tier-due hydration queue) and prints a green/red summary:
+keyword slice coverage, catalog growth, hydration budget spend, tier
+stamping, blow-up flags, 429/error counters. The dashboard's "🔄 Sync live
+data" button does NOT run this — it only reads the catalog from SQLite
+(scout_core.load_catalog_matches); discovery is owned by the 24/7 pipeline
+(Cloudflare cron → the GitHub Actions finder/hydrator workflows).
 
 Usage:
     .venv/bin/python live_sync.py [--min-visits 20000] [--min-ccu 25]

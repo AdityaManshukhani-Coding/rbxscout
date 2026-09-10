@@ -15,7 +15,11 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 import scout_core
-from scout_core import DEFAULT_MESSAGE_TEMPLATE, render_outreach_message
+from scout_core import (
+    DEFAULT_MESSAGE_TEMPLATE,
+    normalize_discord_user_id,
+    render_outreach_message,
+)
 
 APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
 
@@ -105,6 +109,65 @@ def test_render_empty_template_falls_back_to_default():
 
 
 # --------------------------------------------------------------------------- #
+# Optional Discord User ID -> real <@ID> mention in the copied message
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("53908099506183680", "53908099506183680"),
+        (" 53908099506183680 ", "53908099506183680"),
+        ("<@53908099506183680>", "53908099506183680"),  # full token pasted
+        ("5390-8099-5061-83680", "53908099506183680"),  # dashed grouping
+        ("dev_razor10", ""),  # username, not an ID
+        ("12345", ""),  # too short
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_normalize_discord_user_id(raw, expected):
+    assert normalize_discord_user_id(raw) == expected
+
+
+def test_render_with_user_id_makes_real_mention_token():
+    message = render_outreach_message(
+        DEFAULT_MESSAGE_TEMPLATE, "dev_razor10", "Blox Fruits",
+        discord_user_id="53908099506183680",
+    )
+    assert "<@53908099506183680>" in message
+    assert "dev_razor10" not in message
+    assert "[Your Name]" not in message
+
+
+def test_render_without_user_id_keeps_plain_name():
+    message = render_outreach_message(
+        DEFAULT_MESSAGE_TEMPLATE, "dev_razor10", "Blox Fruits", discord_user_id=""
+    )
+    assert "dev_razor10" in message
+    assert "<@" not in message
+
+
+def test_render_invalid_user_id_falls_back_to_plain_name():
+    message = render_outreach_message(
+        DEFAULT_MESSAGE_TEMPLATE, "dev_razor10", "Blox Fruits",
+        discord_user_id="not-an-id",
+    )
+    assert "dev_razor10" in message
+    assert "<@" not in message
+
+
+def test_render_missing_name_leaves_tag_even_with_id():
+    """No username + an ID: the token still fills — the mention IS the name."""
+    message = render_outreach_message(
+        DEFAULT_MESSAGE_TEMPLATE, "", "Blox Fruits",
+        discord_user_id="53908099506183680",
+    )
+    assert "<@53908099506183680>" in message
+    assert "[Your Name]" not in message
+
+
+# --------------------------------------------------------------------------- #
 # Welcome flow (Streamlit AppTest)
 # --------------------------------------------------------------------------- #
 
@@ -134,6 +197,38 @@ def test_onboarding_asks_discord_name_then_template():
     assert template_area.value == DEFAULT_MESSAGE_TEMPLATE
     captions = [element.value for element in at.caption]
     assert any("[Your Name]" in value and "[Game Name]" in value for value in captions)
+
+
+def test_user_id_optional_field_flows_into_copied_message(monkeypatch):
+    """Step 3 shows the optional User ID field with helper captions; a saved
+    ID makes the copied message carry a real <@ID> mention token; leaving it
+    empty keeps the plain username."""
+    _patch_catalog_reader(monkeypatch, _demo_frame())
+
+    at = _fresh_app()
+    at.run()
+    at.button(key="onb0_next").click().run()
+    at.button(key="onb1_next").click().run()
+    for _ in range(4):
+        at.button(key="onb2_next").click().run()
+
+    # Step 3: the optional field + the 3-step "how to find your ID" helper.
+    captions = [element.value for element in at.caption]
+    assert any("Developer Mode" in value and "Copy User ID" in value for value in captions)
+    assert any("optional" in value.lower() for value in captions)
+
+    at.text_input(key="discord_name").set_value("dev_razor10").run()
+    at.text_input(key="discord_user_id").set_value("53908099506183680").run()
+    at.button(key="onb3_next").click().run()  # -> message template step
+    at.button(key="onb4_start").click().run()  # first scan from the catalog
+    at.run()
+
+    assert not at.exception
+    match = re.search(r'data-msg="([^"]+)"', _table_html(at))
+    message = json.loads(html_module.unescape(match.group(1)))
+    assert "<@53908099506183680>" in message
+    assert "dev_razor10" not in message
+    assert "[Your Name]" not in message
 
 
 def _table_html(at: AppTest) -> str:
@@ -214,3 +309,83 @@ def test_sidebar_edits_name_and_template():
     message = json.loads(html_module.unescape(match.group(1)))
     assert message.startswith("Yo rip_indra here")
     assert "Blox Fruits" in message
+
+
+# --------------------------------------------------------------------------- #
+# First scan / Sync live data: read the catalog, never run the finder
+# --------------------------------------------------------------------------- #
+
+
+def _patch_catalog_reader(monkeypatch, frame: pd.DataFrame) -> list[dict]:
+    """Replace the catalog reader with a stub; return the calls it saw."""
+    calls: list[dict] = []
+
+    def _fake(self, min_visits=0, min_ccu=0):
+        calls.append({"min_visits": min_visits, "min_ccu": min_ccu})
+        return frame.copy()
+
+    monkeypatch.setattr(scout_core.RobloxPlatformScout, "load_catalog_matches", _fake)
+    return calls
+
+
+def _walk_onboarding_to_template(at: AppTest) -> None:
+    at.button(key="onb0_next").click().run()  # welcome -> targets
+    at.button(key="onb1_next").click().run()  # targets -> cookie guide
+    for _ in range(4):
+        at.button(key="onb2_next").click().run()  # guide steps 1..4
+    at.button(key="onb3_next").click().run()  # Discord -> message template
+
+
+def test_first_scan_pulls_from_catalog_without_discovery(monkeypatch):
+    """'Start my first scan' must read the DB catalog with the chosen targets
+    and must never launch the finder (deep charts / keyword slices)."""
+    calls = _patch_catalog_reader(monkeypatch, _demo_frame())
+
+    def _no_finder(self, *args, **kwargs):
+        raise AssertionError("finder scan() must not run for the first scan")
+
+    monkeypatch.setattr(scout_core.RobloxPlatformScout, "scan", _no_finder)
+
+    at = _fresh_app()
+    at.run()
+    _walk_onboarding_to_template(at)
+    at.button(key="onb4_start").click().run()
+    at.run()
+
+    assert not at.exception
+    assert calls == [{"min_visits": 20000, "min_ccu": 25}]
+    assert "Blox Fruits" in _table_html(at)
+    captions = [element.value for element in at.caption]
+    assert any("Page 1 of" in value for value in captions)
+
+
+def test_sync_button_reads_catalog_instantly(monkeypatch):
+    """'🔄 Sync live data' re-reads the catalog with the sidebar targets."""
+    at = _render_dashboard()
+    calls = _patch_catalog_reader(monkeypatch, _demo_frame())
+
+    at.sidebar.button(key="sync_live_data").click().run()
+
+    assert not at.exception
+    assert len(calls) == 1
+    assert calls[0]["min_visits"] == 20000 and calls[0]["min_ccu"] == 25
+    assert "Blox Fruits" in _table_html(at)
+
+
+def test_cookie_guide_renders_step_screenshots():
+    """Every cookie-guide step shows a screenshot (assets/Step N SS.png).
+
+    AppTest serves file images under /mock/media/<hash>.png, so the original
+    filename is not visible in the element — one rendered image per step is
+    the contract (guide_image resolves the right file per step).
+    """
+    at = _fresh_app()
+    at.run()
+    at.button(key="onb0_next").click().run()
+    at.button(key="onb1_next").click().run()
+
+    for expected_step in range(1, 5):
+        assert not at.exception
+        assert len(at.image) >= 1, f"guide step {expected_step} must show a screenshot"
+        if expected_step < 4:
+            at.button(key="onb2_next").click().run()

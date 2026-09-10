@@ -2,6 +2,7 @@ import re
 import sqlite3
 import threading
 import time
+from pathlib import Path
 from unittest import mock
 
 import pandas as pd
@@ -9,6 +10,7 @@ import pytest
 
 import scout_core
 from scout_core import (
+    normalize_discord_user_id,
     TIER_THRESHOLDS,
     TIER_CADENCE_SYNC,
     TIER8_STALE_PRUNE_DAYS,
@@ -1441,3 +1443,51 @@ def test_search_pool_breaker_trips_when_everything_fails(monkeypatch):
     # remaining futures were cancelled and never entered the tally.
     assert diag["failed_keywords"] == 5
     assert diag["keywords"] == 8
+
+
+# --------------------------------------------------------------------------- #
+# Catalog-only result set (the dashboard's read-only sync)
+# --------------------------------------------------------------------------- #
+
+
+def test_load_catalog_matches_applies_thresholds_and_ranking(tmp_path):
+    """SQL-only result set: thresholds apply in the query, ranked closest-to-
+    target first (visits ASC, CCU tiebreak) exactly like the dashboard sort."""
+    db = str(tmp_path / "t.db")
+    scout = RobloxPlatformScout(db_path=db)
+    scout.upsert_game({"universe_id": 1, "title": "Just Over", "ccu": 30, "visits": 25_000})
+    scout.upsert_game({"universe_id": 2, "title": "Bigger CCU", "ccu": 120, "visits": 25_000})
+    scout.upsert_game({"universe_id": 3, "title": "Too Few Visits", "ccu": 900, "visits": 19_999})
+    scout.upsert_game({"universe_id": 4, "title": "Too Cold", "ccu": 24, "visits": 500_000})
+
+    df = scout.load_catalog_matches(min_visits=20_000, min_ccu=25)
+    assert set(df["universe_id"]) == {1, 2}
+    assert list(df["universe_id"]) == [1, 2]
+
+    wider = scout.load_catalog_matches(min_visits=0, min_ccu=0)
+    assert set(wider["universe_id"]) == {1, 2, 3, 4}
+
+
+def test_load_catalog_matches_no_target_only_observed_games(tmp_path):
+    """With no target set, games the pipeline never hydrated must not surface."""
+    db = str(tmp_path / "t.db")
+    scout = RobloxPlatformScout(db_path=db)
+    scout.upsert_game({"universe_id": 1, "title": "Observed", "ccu": 10, "visits": 100})
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO game_analytics (universe_id, title, visits, ccu) "
+            "VALUES (2, 'Corpse', 50, 5)"
+        )
+
+    df = scout.load_catalog_matches()
+    assert set(df["universe_id"]) == {1}
+
+
+def test_load_catalog_matches_missing_db_returns_empty(tmp_path):
+    """A missing/unopenable catalog degrades to an empty frame, never raises."""
+    db = str(tmp_path / "t.db")
+    scout = RobloxPlatformScout(db_path=db)
+    scout.upsert_game({"universe_id": 1, "title": "G", "ccu": 10, "visits": 100})
+    Path(db).unlink()
+
+    assert scout.load_catalog_matches().empty

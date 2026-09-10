@@ -398,19 +398,43 @@ def truncate(text: str, max_len: int, suffix: str = "...") -> str:
     return text[: max(0, max_len - len(suffix))].rstrip() + suffix
 
 
-def render_outreach_message(template: str, scout_name: str, game_title: str) -> str:
+def normalize_discord_user_id(value: object) -> str:
+    """Return a clean Discord user ID (15-21 digits), or an empty string if invalid.
+
+    Accepts the raw number, spaced/dashed groupings, or a full mention
+    token like ``<@123456789012345678>`` pasted by mistake. Anything else
+    (usernames, too-short fragments) normalizes to "" so callers can fall
+    back to the plain-text name — the ID is optional, never mandatory.
+    """
+    digits = re.sub(r"\D", "", str(value or ""))
+    return digits if 15 <= len(digits) <= 21 else ""
+
+
+def render_outreach_message(
+    template: str,
+    scout_name: str,
+    game_title: str,
+    discord_user_id: str = "",
+) -> str:
     """Fill a message template's [Your Name] and [Game Name] tags for one game.
 
     The scout name comes from the welcome-flow Discord question and the game
     title from each table row. Missing values leave the corresponding tag in
     place so a broken message is never copied silently. An empty template
     falls back to the default.
+
+    When a valid Discord User ID is supplied (optional), [Your Name] is
+    filled as a real mention token ``<@ID>`` — pasted into Discord it
+    renders as a clickable, pingable @name instead of plain text. Without
+    an ID the plain username is used, exactly as before.
     """
     text = (template or "").strip() or DEFAULT_MESSAGE_TEMPLATE
     name = (scout_name or "").strip()
     game = (game_title or "").strip()
-    if name:
-        text = NAME_TAG_REGEX.sub(lambda _match: name, text)
+    mention = normalize_discord_user_id(discord_user_id)
+    fill = f"<@{mention}>" if mention else name
+    if fill:
+        text = NAME_TAG_REGEX.sub(lambda _match: fill, text)
     if game:
         text = GAME_TAG_REGEX.sub(lambda _match: game, text)
     return text
@@ -1154,6 +1178,51 @@ class RobloxPlatformScout:
         except (pd.errors.DatabaseError, sqlite3.Error):
             return pd.DataFrame()
 
+
+    def load_catalog_matches(
+        self,
+        min_visits: int = 0,
+        min_ccu: int = 0,
+    ) -> pd.DataFrame:
+        """Instant result set: games already in the catalog that meet the targets.
+
+        Pure SQLite — no discovery, no keyword crawl, no Roblox requests. This
+        backs the dashboard's "Sync live data" / "Start my first scan" buttons:
+        the 24/7 pipeline (Cloudflare cron → finder/hydrator workflows) already
+        discovered and hydrated the games, so the UI must only read and filter,
+        not re-run the finder. With no thresholds set, only games the pipeline
+        has actually hydrated (they carry a ccu_history snapshot) are returned.
+
+        The target thresholds are applied in SQL and the result is ranked
+        exactly like the dashboard sorts it (closest to the target first, CCU
+        as tiebreaker) so the first page of the session is ready with zero
+        network cost. Never raises: a missing/corrupt catalog returns an empty
+        frame and the caller falls back to demo data.
+        """
+        min_visits = max(0, int(min_visits or 0))
+        min_ccu = max(0, int(min_ccu or 0))
+        where = ["COALESCE(visits, 0) >= ?", "COALESCE(ccu, 0) >= ?"]
+        params: List[int] = [min_visits, min_ccu]
+        if min_visits == 0 and min_ccu == 0:
+            # Degenerate "no target" session: only games the pipeline has
+            # actually hydrated (every hydration writes a ccu_history
+            # snapshot), so bulk-inserted stat-less rows cannot surface.
+            where.append(
+                "EXISTS (SELECT 1 FROM ccu_history h "
+                "WHERE h.universe_id = game_analytics.universe_id)"
+            )
+        try:
+            with self._connect() as conn:
+                return pd.read_sql_query(
+                    "SELECT * FROM game_analytics "
+                    f"WHERE {' AND '.join(where)} "
+                    "ORDER BY COALESCE(visits, 0) ASC, COALESCE(ccu, 0) ASC",
+                    conn,
+                    params=tuple(params),
+                )
+        except (pd.errors.DatabaseError, sqlite3.Error) as exc:
+            log.warning("load_catalog_matches failed: %s", exc)
+            return pd.DataFrame()
 
     def load_table(self, universe_ids: Optional[Iterable[int]] = None) -> pd.DataFrame:
         """Load tracked games, optionally restricted to a set of universe IDs."""
