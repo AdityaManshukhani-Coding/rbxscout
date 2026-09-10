@@ -17,6 +17,7 @@ from streamlit.testing.v1 import AppTest
 import scout_core
 from scout_core import (
     DEFAULT_MESSAGE_TEMPLATE,
+    DISCORD_FILTER_TRUE,
     normalize_discord_user_id,
     render_outreach_message,
 )
@@ -369,6 +370,47 @@ def test_sync_button_reads_catalog_instantly(monkeypatch):
     assert not at.exception
     assert len(calls) == 1
     assert calls[0]["min_visits"] == 20000 and calls[0]["min_ccu"] == 25
+    assert "Blox Fruits" in _table_html(at)
+
+
+def test_cookie_from_welcome_flow_reaches_the_scout():
+    """The .ROBLOSECURITY entered in onboarding must survive to the Roblox
+    session — Streamlit used to drop it when the widget unmounted, so every
+    contact lookup ran signed-out (401s, zero invites)."""
+    at = _fresh_app()
+    at.run()
+    at.session_state["onboarding_cookie"] = "test-cookie-value"
+    at.session_state["onboarding_complete"] = True
+    at.session_state["pending_initial_scan"] = False
+    at.session_state["welcome_scan_started"] = True
+    at.session_state["data"] = _demo_frame()
+    at.session_state["source"] = "demo"
+    at.run()
+
+    assert not at.exception
+    captions = [el.value for el in at.sidebar.caption]
+    assert any("Cookie configured: yes" in value for value in captions)
+
+
+def test_discord_filter_reads_whole_catalog(monkeypatch):
+    """'Discord Available' must query the catalog-wide contact state in SQL,
+    not just the 20 in-memory rows — otherwise it always said 'No results'."""
+    at = _render_dashboard()
+    calls: list[dict] = []
+    discord_frame = _demo_frame()
+    discord_frame["has_discord"] = True
+    discord_frame["discord_url"] = "https://discord.gg/test"
+
+    def _fake(self, min_visits=0, min_ccu=0, discord=None):
+        calls.append({"min_visits": min_visits, "min_ccu": min_ccu, "discord": discord})
+        return discord_frame.copy() if discord else _demo_frame().drop(index=0)
+
+    monkeypatch.setattr(scout_core.RobloxPlatformScout, "load_catalog_matches", _fake)
+
+    at.sidebar.radio(key="discord_filter_radio").set_value(DISCORD_FILTER_TRUE).run()
+
+    assert not at.exception
+    assert calls and calls[-1]["discord"] is True
     assert "Blox Fruits" in _table_html(at)
 
 

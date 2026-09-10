@@ -433,6 +433,7 @@ def render_onboarding() -> bool:
             type="password",
             key="onboarding_cookie",
             help="Stored in this Streamlit session only and never written to SQLite.",
+            persist_state="session",
         )
         st.caption("Cookie access can vary with Roblox account age, verification, privacy settings, region, and endpoint policy.")
 
@@ -451,7 +452,10 @@ def render_onboarding() -> bool:
             st.session_state.onboarding_step = 3
         st.rerun()
     if guide_step == 4 and not st.session_state.onboarding_cookie:
-        st.caption("You can continue without a cookie; public descriptions will still be checked.")
+        st.caption(
+            "You can continue without a cookie, but Roblox hides social links from "
+            "signed-out requests — Discord invites can only be resolved with one."
+        )
     return False
 
 
@@ -550,6 +554,15 @@ def reset_contact_page() -> None:
 
 scout = get_scout()
 
+# The cookie widget can render before the scout exists (welcome flow) and its
+# value lives in session state; push the latest value into the live Roblox
+# session on every run so contact lookups never run unauthenticated by accident.
+_cookie_value = str(st.session_state.get("onboarding_cookie") or "").strip()
+if _cookie_value and not scout.has_cookie:
+    scout.set_cookie(_cookie_value)
+elif not _cookie_value and scout.has_cookie:
+    scout.set_cookie(None)
+
 st.sidebar.title("🕹️ Studio Scouts")
 st.sidebar.caption("Roblox game scouting and Discord contact finder")
 
@@ -599,6 +612,7 @@ with st.sidebar.expander("⚙️ Scan settings", expanded=False):
         ".ROBLOSECURITY cookie",
         type="password",
         key="onboarding_cookie",
+        persist_state="session",
         help="Session-only credential. It is scoped to Roblox requests and never saved in SQLite.",
     )
     apply_cookie = st.button("💾 Apply cookie", width="stretch", disabled=not cookie)
@@ -664,6 +678,11 @@ if sync or st.session_state.pending_initial_scan:
             st.session_state.source = source
             st.session_state.active_run_id = None
             reset_contact_page()
+    # Defer the page-1 contact check to the NEXT rerun: running it inline
+    # kept the pre-dashboard frame (the welcome flow) visible behind the
+    # spinner for the whole slow lookup. Skipping this run lets the
+    # dashboard paint its rows first; the check then runs over it.
+    st.session_state.defer_contact_check = True
 
 if "data" not in st.session_state:
     # Fallback only: the first scan normally populates data on the
@@ -730,6 +749,7 @@ else:
         "Discord server",
         options=[DISCORD_FILTER_ALL, DISCORD_FILTER_TRUE, DISCORD_FILTER_FALSE],
         index=0,
+        key="discord_filter_radio",
     )
     # Genre is a metric filter, so it is applied before contact requests.
     genres = sorted(g for g in df["genre"].dropna().unique() if g and g != "Unknown")
@@ -743,6 +763,21 @@ metric_filtered = apply_filters(
     min_ccu=eff_min_ccu,
     genres=selected_genres,
 )
+
+# Contact state spans the whole catalog, not just this session's rows: most
+# games were never contact-checked, so filtering the in-memory page would
+# empty the view ("No results"). When a Discord filter is active, re-read
+# the catalog with the constraint applied in SQL instead.
+if not is_watch_view and discord_filter != DISCORD_FILTER_ALL:
+    metric_filtered = apply_filters(
+        scout.load_catalog_matches(
+            min_visits=eff_min_visits,
+            min_ccu=eff_min_ccu,
+            discord=(discord_filter == DISCORD_FILTER_TRUE),
+        ),
+        search=search,
+        genres=selected_genres,
+    )
 
 signature = "|".join([
     search,
@@ -782,11 +817,18 @@ if deep and page_ids:
     # The watchlist tracks its own checked-page set so main-view contact
     # state never suppresses (or leaks into) watch-view lookups.
     loaded_key = "watch_contact_loaded" if is_watch_view else "contact_loaded"
-    needs_contact_check = (
-        requested_contact_check
-        or force
-        or not set(page_ids).issubset(st.session_state[loaded_key])
-    )
+    if st.session_state.pop("defer_contact_check", False) and not (force or requested_contact_check):
+        # Set by the sync above: let this run paint the results table now;
+        # the page-1 contact check runs on the next rerun instead.
+        needs_contact_check = False
+        if page_ids:
+            st.session_state.contact_check_scheduled = True
+    else:
+        needs_contact_check = (
+            requested_contact_check
+            or force
+            or not set(page_ids).issubset(st.session_state[loaded_key])
+        )
     if needs_contact_check:
         with st.spinner(f"Checking Discord contacts for page {page}..."):
             try:
@@ -818,6 +860,22 @@ if deep and page_ids:
                         ascending=[True, True],
                         na_position="last",
                     ).reset_index(drop=True)
+                    if discord_filter != DISCORD_FILTER_ALL:
+                        # Fresh contact states just persisted — re-read the
+                        # catalog so newly resolved invites join the view.
+                        metric_filtered = apply_filters(
+                            scout.load_catalog_matches(
+                                min_visits=eff_min_visits,
+                                min_ccu=eff_min_ccu,
+                                discord=(discord_filter == DISCORD_FILTER_TRUE),
+                            ),
+                            search=search,
+                            genres=selected_genres,
+                        ).sort_values(
+                            ["visits", "ccu"],
+                            ascending=[True, True],
+                            na_position="last",
+                        ).reset_index(drop=True)
                 page_rows = metric_filtered.iloc[page_start:page_start + int(page_size)]
             except Exception as exc:
                 scout.mark_scan_failed(exc)
@@ -1254,7 +1312,11 @@ st.caption(
     "Discord lookups are requested only for the visible page."
 )
 if discord_filter != DISCORD_FILTER_ALL:
-    st.info("Discord filters apply to the currently checked page; advancing pages checks more games.")
+    st.info(
+        "Filtering the whole catalog by known contact state. Games whose contacts "
+        "have not been checked yet count as no Discord — page through to check more, "
+        "then sync to refresh."
+    )
 
 if visible.empty:
     if is_watch_view:
@@ -1280,3 +1342,9 @@ st.caption(
     "Targets are applied before contact lookup. Page navigation checks only the selected page, "
     "so the first useful results arrive without waiting for the entire catalog."
 )
+
+# The deferred page-1 contact check (scheduled by the sync above) reruns the
+# script now: the dashboard is already painted, so the slow lookup shows its
+# spinner over real results instead of the stale welcome-flow frame.
+if st.session_state.pop("contact_check_scheduled", False):
+    st.rerun()

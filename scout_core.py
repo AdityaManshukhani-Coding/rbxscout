@@ -1183,6 +1183,7 @@ class RobloxPlatformScout:
         self,
         min_visits: int = 0,
         min_ccu: int = 0,
+        discord: Optional[bool] = None,
     ) -> pd.DataFrame:
         """Instant result set: games already in the catalog that meet the targets.
 
@@ -1192,6 +1193,10 @@ class RobloxPlatformScout:
         discovered and hydrated the games, so the UI must only read and filter,
         not re-run the finder. With no thresholds set, only games the pipeline
         has actually hydrated (they carry a ccu_history snapshot) are returned.
+
+        ``discord`` narrows by known contact state: True = games with a
+        resolved Discord invite, False = games without one (including not
+        yet checked), None = no constraint.
 
         The target thresholds are applied in SQL and the result is ranked
         exactly like the dashboard sorts it (closest to the target first, CCU
@@ -1203,6 +1208,10 @@ class RobloxPlatformScout:
         min_ccu = max(0, int(min_ccu or 0))
         where = ["COALESCE(visits, 0) >= ?", "COALESCE(ccu, 0) >= ?"]
         params: List[int] = [min_visits, min_ccu]
+        if discord is True:
+            where.append("COALESCE(has_discord, 0) = 1")
+        elif discord is False:
+            where.append("COALESCE(has_discord, 0) != 1")
         if min_visits == 0 and min_ccu == 0:
             # Degenerate "no target" session: only games the pipeline has
             # actually hydrated (every hydration writes a ccu_history
