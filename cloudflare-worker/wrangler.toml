@@ -11,5 +11,12 @@ crons = ["*/5 * * * *"]
 # GITHUB_TOKEN is uploaded with `npx wrangler secret put GITHUB_TOKEN`.
 # It is used only by the scheduled handler for GitHub workflow_dispatch.
 
+# Keep-alive ping target for the hosted dashboard. The scheduled handler
+# pings it only every 11 hours (00:00, 11:00, 22:00 UTC — hours divisible
+# by 11), always landing inside Streamlit Cloud's 12 h idle timeout.
+# Public URL, so a plain variable is fine (not a secret).
+[vars]
+DASHBOARD_KEEPALIVE_URL = "https://rbxscout.streamlit.app/"
+
 # Optional: pin a custom route after adding your zone to the account, e.g.
 # routes = [{ pattern = "rbx-proxy.example.com", custom_domain = true }]

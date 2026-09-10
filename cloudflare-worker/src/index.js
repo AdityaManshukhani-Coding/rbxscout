@@ -33,13 +33,20 @@ const GITHUB_DISPATCH_ATTEMPTS = 3;
 const GITHUB_RETRY_MAX_DELAY_MS = 30_000;
 const GITHUB_RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 
-// Keep-alive: ping the hosted Streamlit dashboard on every 10-minute tick so
-// Community Cloud never hibernates it (its idle timeout is 12 h — this fires
-// ~144×/day). The URL is a Worker VARIABLE (not a secret — it is public
-// anyway) so it can be added without redeploying code:
+// Keep-alive: ping the hosted Streamlit dashboard every 11 hours so
+// Community Cloud never hibernates it (its idle timeout is 12 h; a ping
+// every 11 h always lands before the timer expires). Fires on the tick in
+// hours divisible by 11 — 00:00, 11:00 and 22:00 UTC, 3 pings/day instead
+// of the ~144 a every-10-min ping would cost. The URL is a Worker VARIABLE
+// (not a secret — it is public anyway) so it can be managed without
+// redeploying code:
 //   npx wrangler vars put DASHBOARD_KEEPALIVE_URL
 // Leave the variable unset to disable the ping entirely.
 const DASHBOARD_KEEPALIVE_URL_KEY = "DASHBOARD_KEEPALIVE_URL";
+
+function keepAliveDue(scheduledAt) {
+  return scheduledAt.getUTCHours() % 11 === 0 && scheduledAt.getUTCMinutes() < 5;
+}
 
 async function pingDashboard(env) {
   const url = env[DASHBOARD_KEEPALIVE_URL_KEY];
@@ -176,9 +183,11 @@ async function dispatchDueWorkflows(controller, env) {
     }),
   );
 
-  // Same tick also pings the hosted dashboard so it never sleeps. Fire-and-
-  // forget: its outcome is logged, never thrown.
-  await pingDashboard(env);
+  // On the 11-hour boundary ticks, also ping the hosted dashboard so it
+  // never sleeps. Fire-and-forget: its outcome is logged, never thrown.
+  if (keepAliveDue(scheduledAt)) {
+    await pingDashboard(env);
+  }
 
   const failures = [];
   for (let i = 0; i < results.length; i += 1) {

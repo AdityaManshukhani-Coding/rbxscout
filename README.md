@@ -256,14 +256,21 @@ catalog copy, so it costs nothing per visitor.
 ### Never-sleep keep-alive (Cloudflare Worker)
 
 Community Cloud hibernates apps after 12 h without traffic; the scheduler
-Worker pings the dashboard on every 10-minute tick so it never does:
+Worker pings the dashboard every 11 hours (00:00, 11:00, 22:00 UTC) so it
+never does. The URL lives in `wrangler.toml` under `[vars]`:
 
-```bash
-cd cloudflare-worker
-npx wrangler vars put DASHBOARD_KEEPALIVE_URL
-# paste: https://rbxscout.streamlit.app
+```toml
+[vars]
+DASHBOARD_KEEPALIVE_URL = "https://rbxscout.streamlit.app/"
 ```
 
-The Worker picks the variable up on the next cron tick — no redeploy needed.
-Leave it unset to disable. (A `vars put` does trigger one Worker roll; the
-cron keeps firing throughout.)
+Redeploy with `npx wrangler deploy` after changing it; delete the var (or
+leave it unset) to disable the ping.
+
+### Never roll the catalog back
+
+`db_sync.py push` refuses to overwrite a store that holds a HIGHER sync
+counter than your local copy — that would delete every game discovered
+since your copy was made. If push says "refusing to push", run
+`python db_sync.py pull` first. `--force` overrides at your own risk;
+pushing into an empty store (outage refill) never needs a flag.

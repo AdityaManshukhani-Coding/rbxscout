@@ -344,6 +344,62 @@ class TestPush(DBSyncTest):
         blob = FakeGitHubHandler.assets[db_sync.ASSET_DB]
         self.assertEqual(len(blob), db_sync.DB_PATH.stat().st_size)
 
+    def test_stale_push_is_refused(self):
+        """A local copy older than the store must never roll it back: pushing
+        sync #100 over a store at sync #200 would delete every game
+        discovered in between. The guard refuses, and the store is
+        untouched."""
+        self.make_local_db(games=3)
+        db_sync.STATE_PATH.write_text("100\n")
+        db_sync.main(["db_sync.py", "push"])   # store now at sync #100
+        newer = FakeGitHubHandler.assets[db_sync.ASSET_DB]
+
+        # Laptop drifts behind while the pipeline advances the store.
+        self.make_local_db(games=2)
+        db_sync.STATE_PATH.write_text("90\n")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(db_sync.main(["db_sync.py", "push"]), 1)
+        self.assertIn("refusing to push", stderr.getvalue())
+        self.assertIn("db_sync.py pull", stderr.getvalue())
+        # Store still holds the NEWER catalog, byte for byte.
+        self.assertEqual(FakeGitHubHandler.assets[db_sync.ASSET_DB], newer)
+
+    def test_stale_push_force_overrides(self):
+        self.make_local_db(games=3)
+        db_sync.STATE_PATH.write_text("100\n")
+        db_sync.main(["db_sync.py", "push"])
+        self.make_local_db(games=2)
+        db_sync.STATE_PATH.write_text("90\n")
+        # --force is the explicit escape hatch; it must actually push.
+        self.assertEqual(db_sync.main(["db_sync.py", "push", "--force"]), 0)
+        blob = FakeGitHubHandler.assets[db_sync.ASSET_DB]
+        self.assertEqual(len(blob), db_sync.DB_PATH.stat().st_size)
+
+    def test_equal_sync_push_is_allowed(self):
+        """Same counter (e.g. re-pushing the recovered copy) is fine."""
+        self.make_local_db(games=3)
+        db_sync.STATE_PATH.write_text("100\n")
+        db_sync.main(["db_sync.py", "push"])
+        self.make_local_db(games=5)
+        db_sync.STATE_PATH.write_text("100\n")
+        self.assertEqual(db_sync.main(["db_sync.py", "push"]), 0)
+
+    def test_refill_after_outage_is_allowed(self):
+        """Store holds NO catalog asset (post-outage): any valid local copy
+        must be pushable without --force — recovery must never need flags."""
+        self.make_local_db(games=3)
+        db_sync.STATE_PATH.write_text("100\n")
+        db_sync.main(["db_sync.py", "push"])
+        # Simulate the outage: catalog asset vanishes, marker remains.
+        rel = self.release()
+        rel["assets"] = [a for a in rel["assets"] if a["name"] != db_sync.ASSET_DB]
+        self.make_local_db(games=7)
+        db_sync.STATE_PATH.write_text("99\n")
+        self.assertEqual(db_sync.main(["db_sync.py", "push"]), 0)
+        names = [a["name"] for a in self.release()["assets"]]
+        self.assertIn(db_sync.ASSET_DB, names)
+
 
 class TestPull(DBSyncTest):
     def test_roundtrip_push_then_pull(self):

@@ -27,8 +27,14 @@ which sync produced the stored catalog.
 
 Usage:
     python db_sync.py pull     # release asset -> local rbx_scout.db
-    python db_sync.py push     # local rbx_scout.db -> release asset (clobber)
+    python db_sync.py push     # local rbx_scout.db -> release asset
+    python db_sync.py push --force   # overwrite even if the store is newer
     python db_sync.py status   # compare local vs release (size + marker)
+
+The push refuses to roll the store back: if the store holds a HIGHER sync
+counter than your local copy, your copy is stale and pushing would lose the
+games discovered since — pull first instead (--force overrides, at your own
+risk). Pushing into an EMPTY store (post-outage refill) is always allowed.
 
 Local environment (one time):
     export RBXSCOUT_GITHUB_REPO=AdityaManshukhani-Coding/rbxscout
@@ -441,7 +447,7 @@ def cmd_pull() -> int:
     return 0
 
 
-def cmd_push() -> int:
+def cmd_push(force: bool = False) -> int:
     token = gh_token()
     if not DB_PATH.exists():
         raise SyncError(f"{DB_PATH} does not exist — nothing to push")
@@ -452,6 +458,30 @@ def cmd_push() -> int:
     state = local_state()
     rel = get_or_create_release(token)
     old_state = _asset_state(rel, token)
+    # Stale-push guard: never let an old local copy roll the store back.
+    # The store only ever moves forward (each pipeline pull/push bumps the
+    # sync counter), so a local catalog with a LOWER counter is a stale copy
+    # that would silently delete every game discovered since it was made.
+    # Refill after an outage is always allowed: if the store holds no
+    # catalog at all, any valid local copy is better than an empty store.
+    force = force or os.environ.get("RBXSCOUT_FORCE_PUSH") == "1"
+    store_has_catalog = any(
+        a.get("name") == ASSET_DB for a in rel.get("assets", [])
+    )
+    if (
+        not force
+        and store_has_catalog
+        and old_state and state
+        and old_state.isdigit() and state.isdigit()
+        and int(state) < int(old_state)
+    ):
+        raise SyncError(
+            f"refusing to push: local catalog is sync #{state} but the store "
+            f"already holds sync #{old_state} — pushing would roll the "
+            "catalog back and lose newer games. Run `python db_sync.py pull` "
+            "to refresh your local copy first, or pass --force (or set "
+            "RBXSCOUT_FORCE_PUSH=1) only if you really mean to overwrite."
+        )
     replace_catalog_asset(rel, token, ASSET_DB, blob)
     upload_asset(rel, token, ASSET_STATE, (state + "\n").encode())
     payloads = stats_payloads(DB_PATH)
@@ -489,7 +519,7 @@ def main(argv: list[str]) -> int:
         if cmd == "pull":
             return cmd_pull()
         if cmd == "push":
-            return cmd_push()
+            return cmd_push(force="--force" in argv[2:])
         if cmd == "status":
             return cmd_status()
     except SyncError as exc:
