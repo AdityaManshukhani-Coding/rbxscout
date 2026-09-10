@@ -37,32 +37,45 @@ APP_DIR = Path(__file__).resolve().parent
 
 
 def _resolve_catalog() -> tuple[str, bool]:
-    """Point the dashboard at the right catalog and make sure it exists.
+    """Point the dashboard at the right catalog and make it exist.
 
     Local mode (repo has rbx_scout.db, or RBXSCOUT_LOCAL_DB=1): read the local
     file, exactly as before. Hosted mode (Streamlit Cloud): download the
     public release asset into a cache dir and keep it fresh there. Cached, so
     the ~5-min freshness check and any download happen once per process —
     not once per user, page view, or rerun.
+
+    Never raises. If the release store cannot be reached (e.g. the catalog
+    asset is missing during a pipeline outage), returns the demo-mode sentinel
+    so the dashboard still renders — with a banner explaining what happened —
+    instead of crashing with a red traceback. The ttl below re-runs this
+    every 10 minutes, so when the store recovers the app heals itself with
+    no restart or user action.
     """
 
-    @st.cache_resource(show_spinner=False)
+    @st.cache_resource(show_spinner=False, ttl=600)
     def _ensure(_version: int) -> tuple[str, bool]:
         if not catalog_fetch.is_hosted():
             return str(APP_DIR / "rbx_scout.db"), False
         try:
             path = catalog_fetch.ensure_catalog()
+            return str(path), False
         except catalog_fetch.CatalogFetchError as exc:
             stale = catalog_fetch.stale_cache_fallback(exc)
             if stale is not None:
                 return str(stale), True
-            raise
-        return str(path), False
+            # Store unreachable (missing asset / GitHub outage): run in demo
+            # mode rather than crash. The negative-DB_PATH sentinel makes the
+            # demo fallback select itself on every path below; the cache ttl
+            # (10 min) retries automatically, so recovery needs no restart.
+            print(f"catalog unavailable, running in demo mode: {exc}")
+            return "", False
 
     return _ensure(1)
 
 
 DB_PATH, _USING_STALE_CATALOG = _resolve_catalog()
+_CATALOG_UNAVAILABLE = DB_PATH == ""
 _HOSTED_MODE = catalog_fetch.is_hosted()
 PAGE_SIZE = 20
 DEFAULT_MIN_VISITS = 20_000
@@ -412,8 +425,23 @@ def render_onboarding() -> bool:
 
 initialize_session()
 if not st.session_state.onboarding_complete:
+    if _CATALOG_UNAVAILABLE:
+        st.warning(
+            "⚠️ **The catalog is temporarily unavailable.** The shared catalog "
+            "store is unreachable right now (usually fixed automatically "
+            "within minutes, when the next pipeline sync succeeds). Showing "
+            "a small demo until then."
+        )
     render_onboarding()
     st.stop()
+
+if _CATALOG_UNAVAILABLE:
+    st.warning(
+        "⚠️ **The catalog is temporarily unavailable.** The shared catalog "
+        "store could not be fetched. The next successful pipeline sync "
+        "(usually within minutes) fixes this automatically — reload the page "
+        "after an hour at the latest. Showing a small demo until then."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -424,7 +452,7 @@ if not st.session_state.onboarding_complete:
 def get_scout() -> RobloxPlatformScout:
     if "scout" not in st.session_state:
         st.session_state.scout = RobloxPlatformScout(
-            db_path=DB_PATH,
+            db_path=(DB_PATH or ""),
             roblox_cookie=st.session_state.get("onboarding_cookie") or None,
         )
     return st.session_state.scout
@@ -1097,7 +1125,12 @@ st.title("🚀 New and Upcoming" if is_watch_view else "Games matching your targ
 # Live catalog tracker — like a subscriber counter: a big number that grows
 # as the 24/7 pipeline discovers games. Reads only the cached catalog copy,
 # so it costs nothing per user and never triggers a download by itself.
-_tracker = catalog_fetch.catalog_counts(DB_PATH)
+# Skipped entirely in demo mode (no catalog file to read).
+_tracker = (
+    catalog_fetch.catalog_counts(DB_PATH)
+    if not _CATALOG_UNAVAILABLE
+    else {"games": None, "target": None, "found_today": None, "last_sync": None}
+)
 if _tracker["games"] is not None:
     _target, _found, _last = (
         _tracker.get("target"),

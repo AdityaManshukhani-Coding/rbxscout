@@ -9,6 +9,7 @@ and clobber-push behaviour are all covered.
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -54,6 +55,9 @@ class FakeGitHubHandler(BaseHTTPRequestHandler):
     assets: dict = {}
     next_id = 100
     requests: list = []
+    # Failure injection for testing the safe replace path.
+    fail_uploads = False       # POST /api/* -> 500
+    lie_about_size = False     # upload response reports a wrong size
 
     def log_message(self, *args):  # silence the test log
         pass
@@ -79,11 +83,26 @@ class FakeGitHubHandler(BaseHTTPRequestHandler):
                 return self._json(200, self.releases[tag])
             return self._json(404, {"message": "Not Found"})
         if self.path.startswith("/api/"):
-            # asset download through the API URL; auth required like GitHub
+            # asset download through the API URL; auth required like GitHub.
+            # The URL carries an asset id; resolve the asset's *current* name
+            # (a rename PATCH moves the blob, as on real GitHub where the id
+            # is the stable handle).
             if not (self.headers.get("Authorization") or "").startswith("Bearer "):
                 return self._json(401, {"message": "Requires authentication"})
-            name = self.path.rsplit("/", 1)[-1]
-            body = self._asset_payload(name)
+            parts = self.path.split("/")
+            asset_name: str | None = None
+            try:
+                aid = int(parts[3])  # /api/assets/<id>/<name>
+            except (IndexError, ValueError):
+                aid = None
+            if aid is not None:
+                for rel in self.releases.values():
+                    for a in rel.get("assets", []):
+                        if a["id"] == aid:
+                            asset_name = a["name"]
+            if asset_name is None:
+                asset_name = parts[-1] if len(parts) > 3 else ""
+            body = self._asset_payload(asset_name)
             self.send_response(200)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(len(body)))
@@ -95,13 +114,16 @@ class FakeGitHubHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         self.requests.append(("POST", self.path))
         if self.path.startswith("/api/"):  # asset upload
+            if self.fail_uploads:
+                return self._json(500, {"message": "upload failed (injected)"})
             length = int(self.headers.get("Content-Length", 0))
             name = self.path.split("name=")[-1]
             data = self.rfile.read(length)
             self.assets[name] = data
             FakeGitHubHandler.next_id += 1
             asset = {
-                "id": FakeGitHubHandler.next_id, "name": name, "size": len(data),
+                "id": FakeGitHubHandler.next_id, "name": name,
+                "size": len(data) + (1 if self.lie_about_size else 0),
                 "url": f"http://{self.headers.get('Host')}/api/assets/{FakeGitHubHandler.next_id}/{name}",
                 "updated_at": "2026-09-06T00:00:00Z",
             }
@@ -128,6 +150,22 @@ class FakeGitHubHandler(BaseHTTPRequestHandler):
 
     def do_PATCH(self):
         self.requests.append(("PATCH", self.path))
+        if self.path.startswith("/repos/x/y/releases/assets/"):
+            # Rename an existing asset (PATCH {"name": ...}). Mirrors GitHub:
+            # the blob stays the same, only the name moves.
+            aid = int(self.path.rstrip("/").rsplit("/", 1)[-1])
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length) or b"{}")
+            for rel in self.releases.values():
+                for asset in rel["assets"]:
+                    if asset["id"] == aid:
+                        old_name = asset["name"]
+                        asset.update(body)
+                        new_name = asset["name"]
+                        if new_name != old_name and old_name in self.assets:
+                            self.assets[new_name] = self.assets.pop(old_name)
+                        return self._json(200, asset)
+            return self._json(404, {"message": "Not Found"})
         if self.path.startswith("/repos/x/y/releases/"):
             rid = int(self.path.rstrip("/").rsplit("/", 1)[-1])
             length = int(self.headers.get("Content-Length", 0))
@@ -193,6 +231,8 @@ class DBSyncTest(unittest.TestCase):
         FakeGitHubHandler.assets = {db_sync.ASSET_DB: b"", db_sync.ASSET_STATE: b""}
         FakeGitHubHandler.requests = []
         FakeGitHubHandler.next_id = 100
+        FakeGitHubHandler.fail_uploads = False
+        FakeGitHubHandler.lie_about_size = False
         self._env = {k: os.environ.pop(k, None) for k in
                      ("RBXSCOUT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN", "RBXSCOUT_GITHUB_REPO")}
         os.environ["RBXSCOUT_GITHUB_TOKEN"] = "test-token"
@@ -259,6 +299,50 @@ class TestPush(DBSyncTest):
 
     def test_push_missing_db_errors(self):
         self.assertEqual(db_sync.main(["db_sync.py", "push"]), 1)
+
+    def test_failed_upload_leaves_old_catalog_intact(self):
+        """The 2026-09-09 outage: an upload dying mid-push must never empty
+        the store. The safe replace uploads first, so a failed upload leaves
+        the previous catalog asset exactly as it was."""
+        self.make_local_db(games=3)
+        db_sync.main(["db_sync.py", "push"])
+        original = FakeGitHubHandler.assets[db_sync.ASSET_DB]
+        self.make_local_db(games=9)
+        FakeGitHubHandler.fail_uploads = True
+        self.assertEqual(db_sync.main(["db_sync.py", "push"]), 1)
+        # The store still serves the OLD catalog, byte for byte.
+        self.assertEqual(FakeGitHubHandler.assets[db_sync.ASSET_DB], original)
+        rel = self.release()
+        db_assets = [a for a in rel["assets"] if a["name"] == db_sync.ASSET_DB]
+        self.assertEqual(len(db_assets), 1, "old catalog asset must survive")
+
+    def test_size_mismatch_aborts_before_old_asset_is_touched(self):
+        """A truncated/corrupted upload (GitHub reports a different size than
+        what we sent) is detected while the old asset is still in place."""
+        self.make_local_db(games=3)
+        db_sync.main(["db_sync.py", "push"])
+        original = FakeGitHubHandler.assets[db_sync.ASSET_DB]
+        self.make_local_db(games=8)
+        FakeGitHubHandler.lie_about_size = True
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(db_sync.main(["db_sync.py", "push"]), 1)
+        self.assertIn("verification failed", stderr.getvalue())
+        self.assertEqual(FakeGitHubHandler.assets[db_sync.ASSET_DB], original)
+
+    def test_replace_uses_incoming_and_leaves_no_leftover(self):
+        """The catalog is uploaded as <name>.incoming, then swapped; after a
+        successful push no .incoming asset remains."""
+        self.make_local_db(games=2)
+        db_sync.main(["db_sync.py", "push"])
+        self.make_local_db(games=6)
+        db_sync.main(["db_sync.py", "push"])
+        names = [a["name"] for a in self.release()["assets"]]
+        self.assertNotIn(db_sync.ASSET_DB + db_sync.INCOMING_SUFFIX, names)
+        self.assertIn(db_sync.ASSET_DB, names)
+        # And the served catalog is the newest blob.
+        blob = FakeGitHubHandler.assets[db_sync.ASSET_DB]
+        self.assertEqual(len(blob), db_sync.DB_PATH.stat().st_size)
 
 
 class TestPull(DBSyncTest):

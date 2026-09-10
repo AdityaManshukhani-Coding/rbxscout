@@ -144,6 +144,44 @@ def _table_html(at: AppTest) -> str:
     return joined
 
 
+# --------------------------------------------------------------------------- #
+# Catalog-store outage (the 2026-09-09 red-traceback crash)
+# --------------------------------------------------------------------------- #
+
+
+def test_store_outage_shows_banner_instead_of_crashing(monkeypatch):
+    """When the catalog store is unreachable (e.g. the rbx_scout.db asset is
+    missing during a pipeline outage), the hosted dashboard must render with
+    a friendly banner + demo data — never the red CatalogFetchError page."""
+    import catalog_fetch
+    import streamlit as st
+
+    def _unreachable(*args, **kwargs):
+        raise catalog_fetch.CatalogFetchError(
+            "release catalog-latest currently has no rbx_scout.db asset"
+        )
+
+    monkeypatch.setattr(catalog_fetch, "is_hosted", lambda: True)
+    monkeypatch.setattr(catalog_fetch, "ensure_catalog", _unreachable)
+    monkeypatch.setattr(catalog_fetch, "stale_cache_fallback", lambda exc: None)
+
+    # st.cache_resource is process-global: earlier tests in this file already
+    # resolved the catalog in local mode. Clear before and after so this test
+    # exercises the outage path and later tests recompute normally.
+    st.cache_resource.clear()
+    try:
+        at = AppTest.from_file(APP_PATH, default_timeout=30)
+        at.run()
+    finally:
+        st.cache_resource.clear()
+
+    assert not at.exception, "an outage must not crash the dashboard"
+    warnings = [w.value for w in at.warning]
+    assert any("temporarily unavailable" in w for w in warnings)
+    # The welcome flow still renders on top of the banner.
+    assert any("Studio Scouts" in el.value for el in at.header) or at.title
+
+
 def test_results_table_has_copy_message_column():
     at = _render_dashboard()
     assert not at.exception

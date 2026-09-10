@@ -145,22 +145,39 @@ def _get_bytes(url: str, timeout: float) -> bytes:
         raise CatalogFetchError(f"asset download failed: {exc}") from exc
 
 
-def release_asset_info(timeout: float = 15.0) -> dict:
-    """Return {'size': int, 'updated_at': str} for the catalog DB asset."""
-    rel = _get_json(
-        f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/tags/{RELEASE_TAG}",
-        timeout,
-    )
-    for asset in rel.get("assets", []):
-        if asset.get("name") == ASSET_DB:
-            return {
-                "size": int(asset.get("size") or 0),
-                "updated_at": str(asset.get("updated_at") or ""),
-            }
-    raise CatalogFetchError(
-        f"release {RELEASE_TAG} has no {ASSET_DB} asset yet — run "
-        "`python db_sync.py push` once from your machine to seed it"
-    )
+def release_asset_info(
+    timeout: float = 15.0, attempts: int = 2, retry_delay: float = 3.0
+) -> dict:
+    """Return {'size': int, 'updated_at': str} for the catalog DB asset.
+
+    Retries once after a short delay: the asset is legitimately absent only
+    for the second or two a healthy push takes to swap it in, and a single
+    retry rides out both that window and one transient GitHub hiccup.
+    """
+    last_error: CatalogFetchError | None = None
+    for attempt in range(max(1, attempts)):
+        try:
+            rel = _get_json(
+                f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/tags/{RELEASE_TAG}",
+                timeout,
+            )
+            for asset in rel.get("assets", []):
+                if asset.get("name") == ASSET_DB:
+                    return {
+                        "size": int(asset.get("size") or 0),
+                        "updated_at": str(asset.get("updated_at") or ""),
+                    }
+            last_error = CatalogFetchError(
+                f"release {RELEASE_TAG} currently has no {ASSET_DB} asset — "
+                "the catalog store is empty. This is usually a brief pipeline "
+                "outage; it self-repairs on the next successful db_sync push."
+            )
+        except CatalogFetchError as exc:
+            last_error = exc
+        if attempt + 1 < max(1, attempts):
+            time.sleep(retry_delay)
+    assert last_error is not None
+    raise last_error
 
 
 # ---------------------------------------------------------------------------

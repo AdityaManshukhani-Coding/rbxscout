@@ -45,6 +45,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -134,7 +135,8 @@ def _headers(token: str, accept: str = "application/vnd.github+json") -> dict:
 
 def _api(method: str, path: str, token: str, *, body: dict | None = None,
          raw: bytes | None = None, content_type: str | None = None,
-         expect_json: bool = True, accept: str | None = None):
+         expect_json: bool = True, accept: str | None = None,
+         timeout: float = 120.0):
     url = path if path.startswith("http") else f"{API}{path}"
     headers = _headers(token, accept or "application/vnd.github+json")
     data = None
@@ -146,7 +148,7 @@ def _api(method: str, path: str, token: str, *, body: dict | None = None,
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
             payload = resp.read()
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:300]
@@ -203,15 +205,82 @@ def get_or_create_release(token: str) -> dict:
         raise
 
 
+# Asset uploads can be slow (a ~30 MB catalog from a CI runner); the default
+# 120 s timeout once killed an upload mid-push and left the store empty.
+UPLOAD_TIMEOUT = 600.0
+
+# Suffix used by replace_catalog_asset for the upload-first swap below.
+INCOMING_SUFFIX = ".incoming"
+
+
 def upload_asset(rel: dict, token: str, name: str, data: bytes) -> None:
-    """Upload one asset, replacing any existing asset of the same name."""
+    """Upload one asset, replacing any existing asset of the same name.
+
+    Only used for the small, rebuilt-every-push assets (sync_state, stats).
+    The catalog DB itself must go through replace_catalog_asset, which can
+    never leave the release without a catalog.
+    """
     for asset in rel.get("assets", []):
         if asset.get("name") == name:
             _api("DELETE", f"/repos/{repo_slug()}/releases/assets/{asset['id']}", token)
     upload_url = rel["upload_url"].split("{")[0]
     sep = "&" if "?" in upload_url else "?"
     url = f"{upload_url}{sep}name={name}"
-    _api("POST", url, token, raw=data, content_type="application/octet-stream", expect_json=False)
+    _api("POST", url, token, raw=data, content_type="application/octet-stream",
+         expect_json=False, timeout=UPLOAD_TIMEOUT)
+
+
+def replace_catalog_asset(rel: dict, token: str, name: str, data: bytes) -> None:
+    """Replace the catalog DB asset without ever leaving the store empty.
+
+    Order of operations (this exact sequence fixed the 2026-09-09 outage,
+    where the old delete-then-upload code lost the catalog when the ~30 MB
+    upload timed out after the delete had already gone through):
+
+      1. upload the new blob under ``<name>.incoming`` — the old asset stays
+         untouched while this (slow) transfer runs;
+      2. verify GitHub reports the uploaded size byte-for-byte;
+      3. only then delete the old asset and rename the incoming one into
+         place — the unprotected window shrinks from a multi-minute upload
+         to a single tiny rename call.
+
+    A stale ``<name>.incoming`` from an earlier crashed push is removed
+    before uploading, so the swap self-heals after any incident.
+    """
+    incoming_name = name + INCOMING_SUFFIX
+    for asset in rel.get("assets", []):
+        if asset.get("name") == incoming_name:
+            _api("DELETE", f"/repos/{repo_slug()}/releases/assets/{asset['id']}", token)
+    upload_url = rel["upload_url"].split("{")[0]
+    sep = "&" if "?" in upload_url else "?"
+    url = f"{upload_url}{sep}name={incoming_name}"
+    uploaded = _api("POST", url, token, raw=data,
+                    content_type="application/octet-stream",
+                    expect_json=True, timeout=UPLOAD_TIMEOUT)
+    reported = int((uploaded or {}).get("size") or 0)
+    if reported != len(data):
+        # The old asset is still in place — nothing was lost. Fail loudly so
+        # the workflow run is marked failed and the next push retries.
+        raise SyncError(
+            f"upload verification failed for {name}: GitHub reports "
+            f"{reported} bytes, expected {len(data)} — old catalog left intact"
+        )
+    old = next((a for a in rel.get("assets", []) if a.get("name") == name), None)
+    if old is not None:
+        _api("DELETE", f"/repos/{repo_slug()}/releases/assets/{old['id']}", token)
+    # The rename is the only step after which the store could briefly lack
+    # the catalog (old deleted, incoming not yet renamed). Retry it a few
+    # times so a single transient 5xx cannot strand the swap half-done.
+    rename_path = f"/repos/{repo_slug()}/releases/assets/{uploaded['id']}"
+    for attempt in range(3):
+        try:
+            _api("PATCH", rename_path, token, body={"name": name},
+                 timeout=UPLOAD_TIMEOUT)
+            return
+        except SyncError:
+            if attempt == 2:
+                raise
+            time.sleep(2.0)
 
 
 def _asset_state(rel: dict, token: str) -> str | None:
@@ -383,7 +452,7 @@ def cmd_push() -> int:
     state = local_state()
     rel = get_or_create_release(token)
     old_state = _asset_state(rel, token)
-    upload_asset(rel, token, ASSET_DB, blob)
+    replace_catalog_asset(rel, token, ASSET_DB, blob)
     upload_asset(rel, token, ASSET_STATE, (state + "\n").encode())
     payloads = stats_payloads(DB_PATH)
     for name, payload in payloads.items():
