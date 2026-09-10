@@ -1091,7 +1091,7 @@ def discord_cell_html(url) -> str:
 # instead: it copies the JSON-encoded message from the button's data-msg,
 # tries the async clipboard API first and falls back to a hidden-textarea
 # execCommand copy, then shows one-shot "Copied" feedback on the button.
-_COPY_SCRIPT = """
+_COPY_SCRIPT = r"""
 <script>
 window.__ssCopyReady = true;
 document.addEventListener('click', function (event) {
@@ -1099,12 +1099,25 @@ document.addEventListener('click', function (event) {
   if (!btn) { return; }
   var msg, label = btn.textContent, ok = false;
   try { msg = JSON.parse(btn.dataset.msg); } catch (err) { return; }
-  // Freshness override: a Streamlit text_input only commits on blur/rerun,
-  // so a name typed just before clicking Copy may not be in data-msg yet.
-  // Prefer the live sidebar input value when it differs.
-  var nameInput = document.querySelector('[data-testid="stSidebar"] input[aria-label*="Discord username"], aside input[aria-label*="Discord username"]');
+  // Freshness override: Streamlit text_inputs only commit on blur/rerun,
+  // so a name or User ID typed just before clicking Copy may not be in
+  // data-msg yet. Prefer the live sidebar input values when they differ.
+  var sidebar = document.querySelector('[data-testid="stSidebar"], aside');
+  var nameInput = sidebar && sidebar.querySelector('input[aria-label*="Discord username"]');
+  var idInput = sidebar && sidebar.querySelector('input[aria-label*="Discord User ID"]');
   var name = nameInput && nameInput.value.trim();
-  if (name) {
+  var rawId = idInput && idInput.value.trim();
+  var digits = rawId ? rawId.replace(/\D/g, '') : '';
+  var validId = digits.length >= 15 && digits.length <= 21;
+  if (validId) {
+    // A live User ID wins: swap the tag for a real mention token, refresh
+    // any stale mention from an older ID, then upgrade a resolved name.
+    msg = msg.replace(/\[Your Name\]/gi, '<@' + digits + '>').replace(/\[Name\]/gi, '<@' + digits + '>');
+    msg = msg.replace(/<@\d+>/g, '<@' + digits + '>');
+    if (name && msg.indexOf(name) !== -1) {
+      msg = msg.split(name).join('<@' + digits + '>');
+    }
+  } else if (name) {
     msg = msg.replace(/\[Your Name\]/gi, name).replace(/\[Name\]/gi, name);
   }
   var finish = function () {

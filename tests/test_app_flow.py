@@ -296,6 +296,38 @@ def test_results_table_has_copy_message_column():
     assert "[Game Name]" not in message
 
 
+def test_copy_script_rewrites_identity_from_live_sidebar_inputs():
+    """The freshness override must cover BOTH identity widgets.
+
+    Streamlit text inputs only commit on blur/rerun, so a User ID or name
+    typed just before clicking Copy is not yet in data-msg. The client-side
+    script re-reads the live sidebar inputs — the User ID must win over
+    both unfilled tags and any stale mention token from an older ID.
+    """
+    import re as _re
+
+    at = _render_dashboard()
+    assert not at.exception
+
+    script = _re.search(r"<script>(.*?)</script>", _table_html(at), _re.S)
+    assert script, "copy freshness script should ship with the table"
+    js = script.group(1)
+
+    # Both identity inputs are re-read at click time.
+    assert "Discord username" in js
+    assert "Discord User ID" in js
+
+    # The stored message was rendered server-side (name filled); the JS
+    # must carry the ID-validity gate and the live mention rewrite so a
+    # just-typed ID still wins at click time.
+    match = _re.search(r"data-msg=\"([^\"]+)\"", _table_html(at))
+    assert match
+    stored = json.loads(html_module.unescape(match.group(1)))
+    assert "[Your Name]" not in stored
+    assert "digits.length >= 15" in js and "digits.length <= 21" in js
+    assert "'<@' + digits + '>'" in js
+
+
 def test_sidebar_edits_name_and_template():
     at = _render_dashboard(name="dev_razor10")
     assert not at.exception
