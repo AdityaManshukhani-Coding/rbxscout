@@ -446,6 +446,35 @@ def test_discord_filter_reads_whole_catalog(monkeypatch):
     assert "Blox Fruits" in _table_html(at)
 
 
+def test_discord_filter_survives_stale_scout_core_signature(monkeypatch):
+    """Deploy skew self-heal: a running cloud process can hold the OLD
+    load_catalog_matches (no ``discord`` param) in sys.modules while the
+    freshly re-read app.py calls it with one — this used to crash with a
+    red TypeError on the Discord filter. Now the call is signature-checked
+    and the constraint is applied in memory instead."""
+    at = _render_dashboard()
+
+    stale = pd.concat([
+        _demo_frame(),  # has_discord=True, has an invite
+        _demo_frame().assign(
+            universe_id=2, title="No Invite Game", has_discord=False, discord_url=None
+        ),
+    ], ignore_index=True)
+
+    def _stale(self, min_visits=0, min_ccu=0):
+        # Old-world signature: accepts no ``discord`` argument at all.
+        return stale.copy()
+
+    monkeypatch.setattr(scout_core.RobloxPlatformScout, "load_catalog_matches", _stale)
+
+    at.sidebar.radio(key="discord_filter_radio").set_value(DISCORD_FILTER_TRUE).run()
+
+    assert not at.exception  # the TypeError crash is the regression
+    table = _table_html(at)
+    assert "Blox Fruits" in table
+    assert "No Invite Game" not in table
+
+
 def test_cookie_guide_renders_step_screenshots():
     """Every cookie-guide step shows a screenshot (assets/Step N SS.png).
 

@@ -485,6 +485,37 @@ if _CATALOG_UNAVAILABLE:
 # --------------------------------------------------------------------------- #
 
 
+def _read_catalog(min_visits: int, min_ccu: int, discord: bool | None = None) -> pd.DataFrame:
+    """Read the catalog, tolerating a stale ``scout_core`` in the running process.
+
+    During a Streamlit Cloud redeploy the script on disk (app.py) is re-read on
+    every rerun, but the already-imported ``scout_core`` module stays in
+    ``sys.modules`` until the container restarts. In that window the fresh
+    caller can meet the old ``load_catalog_matches`` signature (no ``discord``
+    parameter) and crash with a red TypeError instead of showing results.
+
+    The stale signature is detected per call; the fallback applies the
+    Discord constraint in memory so the filter keeps working until the
+    restart clears the skew. Never raises.
+    """
+    import inspect
+
+    frame = pd.DataFrame()
+    try:
+        method = scout.load_catalog_matches
+        if "discord" in inspect.signature(method).parameters:
+            frame = method(min_visits=min_visits, min_ccu=min_ccu, discord=discord)
+        else:
+            # Stale module in sys.modules: call the old signature, filter below.
+            frame = method(min_visits=min_visits, min_ccu=min_ccu)
+    except Exception:
+        return pd.DataFrame()
+    if discord is None or frame.empty:
+        return frame
+    has = pd.to_numeric(frame.get("has_discord"), errors="coerce").fillna(0) == 1
+    return frame.loc[has if discord else ~has].copy()
+
+
 def get_scout() -> RobloxPlatformScout:
     if "scout" not in st.session_state:
         st.session_state.scout = RobloxPlatformScout(
@@ -659,7 +690,7 @@ if sync or st.session_state.pending_initial_scan:
             # and hydrator workflows) owns discovery and hydration; this
             # button only pulls what it already stored. Results page one is
             # ready instantly; contacts still load page by page below.
-            data = scout.load_catalog_matches(
+            data = _read_catalog(
                 min_visits=int(min_visits),
                 min_ccu=int(min_ccu),
             )
@@ -770,7 +801,7 @@ metric_filtered = apply_filters(
 # the catalog with the constraint applied in SQL instead.
 if not is_watch_view and discord_filter != DISCORD_FILTER_ALL:
     metric_filtered = apply_filters(
-        scout.load_catalog_matches(
+        _read_catalog(
             min_visits=eff_min_visits,
             min_ccu=eff_min_ccu,
             discord=(discord_filter == DISCORD_FILTER_TRUE),
@@ -864,7 +895,7 @@ if deep and page_ids:
                         # Fresh contact states just persisted — re-read the
                         # catalog so newly resolved invites join the view.
                         metric_filtered = apply_filters(
-                            scout.load_catalog_matches(
+                            _read_catalog(
                                 min_visits=eff_min_visits,
                                 min_ccu=eff_min_ccu,
                                 discord=(discord_filter == DISCORD_FILTER_TRUE),
