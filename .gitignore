@@ -28,6 +28,9 @@ cloudflare-worker/.wrangler/
 *.db-shm
 *.db.tmp
 
+# --- per-device profiles (contain the remembered Roblox cookie — NEVER commit) ---
+.profiles/
+
 # --- private notes (delete these lines to publish) ---
 GAMES_DB_PLAN.md
 implementation_plan.md

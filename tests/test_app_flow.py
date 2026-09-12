@@ -14,6 +14,7 @@ import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
 
+import profile_store
 import scout_core
 from scout_core import (
     DEFAULT_MESSAGE_TEMPLATE,
@@ -473,6 +474,130 @@ def test_discord_filter_survives_stale_scout_core_signature(monkeypatch):
     table = _table_html(at)
     assert "Blox Fruits" in table
     assert "No Invite Game" not in table
+
+
+# --------------------------------------------------------------------------- #
+# Device profile: refreshes and back-navigation remember you
+# --------------------------------------------------------------------------- #
+
+
+def test_refresh_restores_completed_scout_and_reloads_results(
+    monkeypatch, tmp_path
+):
+    """A returning scout (refresh / new tab) lands on their results with
+    identity restored — never back at the start of the welcome flow."""
+    monkeypatch.setenv("SS_PROFILE_DIR", str(tmp_path / "profiles"))
+    profile_store.save_profile(
+        "test-ref-1",
+        {
+            "discord_name": "Saved Scout",
+            "discord_user_id": "53908099506183680",
+            "message_template": DEFAULT_MESSAGE_TEMPLATE,
+            "target_min_visits": 50_000,
+            "target_min_ccu": 75,
+            "onboarding_cookie": "",
+            "onboarding_step": 4,
+            "guide_step": 4,
+            "onboarding_complete": True,
+        },
+    )
+    frame = _demo_frame()
+    monkeypatch.setattr(
+        scout_core.RobloxPlatformScout,
+        "load_catalog_matches",
+        lambda self, min_visits=0, min_ccu=0: frame.copy(),
+    )
+
+    at = _fresh_app()
+    at.session_state["_device_ref"] = "test-ref-1"
+    at.run()
+
+    assert not at.exception
+    titles = [el.value for el in at.title]
+    assert any("Games matching" in t for t in titles), "dashboard, not welcome flow"
+    # Identity came back for the copy-message cells: with a saved User ID the
+    # message carries the real mention token (which takes precedence), so the
+    # restored identity is proven by the token itself.
+    match = re.search(r'data-msg="([^"]+)"', _table_html(at))
+    assert match, "results table with copy buttons rendered"
+    message = json.loads(html_module.unescape(match.group(1)))
+    assert "<@53908099506183680>" in message
+    assert "[Your Name]" not in message
+
+
+def test_mid_onboarding_refresh_resumes_the_saved_step(monkeypatch, tmp_path):
+    """Refreshing mid-welcome-flow resumes at the saved step with fields filled."""
+    monkeypatch.setenv("SS_PROFILE_DIR", str(tmp_path / "profiles"))
+    profile_store.save_profile(
+        "test-ref-2",
+        {
+            "discord_name": "Part Scout",
+            "discord_user_id": "",
+            "message_template": DEFAULT_MESSAGE_TEMPLATE,
+            "target_min_visits": 20_000,
+            "target_min_ccu": 25,
+            "onboarding_cookie": "",
+            "onboarding_step": 3,
+            "guide_step": 4,
+            "onboarding_complete": False,
+        },
+    )
+
+    at = _fresh_app()
+    at.session_state["_device_ref"] = "test-ref-2"
+    at.run()
+
+    assert not at.exception
+    titles = [el.value for el in at.title]
+    assert any("Discord username" in t for t in titles), "resumes at step 3"
+    assert at.text_input(key="discord_name").value == "Part Scout"
+
+
+def test_onboarding_progress_is_saved_for_the_next_refresh(monkeypatch, tmp_path):
+    """Advancing the welcome flow snapshots the profile immediately."""
+    monkeypatch.setenv("SS_PROFILE_DIR", str(tmp_path / "profiles"))
+
+    at = _fresh_app()
+    at.session_state["_device_ref"] = "test-ref-3"
+    at.run()
+    at.button(key="onb0_next").click().run()
+    at.button(key="onb1_next").click().run()  # targets -> cookie guide
+    at.run()
+
+    saved = profile_store.load_profile("test-ref-3")
+    assert saved.get("onboarding_step") == 2  # cookie guide
+    assert saved.get("target_min_visits")
+
+
+def test_forget_this_device_clears_profile_and_returns_to_welcome(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("SS_PROFILE_DIR", str(tmp_path / "profiles"))
+    profile_store.save_profile(
+        "test-ref-4",
+        {
+            "discord_name": "Doomed Scout",
+            "target_min_visits": 1,
+            "target_min_ccu": 1,
+            "onboarding_cookie": "",
+            "onboarding_step": 4,
+            "guide_step": 4,
+            "onboarding_complete": True,
+        },
+    )
+    at = _fresh_app()
+    at.session_state["_device_ref"] = "test-ref-4"
+    at.session_state["data"] = _demo_frame()
+    at.session_state["source"] = "demo"
+    at.run()
+    assert not at.exception
+
+    at.sidebar.button(key="forget_device").click().run()
+
+    assert not at.exception
+    assert profile_store.load_profile("test-ref-4") == {}
+    titles = [el.value for el in at.title]
+    assert any("Welcome" in t for t in titles), "back to a fresh welcome flow"
 
 
 def test_cookie_guide_renders_step_screenshots():

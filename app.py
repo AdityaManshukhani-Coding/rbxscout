@@ -10,6 +10,7 @@ import html
 import json
 import logging
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import quote
 
@@ -30,6 +31,7 @@ from scout_core import (
     truncate,
 )
 import catalog_fetch
+import profile_store
 
 logging.basicConfig(level=logging.INFO)
 
@@ -182,7 +184,94 @@ def demo_dataframe() -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 
 
-def initialize_session() -> None:
+# --------------------------------------------------------------------------- #
+# Device profile: remembers you across refreshes and back-navigation.
+# --------------------------------------------------------------------------- #
+
+_PROFILE_FIELDS = (
+    "discord_name",
+    "discord_user_id",
+    "message_template",
+    "target_min_visits",
+    "target_min_ccu",
+    "onboarding_cookie",
+    "onboarding_step",
+    "guide_step",
+    "onboarding_complete",
+)
+
+
+def _device_ref() -> str | None:
+    """Stable per-browser id: the ``ss_ref`` cookie, minted client-side.
+
+    Streamlit cannot set cookies from the server, so a one-shot script mints a
+    random id in localStorage, mirrors it into a 1-year ``ss_ref`` cookie, and
+    reloads once. From the next run on, ``st.context.cookies`` reads it.
+    """
+    if "_device_ref" in st.session_state:
+        return st.session_state["_device_ref"]
+    ref = (st.context.cookies.get("ss_ref") or "").strip()
+    if ref:
+        st.session_state["_device_ref"] = ref
+        return ref
+    if st.session_state.get("_device_ref_bootstrapping"):
+        # Reload scheduled, script mounted, cookie not visible yet.
+        return None
+    st.session_state._device_ref_bootstrapping = True
+    st.html(
+        r"""
+<script>
+(function () {
+  var KEY = 'ss_ref';
+  var ref = null;
+  try { ref = window.localStorage.getItem(KEY); } catch (e) {}
+  if (!ref) {
+    ref = (window.crypto && window.crypto.randomUUID
+      ? window.crypto.randomUUID() : 'r-' + Date.now() + '-' + Math.random().toString(36).slice(2));
+    try { window.localStorage.setItem(KEY, ref); } catch (e) {}
+  }
+  if (!/(^|;\s*)ss_ref=/.test(document.cookie)) {
+    document.cookie = 'ss_ref=' + encodeURIComponent(ref) + '; Path=/; Max-Age=31536000; SameSite=Lax';
+  }
+  window.location.reload();
+})();
+</script>
+""",
+        unsafe_allow_javascript=True,
+    )
+    return None
+
+
+def _profile_save() -> None:
+    """Snapshot the remembered fields into the device profile (never raises)."""
+    ref = _device_ref()
+    if not ref:
+        return
+    profile_store.save_profile(
+        ref,
+        {field: st.session_state.get(field) for field in _PROFILE_FIELDS},
+    )
+
+
+def _restore_from_profile() -> bool:
+    """Seed session state from the device profile; True when one applied."""
+    ref = _device_ref()
+    if not ref:
+        return False
+    profile = profile_store.load_profile(ref)
+    if not profile:
+        return False
+    for field in _PROFILE_FIELDS:
+        if field in st.session_state:
+            continue  # this session already has a live value; never clobber
+        if field in profile and profile[field] is not None:
+            st.session_state[field] = profile[field]
+    return True
+
+
+def initialize_session() -> bool:
+    """Seed defaults, then overlay the device profile; True when one applied."""
+    restored = _restore_from_profile()  # first, so defaults only fill gaps
     defaults = {
         "onboarding_step": 0,
         "onboarding_complete": False,
@@ -213,6 +302,7 @@ def initialize_session() -> None:
         st.session_state.onboard_visits = st.session_state.target_min_visits
     if "onboard_ccu" not in st.session_state:
         st.session_state.onboard_ccu = st.session_state.target_min_ccu
+    return restored
 
 
 def set_preset(min_visits: int, min_ccu: int) -> None:
@@ -227,6 +317,12 @@ def _save_onboarding_targets() -> None:
     disappear from the render tree on the next rerun."""
     st.session_state.target_min_visits = st.session_state["onboard_visits"]
     st.session_state.target_min_ccu = st.session_state["onboard_ccu"]
+    _profile_save()
+
+
+def _save_profile_identity() -> None:
+    """Snapshot identity fields (name / ID / template / cookie) on change."""
+    _profile_save()
 
 
 def guide_image(step: int):
@@ -248,6 +344,7 @@ def render_onboarding() -> bool:
         st.info("Your first scan uses the targets you choose next. Contact lookups are loaded page by page.")
         if st.button("Next", type="primary", width="stretch", key="onb0_next"):
             st.session_state.onboarding_step = 1
+            _profile_save()  # progress survives a refresh even this early
             st.rerun()
         return False
 
@@ -297,6 +394,7 @@ def render_onboarding() -> bool:
             if int(st.session_state.target_min_visits) or int(st.session_state.target_min_ccu):
                 st.session_state.onboarding_step = 2
                 st.session_state.guide_step = 1
+                _profile_save()  # targets + step survive a refresh
                 st.rerun()
         return False
 
@@ -312,6 +410,7 @@ def render_onboarding() -> bool:
             max_chars=64,
             placeholder="e.g. dev_razor10 or rip_indra",
             persist_state="session",
+            on_change=_save_profile_identity,
         )
         if not str(st.session_state.discord_name or "").strip():
             st.caption("Tip: add your username so the message template can fill it in for you.")
@@ -321,6 +420,7 @@ def render_onboarding() -> bool:
             max_chars=32,
             placeholder="e.g. 53908099506183680",
             persist_state="session",
+            on_change=_save_profile_identity,
         )
         st.caption(
             "How to find it: 1) Discord → User Settings → Advanced → turn on Developer Mode. "
@@ -346,6 +446,7 @@ def render_onboarding() -> bool:
             st.rerun()
         if next_column.button("Next", type="primary", width="stretch", key="onb3_next"):
             st.session_state.onboarding_step = 4
+            _profile_save()  # keep name / ID / progress across refreshes
             st.rerun()
         return False
 
@@ -360,6 +461,7 @@ def render_onboarding() -> bool:
             key="message_template",
             height=430,
             persist_state="session",
+            on_change=_save_profile_identity,
         )
         st.caption(
             "Make sure you use the [Your Name] tag for your Discord username and the "
@@ -393,6 +495,7 @@ def render_onboarding() -> bool:
                 st.session_state.get("onboard_ccu", st.session_state.target_min_ccu)
             )
             st.session_state.onboarding_complete = True
+            _profile_save()  # completion + targets survive refreshes now
             # Run the real first scan on the post-onboarding rerun with the
             # captured targets. The dashboard paints as soon as it finishes;
             # speed hardening in scout_core keeps that well under a minute.
@@ -434,6 +537,7 @@ def render_onboarding() -> bool:
             key="onboarding_cookie",
             help="Stored in this Streamlit session only and never written to SQLite.",
             persist_state="session",
+            on_change=_save_profile_identity,
         )
         st.caption("Cookie access can vary with Roblox account age, verification, privacy settings, region, and endpoint policy.")
 
@@ -450,6 +554,7 @@ def render_onboarding() -> bool:
             st.session_state.guide_step = guide_step + 1
         else:
             st.session_state.onboarding_step = 3
+        _profile_save()  # cookie-guide progress + cookie survive refreshes
         st.rerun()
     if guide_step == 4 and not st.session_state.onboarding_cookie:
         st.caption(
@@ -459,7 +564,11 @@ def render_onboarding() -> bool:
     return False
 
 
-initialize_session()
+_restored = initialize_session()
+if _restored and st.session_state.onboarding_complete:
+    # Returning scout: auto-load their results once per session instead of
+    # dropping them on an empty table after a refresh.
+    st.session_state.pending_initial_scan = not st.session_state.get("welcome_scan_started")
 if not st.session_state.onboarding_complete:
     if _CATALOG_UNAVAILABLE:
         st.warning(
@@ -644,27 +753,54 @@ with st.sidebar.expander("⚙️ Scan settings", expanded=False):
         type="password",
         key="onboarding_cookie",
         persist_state="session",
-        help="Session-only credential. It is scoped to Roblox requests and never saved in SQLite.",
+        on_change=_save_profile_identity,
+        help="Remembered on this device so refreshes keep you signed in. Never written to SQLite.",
     )
     apply_cookie = st.button("💾 Apply cookie", width="stretch", disabled=not cookie)
     if apply_cookie:
         scout.set_cookie(cookie)
-        st.toast("Cookie applied to the active Roblox session.")
+        _profile_save()
+        st.toast("Cookie applied — remembered on this device.")
+    with st.sidebar.expander("This device", expanded=False):
+        st.caption(
+            "Your details (name, User ID, targets, template, cookie, progress) are "
+            "remembered on this device, so refreshes and back-navigation keep you "
+            "where you were."
+        )
+        if st.button("🧠 Forget this device", width="stretch", key="forget_device"):
+            ref = _device_ref()
+            if ref:
+                profile_store.clear_profile(ref)
+            st.session_state.clear()
+            st.rerun()
 
 with st.sidebar.expander("✉️ Outreach message", expanded=False):
-    st.text_input("Discord username", key="discord_name", max_chars=64, persist_state="session")
+    st.text_input(
+        "Discord username",
+        key="discord_name",
+        max_chars=64,
+        persist_state="session",
+        on_change=_save_profile_identity,
+    )
     st.text_input(
         "Discord User ID (optional)",
         key="discord_user_id",
         max_chars=32,
         help="Pasted “@username” is plain text in Discord — real pings need your numeric ID.",
         persist_state="session",
+        on_change=_save_profile_identity,
     )
     st.caption(
         "ID set → [Your Name] copies as a clickable, pingable @mention. "
         "Find it: Developer Mode → right-click your name → Copy User ID."
     )
-    st.text_area("Message template", key="message_template", height=250, persist_state="session")
+    st.text_area(
+        "Message template",
+        key="message_template",
+        height=250,
+        persist_state="session",
+        on_change=_save_profile_identity,
+    )
     st.caption(
         "Keep the [Your Name] and [Game Name] tags — they auto-fill when you "
         "copy a message from the results table."
@@ -680,6 +816,7 @@ if check_contacts:
     st.session_state.check_contacts_requested = True
 
 if sync or st.session_state.pending_initial_scan:
+    _profile_save()  # targets/identity snapshot rides along with the scan
     st.session_state.pending_initial_scan = False
     st.session_state.welcome_scan_started = True
     st.session_state.scan_error = ""
