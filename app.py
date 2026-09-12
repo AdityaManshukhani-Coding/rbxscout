@@ -1318,27 +1318,6 @@ if is_watch_view:
         "Games that climbed 2+ tiers or tripled their CCU between syncs. "
         "Same table, same Discord checks — no filters by design."
     )
-nav_left, nav_center, nav_right = st.columns([1, 2, 1])
-with nav_left:
-    st.button(
-        "← Previous page",
-        disabled=int(page) <= 1,
-        key="main_previous_page",
-        on_click=shift_contact_page,
-        args=(-1, page_count),
-        width="stretch",
-    )
-with nav_center:
-    st.caption(f"Page {int(page)} of {page_count} · {len(metric_filtered):,} matching games")
-with nav_right:
-    st.button(
-        "Next page →",
-        disabled=int(page) >= page_count,
-        key="main_next_page",
-        on_click=shift_contact_page,
-        args=(1, page_count),
-        width="stretch",
-    )
 meta_bits = [
     f"**{len(visible):,}** shown",
     f"**{len(metric_filtered):,}** target matches",
@@ -1380,6 +1359,29 @@ else:
         file_name=f"studioscout_export_{time.strftime('%Y%m%d_%H%M')}.csv",
         mime="text/csv",
         width="content",
+    )
+
+# Pagination sits under the results table, where users look for it.
+nav_left, nav_center, nav_right = st.columns([1, 2, 1])
+with nav_left:
+    st.button(
+        "← Previous page",
+        disabled=int(page) <= 1,
+        key="main_previous_page",
+        on_click=shift_contact_page,
+        args=(-1, page_count),
+        width="stretch",
+    )
+with nav_center:
+    st.caption(f"Page {int(page)} of {page_count} · {len(metric_filtered):,} matching games")
+with nav_right:
+    st.button(
+        "Next page →",
+        disabled=int(page) >= page_count,
+        key="main_next_page",
+        on_click=shift_contact_page,
+        args=(1, page_count),
+        width="stretch",
     )
 
 st.caption(
