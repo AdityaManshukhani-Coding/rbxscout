@@ -310,9 +310,12 @@ def test_copy_script_rewrites_identity_from_live_sidebar_inputs():
     at = _render_dashboard()
     assert not at.exception
 
-    script = _re.search(r"<script>(.*?)</script>", _table_html(at), _re.S)
-    assert script, "copy freshness script should ship with the table"
-    js = script.group(1)
+    table_html = _table_html(at)
+    # Target the copy script specifically (the input-guard script also ships
+    # inside an st.html element but never touches .ss-copy buttons).
+    scripts = _re.findall(r"<script>(.*?)</script>", table_html, _re.S)
+    js = next((s for s in scripts if "aria-label" in s and "ss-copy" in s), "")
+    assert js, "copy freshness script should ship with the table"
 
     # Both identity inputs are re-read at click time.
     assert "Discord username" in js

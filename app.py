@@ -81,6 +81,45 @@ def _resolve_catalog() -> tuple[str, bool]:
 DB_PATH, _USING_STALE_CATALOG = _resolve_catalog()
 _CATALOG_UNAVAILABLE = DB_PATH == ""
 _HOSTED_MODE = catalog_fetch.is_hosted()
+
+_INPUT_GUARD_SCRIPT = r"""
+<script>
+(function () {
+  // The .ROBLOSECURITY cookie field is a real password box; the Discord
+  // fields are plain text but Chrome's heuristic treats labels like "User ID"
+  // as credentials. Left alone, Chrome offers to "save your password" on
+  // every step of onboarding. Mark every Streamlit text input as
+  // non-credential (autocomplete=off + 1Password/LastPass opt-outs) and tag
+  // the app as non-login so the browser stops asking.
+  if (window.__ssInputGuard) { return; }  // observers survive Streamlit reruns
+  window.__ssInputGuard = true;
+  var sweep = function () {
+    var app = document.querySelector("section.stApp, [data-testid='stApp']") || document.body;
+    if (app) {
+      app.setAttribute('data-1p-ignore', '');
+      app.setAttribute('data-lpignore', 'true');
+    }
+    var fields = document.querySelectorAll("input[data-testid='stTextInput'], input[aria-label]");
+    for (var j = 0; j < fields.length; j++) {
+      var el = fields[j];
+      if (el.getAttribute('data-1p-ignore')) { continue; }
+      el.setAttribute('data-1p-ignore', '');
+      el.setAttribute('data-lpignore', 'true');
+      el.setAttribute('autocomplete', 'off');
+    }
+  };
+  sweep();
+  // Streamlit mounts inputs after this script in the element stream, and
+  // replaces them on every rerun — watch the DOM and re-sweep as they appear.
+  var pending = null;
+  var observer = new MutationObserver(function () {
+    if (pending) { return; }
+    pending = window.setTimeout(function () { pending = null; sweep(); }, 120);
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+})();
+</script>
+"""
 PAGE_SIZE = 20
 DEFAULT_MIN_VISITS = 20_000
 DEFAULT_MIN_CCU = 25
@@ -372,6 +411,7 @@ def _render_gate() -> None:
         )
 
     st.markdown("</div>", unsafe_allow_html=True)
+    st.html(_INPUT_GUARD_SCRIPT, unsafe_allow_javascript=True)  # no save-password prompt here either
     st.stop()
 
 
@@ -816,17 +856,106 @@ st.sidebar.caption("Roblox game scouting and Discord contact finder")
 # Workspace switch: the New and Upcoming view reuses the exact same paging,
 # Discord-check and table pipeline as the main view — only the data source
 # (blow-up watchlist) and the absence of filters differ.
+def render_live_counter(compact: bool = True) -> None:
+    """The live catalog counter — the app's subscriber-count moment.
+
+    A big tabular-numeral number that grows as the 24/7 pipeline discovers
+    games, read from the cached catalog copy only (no network, no per-user
+    cost, never triggers a download). ``compact=True`` is the small band
+    under the results heading; the full-size centered version is the
+    dedicated 📡 Live catalog section, where a fragment re-renders it every
+    60 s so the count ticks up live like a YouTube subscriber counter.
+    """
+    _tracker = (
+        catalog_fetch.catalog_counts(DB_PATH)
+        if not _CATALOG_UNAVAILABLE
+        else {"games": None, "target": None, "found_today": None, "last_sync": None}
+    )
+    if _tracker["games"] is None:
+        st.info("Catalog counters unavailable — the catalog did not load this session.")
+        return
+    _target, _found, _last = (
+        _tracker.get("target"),
+        _tracker.get("found_today") or 0,
+        _tracker.get("last_sync"),
+    )
+    _games_fmt = f"{_tracker['games']:,}"
+    _badges = []
+    if _target is not None:
+        _badges.append(f"🎯 {_target:,} meet the 20k visits / 25 CCU target")
+    if _found:
+        _badges.append(f"✨ +{_found:,} discovered today (UTC)")
+    if _last:
+        _badges.append(f"🕒 last pipeline sync {_last} UTC")
+    if _USING_STALE_CATALOG:
+        _badges.append("⚠️ showing the last cached catalog — refresh failed")
+    _badges_html = (
+        '<div class="ss-tracker-badges">' + " · ".join(_badges) + "</div>"
+        if _badges else ""
+    )
+    _wrap = "ss-tracker" if compact else "ss-tracker ss-tracker-full"
+    _num = "ss-tracker-num" if compact else "ss-tracker-num ss-tracker-big"
+    _digits = "".join(
+        f'<span class="ss-digit" style="animation-delay:{i * 45}ms">{ch}</span>'
+        for i, ch in enumerate(_games_fmt)
+    )
+    st.markdown(
+        """
+<style>
+.ss-tracker {
+  display: inline-block; padding: 14px 26px; margin-bottom: 6px;
+  border: 1px solid rgba(128,128,128,0.35); border-radius: 12px;
+  background: linear-gradient(180deg, rgba(88,101,242,0.10), rgba(88,101,242,0.03));
+}
+.ss-tracker-full {
+  display: block; text-align: center; padding: 30px 34px; margin: 6px auto 10px auto;
+}
+.ss-tracker-num {
+  font-size: 3.1rem; font-weight: 800; line-height: 1.1; letter-spacing: 0.5px;
+  font-variant-numeric: tabular-nums; color: #e6edf3;
+}
+.ss-tracker-big { font-size: 5rem; letter-spacing: 1px; }
+.ss-digit {
+  display: inline-block;
+  animation: ss-pop 600ms cubic-bezier(0.2, 0.9, 0.25, 1.2) backwards;
+}
+@keyframes ss-pop {
+  from { opacity: 0; transform: translateY(0.45em) scale(0.92); }
+  to   { opacity: 1; transform: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ss-digit { animation: none; }
+}
+.ss-tracker-sub { font-size: 0.92rem; color: rgba(230,237,243,0.65); margin-top: 2px; }
+.ss-tracker-full .ss-tracker-sub { font-size: 1.05rem; margin-top: 6px; }
+.ss-tracker-badges { font-size: 0.82rem; color: rgba(230,237,243,0.8); margin-top: 8px; }
+</style>
+"""
+        + f'<div class="{_wrap}">'
+        + f'<div class="{_num}">{_digits}</div>'
+        + '<div class="ss-tracker-sub">games in the catalog &amp; growing</div>'
+        + _badges_html
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
 view = st.sidebar.radio(
     "Workspace",
-    options=["🎮 Main scout", "🚀 New and Upcoming"],
+    options=["🎮 Main scout", "🚀 New and Upcoming", "📡 Live catalog"],
     key="workspace_view",
 )
 is_watch_view = str(view).startswith("🚀")
+is_live_view = str(view).startswith("📡")
 # Switching workspaces lands you on page 1 of the new view; contact state
 # stays per-view so neither side loses its checked pages.
 if st.session_state.get("last_workspace_view") != view:
     st.session_state.last_workspace_view = view
     st.session_state.contact_page = 1
+
+# Stop Chrome's "save your password?" bubble on the cookie / Discord fields.
+# Page-level flag inside the script makes repeated mounts harmless.
+st.html(_INPUT_GUARD_SCRIPT, unsafe_allow_javascript=True)
 
 with st.sidebar.expander("🎯 Current target", expanded=True):
     min_visits = st.number_input(
@@ -921,6 +1050,30 @@ with st.sidebar.expander("✉️ Outreach message", expanded=False):
         "Keep the [Your Name] and [Game Name] tags — they auto-fill when you "
         "copy a message from the results table."
     )
+
+if is_live_view:
+    # Dedicated live section: the counter is the whole page. A fragment
+    # re-renders just this block every 60 s so the number ticks up in place —
+    # no full-page rerun, no scroll jump, no spinner over the rest of the UI.
+    # Stops before the sync/data machinery — this view needs none of it.
+    st.title("📡 Live catalog")
+    st.caption(
+        "Every game the 24/7 pipeline has discovered so far. Leave this tab open "
+        "and watch the count grow — it updates itself."
+    )
+
+    @st.fragment(run_every=60)
+    def _live_catalog_fragment() -> None:
+        render_live_counter(compact=False)
+
+    if _CATALOG_UNAVAILABLE:
+        st.warning(
+            "⚠️ The catalog store is unreachable right now — the counter returns "
+            "automatically once the next pipeline sync succeeds."
+        )
+    _live_catalog_fragment()
+    st.caption("Auto-refreshes every 60 seconds. No filters here — this is the whole catalog, raw.")
+    st.stop()
 
 sync = st.sidebar.button("🔄 Sync live data", type="primary", width="stretch", key="sync_live_data")
 check_contacts = st.sidebar.button(
@@ -1491,81 +1644,10 @@ def render_table(frame: pd.DataFrame) -> None:
 
 st.title("🚀 New and Upcoming" if is_watch_view else "Games matching your target")
 
-# Live catalog tracker — like a subscriber counter: a big number that grows
-# as the 24/7 pipeline discovers games. Reads only the cached catalog copy,
-# so it costs nothing per user and never triggers a download by itself.
-# Skipped entirely in demo mode (no catalog file to read).
-_tracker = (
-    catalog_fetch.catalog_counts(DB_PATH)
-    if not _CATALOG_UNAVAILABLE
-    else {"games": None, "target": None, "found_today": None, "last_sync": None}
-)
-if _tracker["games"] is not None:
-    _target, _found, _last = (
-        _tracker.get("target"),
-        _tracker.get("found_today") or 0,
-        _tracker.get("last_sync"),
-    )
-    _games_fmt = f"{_tracker['games']:,}"
-    _badges = []
-    if _target is not None:
-        _badges.append(f"🎯 {_target:,} meet the 20k visits / 25 CCU target")
-    if _found:
-        _badges.append(f"✨ +{_found:,} discovered today (UTC)")
-    if _last:
-        _badges.append(f"🕒 last pipeline sync {_last} UTC")
-    if _USING_STALE_CATALOG:
-        _badges.append("⚠️ showing the last cached catalog — refresh failed")
-    _badges_html = (
-        '<div class="ss-tracker-badges">' + " · ".join(_badges) + "</div>"
-        if _badges else ""
-    )
-    st.markdown(
-        """
-<style>
-.ss-tracker {
-  display: inline-block; padding: 14px 26px; margin-bottom: 6px;
-  border: 1px solid rgba(128,128,128,0.35); border-radius: 12px;
-  background: linear-gradient(180deg, rgba(88,101,242,0.10), rgba(88,101,242,0.03));
-}
-.ss-tracker-num {
-  font-size: 3.1rem; font-weight: 800; line-height: 1.1; letter-spacing: 0.5px;
-  font-variant-numeric: tabular-nums; color: #e6edf3;
-}
-.ss-digit {
-  display: inline-block;
-  animation: ss-pop 600ms cubic-bezier(0.2, 0.9, 0.25, 1.2) backwards;
-}
-.ss-digit:nth-child(1) { animation-delay: 0ms; }
-.ss-digit:nth-child(2) { animation-delay: 45ms; }
-.ss-digit:nth-child(3) { animation-delay: 90ms; }
-.ss-digit:nth-child(4) { animation-delay: 135ms; }
-.ss-digit:nth-child(5) { animation-delay: 180ms; }
-.ss-digit:nth-child(6) { animation-delay: 225ms; }
-.ss-digit:nth-child(7) { animation-delay: 270ms; }
-@keyframes ss-pop {
-  from { opacity: 0; transform: translateY(0.45em) scale(0.92); }
-  to   { opacity: 1; transform: none; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .ss-digit { animation: none; }
-}
-.ss-tracker-sub { font-size: 0.92rem; color: rgba(230,237,243,0.65); margin-top: 2px; }
-.ss-tracker-badges { font-size: 0.82rem; color: rgba(230,237,243,0.8); margin-top: 8px; }
-</style>
-"""
-        + '<div class="ss-tracker">'
-        + '<div class="ss-tracker-num">'
-        + f'<span class="ss-digit">{_games_fmt[0]}</span>'
-        + "".join(f'<span class="ss-digit">{ch}</span>' for ch in _games_fmt[1:])
-        + '</div>'
-        + '<div class="ss-tracker-sub">games in the catalog &amp; growing</div>'
-        + _badges_html
-        + "</div>",
-        unsafe_allow_html=True,
-    )
-else:
-    st.info("Catalog counters unavailable — the catalog did not load this session.")
+# Compact live counter band on the main view (the big auto-refreshing version
+# lives in the dedicated 📡 Live catalog section).
+if not is_watch_view:
+    render_live_counter(compact=True)
 if is_watch_view:
     st.caption(
         "Games that climbed 2+ tiers or tripled their CCU between syncs. "
