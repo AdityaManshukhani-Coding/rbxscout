@@ -9,6 +9,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+import os
 import time
 import uuid
 from pathlib import Path
@@ -31,6 +32,7 @@ from scout_core import (
     truncate,
 )
 import catalog_fetch
+import gate
 import profile_store
 
 logging.basicConfig(level=logging.INFO)
@@ -202,27 +204,51 @@ _PROFILE_FIELDS = (
 
 
 def _device_ref() -> str | None:
-    """Stable per-browser id: the ``ss_ref`` cookie, minted client-side.
+    """Stable per-browser id: ``ss_ref`` cookie or ``?ref=`` URL param.
 
-    Streamlit cannot set cookies from the server, so a one-shot script mints a
-    random id in localStorage, mirrors it into a 1-year ``ss_ref`` cookie, and
-    reloads once. From the next run on, ``st.context.cookies`` reads it.
+    Streamlit cannot set cookies from the server, so a one-shot client script
+    mints a random id in localStorage, mirrors it into a 1-year ``ss_ref``
+    cookie **and the URL query string**, then reloads the page once. From the
+    next run on, the server reads it from ``st.context.cookies`` — or, when
+    cookie reading fails (observed on Streamlit Cloud), from
+    ``st.query_params``, which travels with every request.
+
+    Loop safety (this caused a real infinite-reload incident): the reload
+    script must run **at most once**. Two independent guards:
+
+    * server-side: ``_device_cooked`` is set for the tab's lifetime, so a
+      second run never re-mounts the script — even after
+      ``session_state.clear()`` (Forget this device re-seeds it);
+    * client-side: the script refuses to reload again within 30s
+      (localStorage ``ss_ref_attempt``) and skips entirely once the cookie
+      and query param are both in place — the previous reload starts a fresh
+      server session, so the server-side guard alone cannot stop a loop.
     """
     if "_device_ref" in st.session_state:
         return st.session_state["_device_ref"]
-    ref = (st.context.cookies.get("ss_ref") or "").strip()
+    try:
+        ref = (st.context.cookies.get("ss_ref") or "").strip()
+    except Exception:
+        ref = ""
+    if not ref:
+        try:
+            ref = str(st.query_params.get("ref") or "").strip()
+        except Exception:
+            ref = ""
     if ref:
         st.session_state["_device_ref"] = ref
         return ref
-    if st.session_state.get("_device_ref_bootstrapping"):
-        # Reload scheduled, script mounted, cookie not visible yet.
+    if st.session_state.get("_device_cooked"):
+        # This tab already ran the mint script and neither channel surfaced
+        # the id. Continue without a device id — never reload again.
         return None
-    st.session_state._device_ref_bootstrapping = True
+    st.session_state._device_cooked = True
     st.html(
         r"""
 <script>
 (function () {
   var KEY = 'ss_ref';
+  var GUARD = 'ss_ref_attempt';
   var ref = null;
   try { ref = window.localStorage.getItem(KEY); } catch (e) {}
   if (!ref) {
@@ -230,9 +256,25 @@ def _device_ref() -> str | None:
       ? window.crypto.randomUUID() : 'r-' + Date.now() + '-' + Math.random().toString(36).slice(2));
     try { window.localStorage.setItem(KEY, ref); } catch (e) {}
   }
-  if (!/(^|;\s*)ss_ref=/.test(document.cookie)) {
+  var hasCookie = /(^|;\s*)ss_ref=/.test(document.cookie);
+  var q = new URLSearchParams(window.location.search);
+  var hasRef = !!q.get('ref');
+  if (hasCookie && hasRef) { return; }  // both channels in place — done
+  var last = 0;
+  try { last = parseInt(window.localStorage.getItem(GUARD) || '0', 10) || 0; } catch (e) {}
+  if (Date.now() - last < 30000) { return; }  // already reloaded once just now
+  var changed = false;
+  if (!hasCookie) {
     document.cookie = 'ss_ref=' + encodeURIComponent(ref) + '; Path=/; Max-Age=31536000; SameSite=Lax';
+    changed = true;
   }
+  if (!hasRef) {
+    q.set('ref', ref);
+    history.replaceState(null, '', '?' + q.toString());
+    changed = true;
+  }
+  if (!changed) { return; }
+  try { window.localStorage.setItem(GUARD, String(Date.now())); } catch (e) {}
   window.location.reload();
 })();
 </script>
@@ -267,6 +309,70 @@ def _restore_from_profile() -> bool:
         if field in profile and profile[field] is not None:
             st.session_state[field] = profile[field]
     return True
+
+
+def _render_gate() -> None:
+    """Password screen in front of the whole app; ``st.stop()``s when locked."""
+    if os.environ.get("SS_TEST_BYPASS_GATE") == "1":
+        return  # automated tests exercise the app itself, not the lock
+    ref = _device_ref()
+    if gate.is_unlocked(ref):
+        return
+
+    st.markdown("<style>section[data-testid='stSidebar']{display:none}</style>", unsafe_allow_html=True)
+    st.markdown(
+        """
+        <style>
+           .gate-card {
+                max-width: 420px; margin: 9vh auto 0 auto; padding: 2.2rem 2.4rem;
+                border: 1px solid rgba(250, 250, 250, 0.12); border-radius: 18px;
+                background: rgba(250, 250, 250, 0.04); text-align: center;
+            }
+            .gate-lock { font-size: 2.6rem; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="gate-card"><div class="gate-lock">🔒</div>'
+        '<h2 style="margin-bottom:0.2rem">Studio Scouts</h2>'
+        '<p style="opacity:0.75;margin-top:0">This site is private. Enter the access password to continue.</p>',
+        unsafe_allow_html=True,
+    )
+
+    remaining = gate.cooldown_remaining(ref)
+    if remaining <= 0:
+        candidate = st.text_input("Password", type="password", key="gate_password")
+        if st.button("Unlock", type="primary", width="stretch", key="gate_unlock"):
+            result = gate.check_password(candidate, ref)
+            if result == "ok":
+                st.session_state.gate_unlocked = True
+                gate.remember_unlock(ref)
+                st.rerun()
+            if result == "wrong":
+                if gate.cooldown_remaining(ref) > 0:
+                    st.rerun()  # a cooldown just started — show the timer now
+                left = gate.attempts_left(ref)
+                if left > 0:
+                    st.error(
+                        f"Wrong password. {left} "
+                        f"attempt{'s' if left != 1 else ''} left before the wait starts."
+                    )
+    else:
+        total = gate.cooldown_total(ref) or 60.0
+        mm, ss = divmod(int(remaining + 0.999), 60)
+        st.warning(f"Too many wrong attempts. Try again in {mm}:{ss:02d}.")
+        st.progress(min(1.0, max(0.02, 1.0 - remaining / total)))
+        st.caption("Keep this tab open — the timer runs on the server, refreshing does not help.")
+        # Live countdown: the browser re-checks every 2s; once the server-side
+        # timer expires this very reload renders the password field again.
+        st.html(
+            r"<script>setTimeout(function () { window.location.reload(); }, 2000);</script>",
+            unsafe_allow_javascript=True,
+        )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.stop()
 
 
 def initialize_session() -> bool:
@@ -565,6 +671,7 @@ def render_onboarding() -> bool:
 
 
 _restored = initialize_session()
+_render_gate()  # private site: nothing below renders without the password
 if _restored and st.session_state.onboarding_complete:
     # Returning scout: auto-load their results once per session instead of
     # dropping them on an empty table after a refresh.
@@ -771,7 +878,16 @@ with st.sidebar.expander("⚙️ Scan settings", expanded=False):
             ref = _device_ref()
             if ref:
                 profile_store.clear_profile(ref)
+                gate.forget_unlock(ref)
+            had_device = "_device_ref" in st.session_state or "_device_cooked" in st.session_state
             st.session_state.clear()
+            # Keep the tab-level device flags so clearing the profile does not
+            # re-trigger the one-shot cookie-mint reload script.
+            if had_device:
+                st.session_state._device_cooked = True
+            if ref:
+                st.session_state._device_ref = ref
+            gate.lockdown()  # back to the password screen, signed out
             st.rerun()
 
 with st.sidebar.expander("✉️ Outreach message", expanded=False):

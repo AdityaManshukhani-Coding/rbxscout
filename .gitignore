@@ -31,6 +31,10 @@ cloudflare-worker/.wrangler/
 # --- per-device profiles (contain the remembered Roblox cookie — NEVER commit) ---
 .profiles/
 
+# --- password-gate state (attempt counters + unlocked-device memory) ---
+.gate_lock.json
+.gate_unlocked.json
+
 # --- private notes (delete these lines to publish) ---
 GAMES_DB_PLAN.md
 implementation_plan.md
