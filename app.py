@@ -795,7 +795,7 @@ def run_contact_scan(
         status.caption(message)
 
     try:
-        return scout.scan_contacts(
+        refreshed = scout.scan_contacts(
             page_ids,
             force=force,
             run_id=run_id,
@@ -804,6 +804,22 @@ def run_contact_scan(
     finally:
         progress.empty()
         status.empty()
+    # Protect the verdicts from catalog asset swaps: the hosted cache copy of
+    # the catalog is fully replaced on every pipeline sync, which would
+    # otherwise erase exactly the contact state the user just resolved. The
+    # overlay store is replayed onto every fresh download.
+    try:
+        if not refreshed.empty and "universe_id" in refreshed.columns:
+            records = {}
+            for rec in refreshed.to_dict("records"):
+                try:
+                    records[int(rec["universe_id"])] = rec
+                except (KeyError, TypeError, ValueError):
+                    continue
+            catalog_fetch.record_contacts(records)
+    except Exception:
+        pass  # overlay is best effort; the authoritative write already happened
+    return refreshed
 
 
 def update_contact_rows(base: pd.DataFrame, refreshed: pd.DataFrame) -> pd.DataFrame:
@@ -1221,6 +1237,7 @@ signature = "|".join([
     str(min_visits),
     str(min_ccu),
     ",".join(selected_genres),
+    str(discord_filter),  # filter changes reshuffle the whole list: restart at page 1
 ])
 if signature != st.session_state.contact_signature:
     st.session_state.contact_signature = signature

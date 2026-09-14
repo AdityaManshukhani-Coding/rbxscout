@@ -80,6 +80,136 @@ class CatalogFetchError(RuntimeError):
     """Raised when the hosted catalog cannot be fetched; message is user-facing."""
 
 
+# ---------------------------------------------------------------------------
+# Contact overlay (UI-resolved Discord state that must survive asset swaps)
+# ---------------------------------------------------------------------------
+
+# The dashboard's page-by-page Discord lookups write contact state into the
+# cache copy of the catalog — but the pipeline replaces that whole file on
+# every sync. Without protection, every resolved invite (and every checked
+# "no Discord" verdict) would silently vanish from the filter minutes after
+# the user finds it. The overlay is a small sidecar JSON keyed by universe_id
+# holding the contact columns; it is replayed onto each freshly downloaded
+# catalog copy so user-visible progress accumulates instead of evaporating.
+CONTACT_COLUMNS = (
+    "has_discord",
+    "discord_url",
+    "status",
+    "found_via",
+    "has_social_links",
+    "contacts_checked_at",
+)
+OVERLAY_MAX_ROWS = 50_000  # hard cap so the file can never grow unbounded
+
+
+def _overlay_path() -> Path:
+    return CACHE_DIR / "contact_overlay.json"
+
+
+def load_contact_overlay() -> dict:
+    """Return the overlay as ``{universe_id_str: {column: value}}``. Never raises."""
+    try:
+        data = json.loads(_overlay_path().read_text())
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _jsonable(value):
+    """Coerce pandas/numpy cell values (np.bool_, np.int64, Timestamp) to JSON types."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return item()
+        except Exception:
+            pass
+    iso = getattr(value, "isoformat", None)
+    if callable(iso):
+        try:
+            return iso()
+        except Exception:
+            pass
+    return str(value)
+
+
+def record_contacts(records: dict) -> None:
+    """Merge UI-resolved contact rows into the overlay (best effort).
+
+    ``records`` maps universe_id -> dict with the CONTACT_COLUMNS keys.
+    A failed write must never break the caller: the authoritative write
+    already happened in the catalog DB; the overlay only protects it from
+    the next asset replacement.
+    """
+    if not records:
+        return
+    overlay = load_contact_overlay()
+    for uid, rec in records.items():
+        try:
+            overlay[str(int(uid))] = {
+                col: _jsonable(rec.get(col)) for col in CONTACT_COLUMNS
+            }
+        except (TypeError, ValueError, AttributeError):
+            continue
+    if len(overlay) > OVERLAY_MAX_ROWS:
+        # Keep the newest rows by checked timestamp; oldest fall off.
+        keep = sorted(
+            overlay.items(),
+            key=lambda kv: str((kv[1] or {}).get("contacts_checked_at") or ""),
+            reverse=True,
+        )[:OVERLAY_MAX_ROWS]
+        overlay = dict(keep)
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _overlay_path().write_text(json.dumps(overlay))
+    except Exception:
+        pass  # overlay is an optimization, never a dependency
+
+
+def _replay_overlay(db_path: Path) -> None:
+    """Re-apply overlay rows onto a freshly installed catalog copy.
+
+    Runs right after the atomic swap in _download_and_install, so the new
+    file starts with every contact verdict the UI ever resolved. Best
+    effort: any error leaves the fresh download as-is.
+    """
+    overlay = load_contact_overlay()
+    if not overlay:
+        return
+    try:
+        import sqlite3
+
+        rows = [
+            (
+                bool((rec or {}).get("has_discord")),
+                (rec or {}).get("discord_url"),
+                (rec or {}).get("status"),
+                (rec or {}).get("found_via"),
+                bool((rec or {}).get("has_social_links")),
+                (rec or {}).get("contacts_checked_at"),
+                int(uid),
+                str((rec or {}).get("contacts_checked_at") or ""),
+            )
+            for uid, rec in overlay.items()
+        ]
+        conn = sqlite3.connect(str(db_path))
+        try:
+            with conn:
+                conn.executemany(
+                    "UPDATE game_analytics SET has_discord=?, discord_url=?, "
+                    "status=?, found_via=?, has_social_links=?, "
+                    "contacts_checked_at=? "
+                    "WHERE universe_id=? AND (contacts_checked_at IS NULL "
+                    "OR contacts_checked_at < ?)",
+                    rows,
+                )
+        finally:
+            conn.close()
+    except Exception:
+        pass  # a schema drift or corrupt overlay must never block downloads
+
+
 def is_hosted() -> bool:
     """Hosted mode = no local DB and not explicitly forced local.
 
@@ -262,6 +392,7 @@ def _download_and_install(timeout: float, state: dict) -> Path:
     tmp = CACHE_DIR / (ASSET_DB + ".tmp")
     tmp.write_bytes(blob)
     tmp.replace(CACHE_DB_PATH)  # atomic swap: readers never see a partial file
+    _replay_overlay(CACHE_DB_PATH)  # restore UI-resolved contacts the swap erased
     state.update({
         "checked_at": time.time(),
         "remote": info,

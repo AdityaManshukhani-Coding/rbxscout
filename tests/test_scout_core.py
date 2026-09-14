@@ -1468,6 +1468,27 @@ def test_load_catalog_matches_applies_thresholds_and_ranking(tmp_path):
     assert set(wider["universe_id"]) == {1, 2, 3, 4}
 
 
+def test_load_catalog_matches_discord_filter_orders_visits_ascending(tmp_path):
+    """The Discord filter must not disturb the catalog ranking: smallest
+    qualifying visit counts first, CCU tiebreak — same as the unfiltered read."""
+    db = str(tmp_path / "t.db")
+    scout = RobloxPlatformScout(db_path=db)
+    scout.upsert_game({"universe_id": 1, "title": "Huge", "ccu": 50, "visits": 9_000_000,
+                       "has_discord": True, "discord_url": "https://discord.gg/h"})
+    scout.upsert_game({"universe_id": 2, "title": "Small", "ccu": 50, "visits": 1_000,
+                       "has_discord": True, "discord_url": "https://discord.gg/s"})
+    scout.upsert_game({"universe_id": 3, "title": "Mid", "ccu": 50, "visits": 100_000,
+                       "has_discord": True, "discord_url": "https://discord.gg/m"})
+    scout.upsert_game({"universe_id": 4, "title": "No Discord", "ccu": 50, "visits": 5,
+                       "has_discord": False, "status": "No Contact Found"})
+
+    df = scout.load_catalog_matches(0, 0, discord=True)
+    assert list(df["universe_id"]) == [2, 3, 1]  # ascending visits
+
+    complement = scout.load_catalog_matches(0, 0, discord=False)
+    assert list(complement["universe_id"]) == [4]
+
+
 def test_load_catalog_matches_no_target_only_observed_games(tmp_path):
     """With no target set, games the pipeline never hydrated must not surface."""
     db = str(tmp_path / "t.db")

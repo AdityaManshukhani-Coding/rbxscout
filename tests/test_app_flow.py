@@ -14,10 +14,12 @@ import pandas as pd
 import pytest
 from streamlit.testing.v1 import AppTest
 
+import catalog_fetch
 import profile_store
 import scout_core
 from scout_core import (
     DEFAULT_MESSAGE_TEMPLATE,
+    DISCORD_FILTER_ALL,
     DISCORD_FILTER_TRUE,
     normalize_discord_user_id,
     render_outreach_message,
@@ -448,6 +450,67 @@ def test_discord_filter_reads_whole_catalog(monkeypatch):
     assert not at.exception
     assert calls and calls[-1]["discord"] is True
     assert "Blox Fruits" in _table_html(at)
+
+
+def test_resolved_contacts_recorded_to_overlay(monkeypatch):
+    """Contact verdicts resolved in the UI must be handed to the catalog_fetch
+    overlay store, or the next pipeline asset swap erases them and the
+    Discord filter 'loses' games the user already found."""
+    recorded: dict = {}
+    monkeypatch.setattr(catalog_fetch, "record_contacts", lambda records: recorded.update(records))
+
+    refreshed = _demo_frame().copy()
+    refreshed["contacts_checked_at"] = "2026-09-14 12:00:00"
+
+    def _fake_scan(self, ids, force=False, run_id=None, progress_cb=None):
+        return refreshed.copy()
+
+    monkeypatch.setattr(scout_core.RobloxPlatformScout, "scan_contacts", _fake_scan)
+
+    at = _render_dashboard()
+
+    assert not at.exception
+    assert 1 in recorded, "page-1 contact check must feed the overlay store"
+    assert recorded[1]["has_discord"] == True  # noqa: E712
+    assert recorded[1]["discord_url"] == "https://discord.gg/test"
+
+
+def test_discord_filter_flip_resets_to_page_one(monkeypatch):
+    """Toggling the Discord filter deep into the unfiltered list used to drop
+    the user on the LAST page of the filtered set (clamped), which read as if
+    results were sorted highest-visits-first. A filter flip must restart at
+    page 1."""
+    at = _render_dashboard()
+
+    # 25 rows in session data and 25 filtered rows from the catalog read:
+    # both lists span 2 pages at 20 per page, so page 2 is reachable.
+    rows = []
+    for i in range(1, 26):
+        row = _demo_frame().iloc[0].copy()
+        row["universe_id"] = i
+        row["title"] = f"Game {i:02d}"
+        row["visits"] = 1000 * i  # ascending
+        rows.append(row)
+    big = pd.DataFrame(rows)
+    at.session_state["data"] = big.copy()
+
+    discord_rows = big.copy()
+    discord_rows["has_discord"] = True
+    discord_rows["discord_url"] = "https://discord.gg/x"
+
+    def _fake(self, min_visits=0, min_ccu=0, discord=None):
+        return discord_rows.copy() if discord else big.copy()
+
+    monkeypatch.setattr(scout_core.RobloxPlatformScout, "load_catalog_matches", _fake)
+
+    at.sidebar.radio(key="discord_filter_radio").set_value(DISCORD_FILTER_TRUE).run()
+    assert not at.exception
+    at.sidebar.number_input(key="contact_page").set_value(2).run()
+    assert at.session_state["contact_page"] == 2
+
+    # Flipping the filter changes the result set entirely -> back to page 1.
+    at.sidebar.radio(key="discord_filter_radio").set_value(DISCORD_FILTER_ALL).run()
+    assert at.session_state["contact_page"] == 1
 
 
 def test_discord_filter_survives_stale_scout_core_signature(monkeypatch):
