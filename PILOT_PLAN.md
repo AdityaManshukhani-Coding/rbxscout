@@ -1,5 +1,11 @@
 # 🧪 Capacity Pilot — the 2–3 Day Plan (Phase 1)
 
+> **⚠️ RETIRED (2026-09-18):** this pilot's keyword-trial verdicts and
+> hydrator-utilization block have been removed from the sync logs (and
+> `capacity_pilot.py` was replaced by `expansion_pilot.py`). The plan below
+> is kept for historical context only; the live observe→verdict system is
+> now the catalog-expansion pilot — see EXPANSION_PILOT.md.
+
 **Status:** LIVE since 2026-09-06 · **Mode:** observe-only, zero behavior change
 **Where the results appear:** the `CAPACITY PILOT` block at the bottom of every
 Actions run log (finder and hydrator), plus the `sync_health_log` table inside

@@ -41,7 +41,9 @@ env:
 jobs:
   hydrate:
     runs-on: ubuntu-latest
-    timeout-minutes: 10   # a hydration pass is minutes of work, not 30
+    timeout-minutes: 20   # pull + hydrate + push of a 60+ MB catalog; the
+                          # old 10-min cap killed runs mid-swap (2026-09-17
+                          # outage: DB deleted from the release mid-upload)
 
     steps:
       - name: Check out repo

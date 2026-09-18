@@ -49,6 +49,12 @@ runs every five minutes in UTC:
   dictionary (662 curated seeds + a deterministic bases×modifiers expansion;
   a full sweep takes ~12h at the 10-minute cadence, each keyword read to
   page 2), then hydrates new games.
+- **Expander ("Game Finder 2.0")** — on the clean `:15`/`:45` minutes (every
+  30 min), the Worker dispatches `.github/workflows/expander.yml`: the
+  catalog-expansion pilot (creator spiderwebbing + discovery-queue drain +
+  universe-ID frontier scan, strict 20k/25 gate). Pilot rates and the
+  automated KEEP/REVERT verdict are documented in
+  [EXPANSION_PILOT.md](EXPANSION_PILOT.md).
 
 The GitHub workflow files intentionally contain **no `schedule:` triggers**.
 They retain `workflow_dispatch` for Cloudflare and manual runs only, so an
@@ -130,8 +136,9 @@ All public, cookieless endpoints — no credentials anywhere in this repo:
 | Stage | Source |
 |---|---|
 | Discovery | `apis.roblox.com/explore-api/v1/get-sorts` (deep charts: follows `nextSortsPageToken` through the full leaderboard taxonomy — Top Earning, Top Rated, Most Popular and every genre chart, ~26 sorts / ~770 games per run), `search-api/omni-search` (depth 2: page 1 + `nextPageToken` page 2 per keyword) |
+| Expansion | `games.roblox.com/v2/groups/{id}/games` + `/v2/users/{id}/games` (creator portfolio spiderwebbing; verified caps 100/50, `placeVisits` free) and sequential universe-ID frontier scanning — see [EXPANSION_PILOT.md](EXPANSION_PILOT.md) |
 | Bulk index | `api.rolimons.com/games/v1/gamelist` |
-| Metrics | `games.roblox.com/v1/games` (50 universes/batch) |
+| Metrics | `games.roblox.com/v1/games` (50 universes/batch — verified hard cap) |
 | Icons | `thumbnails.roblox.com/v1/games/icons` |
 
 Rate limiting is handled by an adaptive token-bucket pacer (stretches on 429,

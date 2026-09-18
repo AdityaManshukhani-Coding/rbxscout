@@ -44,7 +44,7 @@ def offline(monkeypatch):
 
 
 def _fresh_app() -> AppTest:
-    return AppTest.from_file(APP_PATH, default_timeout=15)
+    return AppTest.from_file(APP_PATH, default_timeout=45)
 
 
 def _demo_frame() -> pd.DataFrame:

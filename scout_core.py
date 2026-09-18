@@ -115,6 +115,38 @@ DEFAULT_CANDIDATE_LIMIT = 10_000  # safety ceiling after batch place resolution
 HYDRATION_BUDGET_PER_SYNC = 150
 
 # --------------------------------------------------------------------------- #
+# Catalog expansion pilot (creator spiderwebbing + frontier scan).
+# Full story in EXPANSION_PILOT.md. Phase-0 spike, live 2026-09-17:
+#   * /v2/groups/{id}/games?accessFilter=Public accepts limit=100
+#   * /v2/users/{id}/games?accessFilter=Public caps at limit=50 (100 -> 400)
+#   * the metrics batch endpoint REJECTS >50 universe IDs ("Too many
+#     universe IDs were requested."), so the scan batch is 50, not 100
+#   * portfolio payloads carry `placeVisits` for free -> candidates are
+#     pre-gated by visits BEFORE any hydration request is spent
+# --------------------------------------------------------------------------- #
+METRICS_BATCH_SIZE = 50          # verified hard cap of /v1/games?universeIds
+SPIDERWEB_GROUP_LIMIT = 100      # page size for /v2/groups/{id}/games
+SPIDERWEB_USER_LIMIT = 50        # page size for /v2/users/{id}/games (real cap)
+SPIDERWEB_MAX_PAGES = 10         # cursor-follow ceiling per creator
+SPIDERWEB_RESCRAPE_DAYS = 14     # re-spider each creator at most this often
+SPIDERWEB_VISITS_PREGATE = 20_000  # portfolio rows below this never hydrate
+EXPANSION_TARGET_VISITS = 20_000   # strict gate: nothing below target is stored
+EXPANSION_TARGET_CCU = 25
+# Pilot rates (env-tunable; conservative defaults until the 72-run verdict):
+EXPAND_SPIDERWEB_CREATORS_DEFAULT = 100  # creators per expand run (~100-150 req)
+EXPAND_QUEUE_BATCHES_DEFAULT = 10        # 10 x 50 = 500 queued candidates hydrated/run
+EXPAND_FRONTIER_BATCHES_DEFAULT = 10     # 10 x 50 = 500 fresh IDs/run (~24k/day)
+EXPANSION_QUEUE_MAX_ROWS = 2_000_000     # dedup-memory ceiling (trim oldest)
+
+
+def _env_int(name: str, default: int, minimum: int = 0) -> int:
+    """Read a bounded int from the environment (pilot-rate tuning knobs)."""
+    try:
+        return max(minimum, int(os.environ.get(name, "") or default))
+    except (TypeError, ValueError):
+        return default
+
+# --------------------------------------------------------------------------- #
 # Tier system — monotonic thresholds + higher-axis classification
 # --------------------------------------------------------------------------- #
 # Tier membership is defined by visits + CCU, which only exist AFTER hydration.
@@ -356,9 +388,8 @@ KEYWORD_DICTIONARY = _SEED_KEYWORDS + KEYWORD_EXPANSION
 
 # Number of keywords to crawl per sync (rotating slice) — the ~14.7k-word
 # dictionary swept 200 words at a time = full coverage in ~74 syncs, i.e. a
-# complete sweep in ~12h at the 10-minute finder cadence. 200 is a MONITORED
-# TRIAL: capacity_pilot.py tracks keyword success/benching/breaker rates and
-# renders a keep-or-revert verdict into every finder run's log.
+# complete sweep in ~12h at the 10-minute finder cadence. (The old monitored
+# keyword trial — keep/revert verdicts in the finder log — has been retired.)
 KEYWORDS_PER_SYNC = 200
 
 # --- Deep charts (explore-api) ---------------------------------------------- #
@@ -891,6 +922,58 @@ class RobloxPlatformScout:
                 """
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_roli_playing ON rolimons_catalog(playing)")
+            # --- Catalog expansion pilot tables (EXPANSION_PILOT.md) ------ #
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS scan_pointers (
+                    id               TEXT PRIMARY KEY,
+                    last_universe_id INTEGER,
+                    updated_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS creator_spiderweb_log (
+                    creator_id   INTEGER NOT NULL,
+                    creator_type TEXT NOT NULL,
+                    scraped_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    game_count   INTEGER DEFAULT 0,
+                    PRIMARY KEY (creator_id, creator_type)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS discovery_queue (
+                    universe_id  INTEGER PRIMARY KEY,
+                    source       TEXT,
+                    priority     INTEGER DEFAULT 3,
+                    status       TEXT DEFAULT 'pending',
+                    outcome      TEXT,
+                    seen_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    evaluated_at TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_dq_status ON discovery_queue(status, priority)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_csw_scraped ON creator_spiderweb_log(scraped_at)"
+            )
+            # Seed the frontier pointer once at the highest known universe
+            # ID: the scanner walks UPWARD from there into never-seen ranges
+            # (Roblox assigns IDs as increasing integers). INSERT OR IGNORE
+            # makes the seed exactly-once via the PRIMARY KEY — a WHERE
+            # NOT EXISTS around an aggregate would still emit one row.
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO scan_pointers (id, last_universe_id)
+                SELECT 'frontier_scan', COALESCE(MAX(universe_id), 10765584604)
+                FROM game_analytics
+                """
+            )
 
     def _load_persisted_diagnostics(self) -> None:
         import json
@@ -2103,7 +2186,10 @@ class RobloxPlatformScout:
         statuses: List[int] = []
         consecutive_failures = 0
         breaker_tripped = False
-        chunks = [universe_ids[i : i + 50] for i in range(0, len(universe_ids), 50)]
+        chunks = [
+            universe_ids[i : i + METRICS_BATCH_SIZE]
+            for i in range(0, len(universe_ids), METRICS_BATCH_SIZE)
+        ]
 
         def work(chunk: List[int]):
             q = ",".join(str(u) for u in chunk)
@@ -2395,6 +2481,510 @@ class RobloxPlatformScout:
         return None
 
     # ------------------------------------------------------------------ #
+    # Catalog expansion pilot: creator spiderwebbing + frontier scan
+    # (EXPANSION_PILOT.md — strict gate: nothing below 20k visits / 25 CCU
+    # is ever stored in game_analytics; discards live in discovery_queue)
+    # ------------------------------------------------------------------ #
+
+    def _enqueue_discovery(self, items: Iterable[Tuple[int, str, int]]) -> int:
+        """Insert candidate universe IDs into the discovery queue (dedup).
+
+        ``items`` yields (universe_id, source, priority). Existing rows keep
+        their original source/priority — an ID already queued or evaluated is
+        never duplicated or re-prioritized. Returns the number of NEW rows.
+        The table is the dedup memory that lets discards stay OUT of
+        game_analytics without ever wasting a second hydration on them.
+        """
+        rows: Dict[int, Tuple[str, int]] = {}
+        for uid, source, priority in items:
+            try:
+                uid = int(uid)
+            except (TypeError, ValueError):
+                continue
+            if uid > 0 and uid not in rows:
+                rows[uid] = (source, int(priority))
+        if not rows:
+            return 0
+        inserted = 0
+        try:
+            with self._connect() as conn:
+                uid_list = list(rows)
+                for i in range(0, len(uid_list), 900):
+                    chunk = uid_list[i : i + 900]
+                    marks = ",".join("?" for _ in chunk)
+                    have = conn.execute(
+                        f"SELECT universe_id FROM discovery_queue WHERE universe_id IN ({marks})",
+                        chunk,
+                    ).fetchall()
+                    for (existing,) in have:
+                        rows.pop(int(existing), None)
+                if rows:
+                    # Dedup-memory ceiling: trim the OLDEST processed rows
+                    # first (pending rows are the live workload, keep them).
+                    overflow = (
+                        conn.execute("SELECT COUNT(*) FROM discovery_queue").fetchone()[0]
+                        + len(rows)
+                        - EXPANSION_QUEUE_MAX_ROWS
+                    )
+                    if overflow > 0:
+                        conn.execute(
+                            "DELETE FROM discovery_queue WHERE universe_id IN ("
+                            "SELECT universe_id FROM discovery_queue "
+                            "WHERE status != 'pending' ORDER BY seen_at ASC LIMIT ?)",
+                            (int(overflow),),
+                        )
+                    conn.executemany(
+                        "INSERT INTO discovery_queue "
+                        "(universe_id, source, priority, status, seen_at) "
+                        "VALUES (?, ?, ?, 'pending', CURRENT_TIMESTAMP)",
+                        [(uid, src, pri) for uid, (src, pri) in rows.items()],
+                    )
+                    inserted = len(rows)
+        except sqlite3.Error as exc:
+            log.warning("discovery_queue insert failed: %s", exc)
+        return inserted
+
+    def _mark_discovery_outcome(self, uid: int, outcome: str) -> None:
+        """Record the strict-gate verdict for one queued ID."""
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE discovery_queue SET status='processed', outcome=?, "
+                    "evaluated_at=CURRENT_TIMESTAMP WHERE universe_id=?",
+                    (outcome, int(uid)),
+                )
+        except sqlite3.Error as exc:
+            log.warning("discovery_queue outcome update failed for %s: %s", uid, exc)
+
+    def _qualified_only(self, metas: Dict[int, Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+        """Strict gate: keep ONLY games meeting the 20k-visits / 25-CCU target.
+
+        Everything else must never reach game_analytics (the agreed catalog
+        policy — no graveyard rows); the queue records the discard instead.
+        """
+        return {
+            uid: meta
+            for uid, meta in metas.items()
+            if int(meta.get("visits") or 0) >= EXPANSION_TARGET_VISITS
+            and int(meta.get("ccu") or 0) >= EXPANSION_TARGET_CCU
+        }
+
+    def fetch_creator_portfolio(
+        self, creator_id: int, creator_type: str
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Fetch one creator's public game portfolio (cursor-followed).
+
+        Verified live 2026-09-17 (Phase-0 spike):
+          * groups: /v2/groups/{id}/games?accessFilter=Public — limit 100 OK
+          * users:  /v2/users/{id}/games?accessFilter=Public — limit 50 (100 -> HTTP 400)
+          * both paginate via nextPageCursor and carry placeVisits for free
+        Returns portfolio rows {universe_id, name, root_place_id, place_visits}.
+        Returns None when the FIRST page fails (deleted group, banned user,
+        429 window) so the caller does NOT log the creator — the next expand
+        run retries them. Returns [] only for a real empty portfolio.
+        """
+        creator_type = (creator_type or "User").strip().capitalize()
+        if creator_type == "Group":
+            base = f"https://games.roblox.com/v2/groups/{int(creator_id)}/games"
+            limit = SPIDERWEB_GROUP_LIMIT
+        else:
+            base = f"https://games.roblox.com/v2/users/{int(creator_id)}/games"
+            limit = SPIDERWEB_USER_LIMIT
+        games: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        for page_index in range(SPIDERWEB_MAX_PAGES):
+            url = f"{base}?accessFilter=Public&limit={limit}&sortOrder=Asc"
+            if cursor:
+                url += f"&cursor={quote(str(cursor), safe='')}"
+            status, data = self._get_json(url)
+            if status != 200 or not isinstance(data, dict):
+                if page_index == 0:
+                    return None  # unknown state — retryable, creator not logged
+                break           # later-page failure: keep earlier pages
+            for g in data.get("data") or []:
+                uid = g.get("id")
+                if not uid:
+                    continue
+                root = g.get("rootPlace") if isinstance(g.get("rootPlace"), dict) else {}
+                try:
+                    place_visits = int(g.get("placeVisits") or 0)
+                except (TypeError, ValueError):
+                    place_visits = 0
+                games.append({
+                    "universe_id": int(uid),
+                    "name": g.get("name"),
+                    "root_place_id": (root or {}).get("id"),
+                    "place_visits": place_visits,
+                })
+            cursor = data.get("nextPageCursor")
+            if not cursor:
+                break
+        return games
+
+    def _log_spiderweb(self, creator_id: int, creator_type: str, game_count: int) -> None:
+        creator_type = (creator_type or "User").strip().capitalize()
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO creator_spiderweb_log "
+                    "(creator_id, creator_type, scraped_at, game_count) "
+                    "VALUES (?, ?, CURRENT_TIMESTAMP, ?)",
+                    (int(creator_id), creator_type, int(game_count)),
+                )
+        except sqlite3.Error as exc:
+            log.warning("creator_spiderweb_log write failed: %s", exc)
+
+    def spiderweb_creators(
+        self,
+        limit_creators: int = EXPAND_SPIDERWEB_CREATORS_DEFAULT,
+        progress_cb: Optional[Callable[[float, str], None]] = None,
+    ) -> Dict[str, int]:
+        """Crawl portfolios for the next slice of not-recently-crawled creators.
+
+        Seed list = every distinct (creator_id, creator_type) already in
+        game_analytics — pure SQL, zero request cost (~14.6k creators today).
+        Creators logged within SPIDERWEB_RESCRAPE_DAYS are skipped; failed
+        fetches (None) are never logged so they retry next run; genuinely
+        empty portfolios log with game_count=0 and retry after the TTL.
+        Every portfolio game passing the free placeVisits pre-gate is
+        enqueued at priority 1 ("group_spiderweb") for the queue drain.
+        """
+        report = progress_cb or (lambda p, m: None)
+        cutoff = time.strftime(
+            "%Y-%m-%d %H:%M:%S",
+            time.gmtime(time.time() - SPIDERWEB_RESCRAPE_DAYS * 86400),
+        )
+        stats = {"crawled": 0, "failed": 0, "empty": 0, "games_found": 0, "pregate_passed": 0, "enqueued": 0}
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT DISTINCT ga.creator_id, COALESCE(ga.creator_type, 'User')
+                    FROM game_analytics ga
+                    WHERE ga.creator_id IS NOT NULL
+                      AND NOT EXISTS (
+                        SELECT 1 FROM creator_spiderweb_log l
+                        WHERE l.creator_id = ga.creator_id
+                          AND l.creator_type = COALESCE(ga.creator_type, 'User')
+                          AND l.scraped_at > ?
+                      )
+                    ORDER BY ga.creator_id
+                    LIMIT ?
+                    """,
+                    (cutoff, max(1, int(limit_creators))),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            log.warning("spiderweb seed query failed: %s", exc)
+            return stats
+        if not rows:
+            return stats
+        report(0.0, f"Spiderwebbing {len(rows)} creators…")
+        for index, (creator_id, creator_type) in enumerate(rows, start=1):
+            games = self.fetch_creator_portfolio(creator_id, creator_type)
+            if games is None:
+                stats["failed"] += 1  # not logged — retried next run
+            elif not games:
+                stats["empty"] += 1
+                self._log_spiderweb(creator_id, creator_type, 0)
+            else:
+                stats["crawled"] += 1
+                stats["games_found"] += len(games)
+                passing = [
+                    g for g in games
+                    if int(g.get("place_visits") or 0) >= SPIDERWEB_VISITS_PREGATE
+                ]
+                stats["pregate_passed"] += len(passing)
+                stats["enqueued"] += self._enqueue_discovery(
+                    (int(g["universe_id"]), "group_spiderweb", 1) for g in passing
+                )
+                self._log_spiderweb(creator_id, creator_type, len(games))
+            if index % 10 == 0 or index == len(rows):
+                report(
+                    index / len(rows),
+                    f"Spiderweb {index}/{len(rows)} creators · "
+                    f"+{stats['games_found']} games · +{stats['pregate_passed']} pass pre-gate",
+                )
+        return stats
+
+    def _reset_stale_queue_claims(self) -> None:
+        """Self-heal 'processing' claims left by a crashed run (claims only
+        live minutes; anything stuck longer than 2h returns to pending)."""
+        cutoff = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 7200))
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE discovery_queue SET status='pending' "
+                    "WHERE status='processing' AND seen_at < ?",
+                    (cutoff,),
+                )
+        except sqlite3.Error:
+            pass
+
+    def _claim_discovery_batch(self, limit_ids: int) -> List[Tuple[int, str]]:
+        """Atomically claim the next pending slice (priority first, FIFO)."""
+        out: List[Tuple[int, str]] = []
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT universe_id, COALESCE(source, '') FROM discovery_queue
+                    WHERE status='pending'
+                    ORDER BY priority ASC, seen_at ASC, universe_id ASC
+                    LIMIT ?
+                    """,
+                    (max(1, int(limit_ids)),),
+                ).fetchall()
+                for uid, source in rows:
+                    # seen_at becomes the claim timestamp: 'processing' rows
+                    # with an old seen_at are then unambiguously crashed
+                    # claims (self-healed by _reset_stale_queue_claims),
+                    # even when the enqueue happened seconds earlier.
+                    conn.execute(
+                        "UPDATE discovery_queue SET status='processing', "
+                        "seen_at=CURRENT_TIMESTAMP WHERE universe_id=?",
+                        (int(uid),),
+                    )
+                out = [(int(uid), str(source)) for uid, source in rows]
+        except sqlite3.Error as exc:
+            log.warning("discovery_queue claim failed: %s", exc)
+        return out
+
+    def drain_discovery_queue(
+        self,
+        batches: int = EXPAND_QUEUE_BATCHES_DEFAULT,
+        progress_cb: Optional[Callable[[float, str], None]] = None,
+    ) -> Dict[str, int]:
+        """Hydrate queued candidates and store ONLY strict-gate qualifiers.
+
+        Claims up to ``batches`` x 50 pending IDs (priority 1 spiderweb first),
+        skips IDs already in the catalog (the hydrator owns refreshing those),
+        hydrates the rest through the shared paced metrics endpoint, and
+        upserts qualifying games via upsert_game — full tier stamping, blow-up
+        flag, ccu_history snapshot, found_via='expansion'. Every evaluated ID
+        gets an outcome in the queue so nothing is re-hydrated before the
+        14-day re-spider window re-enqueues it.
+        """
+        report = progress_cb or (lambda p, m: None)
+        self._reset_stale_queue_claims()
+        stats = {"claimed": 0, "duplicates": 0, "hydrated": 0, "qualified": 0, "below_gate": 0, "metrics_failed": 0, "batches": 0}
+        claimed = self._claim_discovery_batch(batches * METRICS_BATCH_SIZE)
+        if not claimed:
+            report(0.5, "Discovery queue empty — nothing to drain.")
+            return stats
+        stats["claimed"] = len(claimed)
+        ids = [uid for uid, _ in claimed]
+        existing: set = set()
+        try:
+            with self._connect() as conn:
+                for i in range(0, len(ids), 900):
+                    chunk = ids[i : i + 900]
+                    marks = ",".join("?" for _ in chunk)
+                    have = conn.execute(
+                        f"SELECT universe_id FROM game_analytics WHERE universe_id IN ({marks})",
+                        chunk,
+                    ).fetchall()
+                    existing.update(int(r[0]) for r in have)
+        except sqlite3.Error:
+            existing = set()
+        for uid in sorted(existing):
+            self._mark_discovery_outcome(uid, "already_in_catalog")
+        stats["duplicates"] = len(existing)
+        to_check = [uid for uid in ids if uid not in existing]
+        if not to_check:
+            report(0.9, "All queued candidates already in catalog.")
+            return stats
+        report(0.2, f"Hydrating {len(to_check)} queued expansion candidates…")
+        all_metas = self.fetch_game_metrics(to_check)
+        stats["hydrated"] = len(all_metas)
+        stats["batches"] = (len(to_check) + METRICS_BATCH_SIZE - 1) // METRICS_BATCH_SIZE
+        qualified = self._qualified_only(all_metas)
+        stats["qualified"] = len(qualified)
+        stats["below_gate"] = sum(1 for uid in to_check if uid in all_metas and uid not in qualified)
+        stats["metrics_failed"] = sum(1 for uid in to_check if uid not in all_metas)
+        for uid, meta in qualified.items():
+            # upsert_game does its own tier stamping (via _tier_stamp_for),
+            # peak-CCU growth and the ccu_history snapshot — identical to the
+            # main pipeline. found_via only lands on brand-new rows; the
+            # COALESCE in the upsert keeps it from clobbering real sources.
+            self.upsert_game({
+                "universe_id": int(uid),
+                "root_place_id": meta.get("root_place_id"),
+                "title": meta.get("title"),
+                "ccu": meta.get("ccu"),
+                "peak_ccu": meta.get("ccu"),
+                "visits": meta.get("visits"),
+                "favorites": meta.get("favorites"),
+                "genre": meta.get("genre"),
+                "creator_name": meta.get("creator_name"),
+                "creator_type": meta.get("creator_type"),
+                "creator_id": meta.get("creator_id"),
+                "description": meta.get("description"),
+                "found_via": "expansion",
+            })
+            self._mark_discovery_outcome(uid, "qualified")
+        for uid in to_check:
+            if uid not in qualified:
+                self._mark_discovery_outcome(
+                    uid, "below_gate" if uid in all_metas else "metrics_failed"
+                )
+        report(
+            0.9,
+            f"Queue drained: {stats['qualified']} qualified · "
+            f"{stats['below_gate']} below gate · {stats['duplicates']} already known",
+        )
+        return stats
+
+    def load_frontier_pointer(self) -> int:
+        """Read the frontier-scan high-water mark (defaults to the seed ID)."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT last_universe_id FROM scan_pointers WHERE id = 'frontier_scan'"
+                ).fetchone()
+            if row and row[0]:
+                return int(row[0])
+        except sqlite3.Error:
+            pass
+        return 10_765_584_604  # Phase-0 seed: max known universe ID 2026-09-17
+
+    def _advance_frontier_pointer(self, new_value: int) -> None:
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO scan_pointers (id, last_universe_id, updated_at)
+                    VALUES ('frontier_scan', ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(id) DO UPDATE SET
+                        last_universe_id = excluded.last_universe_id,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (int(new_value),),
+                )
+        except sqlite3.Error as exc:
+            log.warning("frontier pointer update failed: %s", exc)
+
+    def scan_frontier(
+        self,
+        batches: int = EXPAND_FRONTIER_BATCHES_DEFAULT,
+        progress_cb: Optional[Callable[[float, str], None]] = None,
+    ) -> Dict[str, int]:
+        """Sequential universe-ID scan upward from the frontier pointer.
+
+        Roblox assigns universe IDs as increasing integers, so scanning the
+        range just past the highest known ID catches brand-new games — the
+        ones that can hit 20k visits within days of launch. Each batch of 50
+        IDs costs ONE metrics request; strict-gate qualifiers are upserted
+        with found_via='expansion' and everything else is recorded in the
+        discovery queue (outcome='below_gate') so a range is never re-spent.
+        The pointer only advances AFTER evaluation, so a crashed run re-scans
+        its range instead of skipping it.
+        """
+        report = progress_cb or (lambda p, m: None)
+        stats = {"scanned": 0, "already_known": 0, "qualified": 0, "below_gate": 0, "start_id": 0, "end_id": 0}
+        batches = max(0, int(batches))
+        if batches == 0:
+            return stats
+        start = self.load_frontier_pointer() + 1
+        ids = list(range(start, start + batches * METRICS_BATCH_SIZE))
+        stats["start_id"] = start
+        stats["end_id"] = ids[-1]
+        existing: set = set()
+        try:
+            with self._connect() as conn:
+                for i in range(0, len(ids), 900):
+                    chunk = ids[i : i + 900]
+                    marks = ",".join("?" for _ in chunk)
+                    have = conn.execute(
+                        f"SELECT universe_id FROM game_analytics WHERE universe_id IN ({marks})",
+                        chunk,
+                    ).fetchall()
+                    existing.update(int(r[0]) for r in have)
+        except sqlite3.Error:
+            existing = set()
+        to_check = [uid for uid in ids if uid not in existing]
+        stats["already_known"] = len(existing)
+        report(0.2, f"Frontier scan {start:,} → {ids[-1]:,} ({len(to_check)} fresh IDs)…")
+        if to_check:
+            all_metas = self.fetch_game_metrics(to_check)
+            qualified = self._qualified_only(all_metas)
+            stats["qualified"] = len(qualified)
+            stats["below_gate"] = sum(1 for uid in to_check if uid in all_metas and uid not in qualified)
+            for uid, meta in qualified.items():
+                self.upsert_game({
+                    "universe_id": int(uid),
+                    "root_place_id": meta.get("root_place_id"),
+                    "title": meta.get("title"),
+                    "ccu": meta.get("ccu"),
+                    "peak_ccu": meta.get("ccu"),
+                    "visits": meta.get("visits"),
+                    "favorites": meta.get("favorites"),
+                    "genre": meta.get("genre"),
+                    "creator_name": meta.get("creator_name"),
+                    "creator_type": meta.get("creator_type"),
+                    "creator_id": meta.get("creator_id"),
+                    "description": meta.get("description"),
+                    "found_via": "expansion",
+                })
+            # Record every evaluated discard (and evaluated-and-qualified ID)
+            # in the dedup memory so future spiderweb/seed passes skip them.
+            self._enqueue_discovery(
+                (uid, "sequential_scan", 3) for uid in to_check
+            )
+            for uid in to_check:
+                outcome = "qualified" if uid in qualified else (
+                    "below_gate" if uid in all_metas else "metrics_failed"
+                )
+                self._mark_discovery_outcome(uid, outcome)
+            stats["scanned"] = len(to_check)
+        # Only NOW move the high-water mark: a crash above leaves the range
+        # to be re-scanned next run instead of silently skipped.
+        self._advance_frontier_pointer(ids[-1])
+        report(
+            0.95,
+            f"Frontier advanced to {ids[-1]:,} · {stats['qualified']} qualified · "
+            f"{stats['below_gate']} below gate",
+        )
+        return stats
+
+    def run_expansion(
+        self,
+        spiderweb_creators: Optional[int] = None,
+        queue_batches: Optional[int] = None,
+        frontier_batches: Optional[int] = None,
+        progress_cb: Optional[Callable[[float, str], None]] = None,
+    ) -> Dict[str, Any]:
+        """One expansion pass: spiderweb → queue drain → frontier scan.
+
+        Pilot rates come from the env knobs (see EXPANSION_PILOT.md); every
+        sub-step is bounded and the whole pass reuses the shared pacer, so it
+        can never breach the hydrator's T1/T2 floors — it runs inside the
+        finder-style workflow slot, not the 5-minute hydrator.
+        """
+        report = progress_cb or (lambda p, m: None)
+        web_limit = _env_int(
+            "EXPAND_SPIDERWEB_CREATORS",
+            EXPAND_SPIDERWEB_CREATORS_DEFAULT if spiderweb_creators is None else spiderweb_creators,
+        )
+        drain_limit = _env_int(
+            "EXPAND_QUEUE_BATCHES",
+            EXPAND_QUEUE_BATCHES_DEFAULT if queue_batches is None else queue_batches,
+        )
+        frontier_limit = _env_int(
+            "EXPAND_FRONTIER_BATCHES",
+            EXPAND_FRONTIER_BATCHES_DEFAULT if frontier_batches is None else frontier_batches,
+        )
+        result: Dict[str, Any] = {}
+        report(0.05, "Expansion pass: creator spiderwebbing…")
+        result["spiderweb"] = self.spiderweb_creators(web_limit, progress_cb=report)
+        report(0.4, "Expansion pass: draining the discovery queue…")
+        result["drain"] = self.drain_discovery_queue(drain_limit, progress_cb=report)
+        report(0.7, "Expansion pass: frontier scan…")
+        result["frontier"] = self.scan_frontier(frontier_limit, progress_cb=report)
+        self.source_diagnostics["expansion"] = result
+        self.last_scan["expansion"] = result
+        return result
+
+    # ------------------------------------------------------------------ #
     # Full scan orchestration
     # ------------------------------------------------------------------ #
 
@@ -2428,12 +3018,15 @@ class RobloxPlatformScout:
         - ``None`` (default) — the historical full pipeline: find + hydrate.
         """
         selected = [p.strip().lower() for p in (phases or ()) if p and p.strip()]
-        invalid = [p for p in selected if p not in ("find", "hydrate")]
+        invalid = [p for p in selected if p not in ("find", "hydrate", "expand")]
         if invalid:
-            raise ValueError(f"Unknown scan phases: {invalid}. Use 'find', 'hydrate', or None.")
+            raise ValueError(
+                f"Unknown scan phases: {invalid}. Use 'find', 'hydrate', 'expand', or None."
+            )
         phase_set = set(selected) or {"find", "hydrate"}
         do_find = "find" in phase_set
         do_hydrate = "hydrate" in phase_set
+        do_expand = "expand" in phase_set
         report = progress_cb or (lambda p, m: None)
         run_id = self._begin_scan()
         started_at = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -2472,11 +3065,21 @@ class RobloxPlatformScout:
             "hydration_budget": {},
             "pruned_stale": 0,
             "blowup_watch_count": 0,
+            "mode": "expand" if do_expand else None,
+            "expansion": {},
         }
         # The sync counter persists across restarts via the .sync_state
         # sidecar file (still used as the weekly T5–T7 marker).
         sync_number = self.bump_sync_sequence()
         self.last_scan["sync_number"] = sync_number
+
+        # Expansion is a standalone mode: the expander workflow runs ONLY the
+        # expansion pass so its request budget can never crowd out the
+        # finder/hydrator tiers (the PILOT_PLAN refresh floors stay untouchable). It runs
+        # AFTER the run bookkeeping above so the pass lands in scan_runs with
+        # the standard lifecycle.
+        if do_expand:
+            return self._scan_expand(min_visits, min_ccu, progress_cb)
 
         try:
             if do_find:
@@ -2748,6 +3351,37 @@ class RobloxPlatformScout:
         except Exception as exc:
             self.mark_scan_failed(exc)
             raise
+
+    def _scan_expand(
+        self,
+        min_visits: int,
+        min_ccu: int,
+        progress_cb: Optional[Callable[[float, str], None]] = None,
+    ) -> pd.DataFrame:
+        """Run one expansion pass (strict gate) as a full scan-mode workflow.
+
+        Runs inside scan() so the run lands in scan_runs (dashboard diagnostics)
+        and inherits the standard run lifecycle; the strict gate is enforced by
+        drain_discovery_queue/scan_frontier regardless of the caller's
+        min_visits/min_ccu arguments (the expander workflow passes 20000/25).
+        """
+        report = progress_cb or (lambda p, m: None)
+        result = self.run_expansion(progress_cb=report)
+        web = result.get("spiderweb") or {}
+        drain = result.get("drain")
+        frontier = result.get("frontier") or {}
+        qualified = int(drain.get("qualified") or 0) + int(frontier.get("qualified") or 0)
+        self.last_scan.update({
+            "status": "complete",
+            "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "metrics_count": qualified,
+            "matched_count": qualified,
+            "candidate_count": int(web.get("pregate_passed") or 0),
+            "catalog_count": int(self.load_table().shape[0]),
+        })
+        self._finish_scan()
+        report(1.0, f"Expansion complete — {qualified} new qualified games stored.")
+        return self.load_catalog_matches(min_visits=EXPANSION_TARGET_VISITS, min_ccu=EXPANSION_TARGET_CCU)
 
     def scan_contacts(
         self,

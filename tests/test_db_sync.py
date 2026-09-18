@@ -437,6 +437,73 @@ class TestPull(DBSyncTest):
         with self.assertRaises(db_sync.SyncError):
             db_sync.cmd_pull()
 
+    def test_pull_recovers_incoming_asset_after_midswap_crash(self):
+        """The 2026-09-17 outage: a push that died between deleting the old
+        catalog and renaming the incoming one left only <name>.incoming on
+        the release. That blob is only written after byte-verification, so
+        pull must recover it (and rename it back) instead of failing forever.
+        """
+        self.make_local_db(games=9)
+        db_sync.STATE_PATH.write_text("77\n")
+        db_sync.main(["db_sync.py", "push"])
+        rescued_blob = FakeGitHubHandler.assets[db_sync.ASSET_DB]
+
+        # Simulate the crash: db asset gone, only the .incoming twin remains.
+        rel = self.release()
+        rel["assets"] = [
+            a for a in rel["assets"] if a["name"] != db_sync.ASSET_DB
+        ]
+        del FakeGitHubHandler.assets[db_sync.ASSET_DB]
+        FakeGitHubHandler.next_id += 1
+        rel["assets"].append({
+            "id": FakeGitHubHandler.next_id,
+            "name": db_sync.ASSET_DB + db_sync.INCOMING_SUFFIX,
+            "size": len(rescued_blob),
+            "url": f"{self.base}/api/assets/{FakeGitHubHandler.next_id}/x",
+            "updated_at": "2026-09-17T16:54:20Z",
+        })
+        FakeGitHubHandler.assets[db_sync.ASSET_DB + db_sync.INCOMING_SUFFIX] = rescued_blob
+
+        # Local copy vanished with every failing run before the fix.
+        db_sync.DB_PATH.unlink()
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(db_sync.main(["db_sync.py", "pull"]), 0)
+        self.assertIn("recovering", stdout.getvalue())
+        conn = sqlite3.connect(str(db_sync.DB_PATH))
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM game_analytics").fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(n, 9, "the rescued catalog is the complete one")
+        self.assertEqual(db_sync.STATE_PATH.read_text().strip(), "77")
+        # Self-heal: the recovered asset was renamed back into place.
+        names = [a["name"] for a in self.release()["assets"]]
+        self.assertIn(db_sync.ASSET_DB, names)
+        self.assertEqual(FakeGitHubHandler.assets[db_sync.ASSET_DB], rescued_blob)
+
+    def test_pull_refuses_non_sqlite_incoming_asset(self):
+        """Recovery never installs garbage: a .incoming blob that is not a
+        SQLite database is refused like any other catalog asset."""
+        self.make_local_db(games=3)
+        db_sync.STATE_PATH.write_text("5\n")
+        db_sync.main(["db_sync.py", "push"])
+        rel = self.release()
+        rel["assets"] = [a for a in rel["assets"] if a["name"] != db_sync.ASSET_DB]
+        del FakeGitHubHandler.assets[db_sync.ASSET_DB]
+        FakeGitHubHandler.next_id += 1
+        rel["assets"].append({
+            "id": FakeGitHubHandler.next_id,
+            "name": db_sync.ASSET_DB + db_sync.INCOMING_SUFFIX,
+            "size": 21,
+            "url": f"{self.base}/api/assets/{FakeGitHubHandler.next_id}/x",
+            "updated_at": "2026-09-17T16:54:20Z",
+        })
+        FakeGitHubHandler.assets[db_sync.ASSET_DB + db_sync.INCOMING_SUFFIX] = b"<html>junk</html>"
+        db_sync.DB_PATH.unlink()
+        with self.assertRaises(db_sync.SyncError):
+            db_sync.cmd_pull()
+
     def test_status_reports_missing_release(self):
         rc = db_sync.main(["db_sync.py", "status"])
         self.assertEqual(rc, 1)

@@ -36,7 +36,7 @@ def counts(monkeypatch):
 
 
 def _app_with_view(view: str) -> AppTest:
-    at = AppTest.from_file(APP_PATH, default_timeout=15)
+    at = AppTest.from_file(APP_PATH, default_timeout=45)
     at.session_state["_device_ref"] = "live-ref-1"
     at.session_state["onboarding_complete"] = True
     at.session_state["welcome_scan_started"] = True

@@ -16,6 +16,9 @@ Usage:
                      games, never drains the known-game refresh queue.
     --only hydrator  refreshes games already in the catalog (tier-due queue);
                      zero discovery traffic — the cheap, frequent pass.
+    --only expander  the catalog-expansion pilot (EXPANSION_PILOT.md): creator
+                     spiderwebbing → discovery-queue drain → frontier scan,
+                     strict 20k/25 gate. Pilot-rate bounded by env knobs.
     (no flag)        full pipeline: find + hydrate in one run (UI parity).
 
 The Cloudflare Worker invokes the GitHub workflows via workflow_dispatch: it
@@ -40,7 +43,7 @@ APP_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(APP_DIR))
 
 from scout_core import KEYWORD_DICTIONARY, RobloxPlatformScout  # noqa: E402
-import capacity_pilot  # noqa: E402
+import expansion_pilot  # noqa: E402
 DB_PATH = str(APP_DIR / "rbx_scout.db")
 
 
@@ -99,7 +102,7 @@ def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float, mode: st
     print(f"keyword slice     : {scan.get('keyword_slice_start', 0) + 1}–"
           f"{scan.get('keyword_slice_end', 0)} of {len(KEYWORD_DICTIONARY)} · "
           f"{scan.get('keyword_discovered', 0)} games discovered"
-          + ("  (skipped: hydrator run)" if mode == "hydrator" else ""))
+          + ("  (skipped: " + mode + " run)" if mode in ("hydrator", "expander") else ""))
     print(f"candidates        : {scan.get('candidate_count', 0):,}")
     hyd = scan.get("hydration_budget") or {}
     print(f"hydration budget  : {hyd.get('new', 0)} new + {hyd.get('known_due', 0)} known-due "
@@ -142,22 +145,58 @@ def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float, mode: st
     print(f"discovery         : HTTP {disc.get('status', '?')} · {disc.get('records', 0)} games · "
           f"{disc.get('sorts', 0)} sorts across {disc.get('pages', 0)} chart page(s)")
 
+    # Catalog-expansion pilot summary (EXPANSION_PILOT.md) — only on expander
+    # runs, where scan['expansion'] is populated.
+    expansion = scan.get("expansion") or {}
+    if expansion:
+        web = expansion.get("spiderweb") or {}
+        drain = expansion.get("drain") or {}
+        frontier = expansion.get("frontier") or {}
+        print("\n" + "-" * 62)
+        print("EXPANSION PILOT (strict gate: 20k visits / 25 CCU)")
+        print("-" * 62)
+        print(f"spiderweb         : {web.get('crawled', 0)} crawled · {web.get('empty', 0)} empty · "
+              f"{web.get('failed', 0)} failed (retried next run)")
+        print(f"  games found     : {web.get('games_found', 0):,} · pre-gate pass: "
+              f"{web.get('pregate_passed', 0):,} · enqueued: {web.get('enqueued', 0):,}")
+        print(f"queue drain       : {drain.get('claimed', 0)} claimed · {drain.get('duplicates', 0)} known · "
+              f"{drain.get('qualified', 0)} QUALIFIED · {drain.get('below_gate', 0)} below gate · "
+              f"{drain.get('metrics_failed', 0)} failed")
+        if frontier.get("start_id"):
+            print(f"frontier scan     : {frontier.get('start_id', 0):,} → {frontier.get('end_id', 0):,} · "
+                  f"{frontier.get('scanned', 0)} fresh IDs · {frontier.get('qualified', 0)} QUALIFIED · "
+                  f"{frontier.get('below_gate', 0)} below gate")
+        import sqlite3
+        with sqlite3.connect(DB_PATH) as conn:
+            q = lambda s: conn.execute(s).fetchone()[0]
+            total_rows = q("SELECT COUNT(*) FROM game_analytics")
+            qualified_rows = q(
+                "SELECT COUNT(*) FROM game_analytics WHERE visits>=20000 AND ccu>=25")
+            queue_pending = q(
+                "SELECT COUNT(*) FROM discovery_queue WHERE status='pending'")
+            queue_total = q("SELECT COUNT(*) FROM discovery_queue")
+            logged_creators = q("SELECT COUNT(*) FROM creator_spiderweb_log")
+        print(f"catalog           : {total_rows:,} rows · {qualified_rows:,} qualified")
+        print(f"queue depth       : {queue_pending:,} pending · {queue_total:,} total")
+        print(f"spiderweb log     : {logged_creators:,} creators logged")
+
     # 429 sanity: counts come from the diagnostics the engine records.
     total_batches = metrics.get("batches", 0) or 0
     failed = metrics.get("failed_batches", 0) or 0
     rate = (failed / total_batches * 100) if total_batches else 0.0
     print(f"failure rate      : {rate:.1f}% of metric batches ({failed}/{total_batches})"
           + ("  — above the 2% escalation line, watch next sync" if rate > 2 else ""))
-    # Phase-1 capacity pilot: record this run's telemetry, then print the
-    # observe-only report (keyword-trial verdict + utilization + recs).
+    # Expansion pilot: record this run's telemetry, then — on expander runs
+    # only — print the observe-only KEEP/BORDERLINE/REVERT verdict block.
     try:
-        capacity_pilot.record_run(
+        expansion_pilot.record_run(
             DB_PATH, mode, int(scan.get("run_id") or 0), scan, diag,
             tier_schedule=scan.get("tier_schedule") or {},
         )
     except Exception as exc:  # telemetry must never fail a sync
         print(f"[pilot] record skipped: {exc}")
-    print(capacity_pilot.report(DB_PATH))
+    if mode == "expander":
+        print(expansion_pilot.report(DB_PATH))
     return 0 if ok else 1
 
 
@@ -167,15 +206,16 @@ def main() -> int:
     parser.add_argument("--min-ccu", type=int, default=25)
     parser.add_argument(
         "--only",
-        choices=("finder", "hydrator"),
+        choices=("finder", "hydrator", "expander"),
         default=None,
         help="finder = discover new games only; hydrator = refresh known games "
-        "only; omit for the full pipeline.",
+        "only; expander = catalog-expansion pilot; omit for the full pipeline.",
     )
     args = parser.parse_args()
     phases = {
         "finder": ("find",),
         "hydrator": ("hydrate",),
+        "expander": ("expand",),
         None: None,
     }[args.only]
     mode = args.only or "full"

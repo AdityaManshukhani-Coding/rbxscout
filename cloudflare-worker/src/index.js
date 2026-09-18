@@ -28,6 +28,7 @@ const GITHUB_API_VERSION = "2022-11-28";
 const GITHUB_WORKFLOWS = {
   hydrator: "hydrator.yml",
   finder: "finder.yml",
+  expander: "expander.yml",
 };
 const GITHUB_DISPATCH_ATTEMPTS = 3;
 const GITHUB_RETRY_MAX_DELAY_MS = 30_000;
@@ -174,6 +175,14 @@ async function dispatchDueWorkflows(controller, env) {
   // concurrency group serializes finder/hydrator when ticks coincide.
   if (minute % 10 === 0) {
     due.push(["finder", GITHUB_WORKFLOWS.finder]);
+  }
+
+  // Expander ("Game Finder 2.0", EXPANSION_PILOT.md) gets the odd clean
+  // minute :15/:45 — its own 30-min slot that never coincides with finder's
+  // even-minute ticks. The Actions concurrency group still serializes any
+  // overlap (e.g. a long finder run still holding the mutex at :15).
+  if (minute === 15 || minute === 45) {
+    due.push(["expander", GITHUB_WORKFLOWS.expander]);
   }
 
   const results = await Promise.allSettled(

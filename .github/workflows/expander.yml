@@ -1,0 +1,85 @@
+# RbxScout expander — "Game Finder 2.0", the catalog-expansion pilot (every 30 min).
+#
+# The third discovery engine (EXPANSION_PILOT.md): creator spiderwebbing
+# (crawls the public portfolios of every creator already in the catalog),
+# a priority discovery-queue drain, and a frontier scan that walks fresh
+# universe-ID ranges upward from the highest known ID. Strict gate: only
+# games meeting 20k visits / 25 CCU are stored — everything else is recorded
+# in discovery_queue as dedup memory, never as a catalog row.
+#
+# The catalog lives on the rolling Release `catalog-latest` (asset
+# rbx_scout.db): pull -> sync -> push, same as finder/hydrator.
+#
+# ⚠️ Race safety: this workflow declares the SAME `rbxscout-sync` Actions
+# concurrency group as finder.yml and hydrator.yml. The DB is one binary
+# SQLite file — two pull/sync/push cycles running at once would silently
+# drop one run's data. GitHub enforces the group repo-wide as a mutex;
+# `queue: max` retains pending dispatches while a run is active.
+#
+# Pilot knobs (repo Variables, optional): EXPAND_SPIDERWEB_CREATORS,
+# EXPAND_QUEUE_BATCHES, EXPAND_FRONTIER_BATCHES. A 72-run automated
+# KEEP/REVERT verdict prints in every expander run log.
+#
+# Manual runs: Actions tab -> "Expander — Game Finder 2.0 (30 min)" -> Run workflow
+
+name: Expander — Game Finder 2.0 (30 min)
+
+on:
+# Automatic dispatching is owned by the Cloudflare Worker in
+# cloudflare-worker/wrangler.toml. Keep only workflow_dispatch here.
+  workflow_dispatch:
+
+permissions:
+  contents: write   # create/update the catalog-latest release assets
+
+env:
+  # The expander never touches the search API; proxy pool stays empty.
+  RBXSCOUT_SEARCH_PROXY_URLS: ''
+  # Pilot rates (defaults live in scout_core.py): 100 creators, 10 queue
+  # batches (500 candidates), 10 frontier batches (500 fresh IDs) per run.
+  EXPAND_SPIDERWEB_CREATORS: ${{ vars.EXPAND_SPIDERWEB_CREATORS || '' }}
+  EXPAND_QUEUE_BATCHES: ${{ vars.EXPAND_QUEUE_BATCHES || '' }}
+  EXPAND_FRONTIER_BATCHES: ${{ vars.EXPAND_FRONTIER_BATCHES || '' }}
+
+# ⚠️ Keep this group IDENTICAL to finder.yml / hydrator.yml — the shared
+# literal string IS the cross-workflow mutex.
+concurrency:
+  group: rbxscout-sync
+  queue: max                 # retain dispatches while another workflow runs
+
+jobs:
+  expand:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30      # pacer can stretch on 429s; matches finder
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Export release-store credentials
+        run: echo "RBXSCOUT_GITHUB_TOKEN=${{ github.token }}" >> "$GITHUB_ENV"
+
+      - name: Set up Python 3.14 (matches the tested local env)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Pull catalog from release store
+        run: python db_sync.py pull
+
+      - name: Run test suite (protects the catalog from bad pushes)
+        run: python -m pytest tests -q
+
+      - name: Run expander (spiderweb + queue drain + frontier scan)
+        run: python live_sync.py --only expander --min-visits 20000 --min-ccu 25
+
+      # One-way door: an expansion pass that evaluated IDs but failed to
+      # persist would re-evaluate the same ranges next run (the frontier
+      # pointer only advances after a successful DB write). Fail visibly.
+      - name: Push catalog to release store
+        if: always()
+        run: python db_sync.py push

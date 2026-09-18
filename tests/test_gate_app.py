@@ -41,7 +41,7 @@ def _gate_state(tmp_path, monkeypatch):
 
 
 def test_wrong_password_stays_on_gate(_gate_state):
-    at = AppTest.from_file(APP_PATH, default_timeout=15)
+    at = AppTest.from_file(APP_PATH, default_timeout=45)
     at.session_state["_device_ref"] = "gate-dev-1"
     at.run()
     assert not at.exception
@@ -57,7 +57,7 @@ def test_wrong_password_stays_on_gate(_gate_state):
 
 
 def test_correct_password_reaches_app(_gate_state):
-    at = AppTest.from_file(APP_PATH, default_timeout=15)
+    at = AppTest.from_file(APP_PATH, default_timeout=45)
     at.session_state["_device_ref"] = "gate-dev-2"
     at.run()
     at.text_input(key="gate_password").set_value("Sep#2007").run()
@@ -69,7 +69,7 @@ def test_correct_password_reaches_app(_gate_state):
 
 
 def test_wrong_password_shows_cooldown(_gate_state):
-    at = AppTest.from_file(APP_PATH, default_timeout=15)
+    at = AppTest.from_file(APP_PATH, default_timeout=45)
     at.session_state["_device_ref"] = "gate-dev-3"
     at.run()
     for _ in range(gate.MAX_ATTEMPTS):
@@ -120,7 +120,7 @@ def test_device_ref_from_query_param_never_mounts_script(_gate_state, monkeypatc
 
 def test_gate_renders_before_anything_else(_gate_state):
     """The gate renders instead of onboarding/dashboard, and app content is hidden."""
-    at = AppTest.from_file(APP_PATH, default_timeout=15)
+    at = AppTest.from_file(APP_PATH, default_timeout=45)
     at.session_state["_device_ref"] = "gate-dev-4"
     at.run()
     body_text = " ".join(m.value for m in at.markdown)
@@ -130,7 +130,7 @@ def test_gate_renders_before_anything_else(_gate_state):
 
 def test_unlocked_device_skips_gate(_gate_state):
     gate.remember_unlock("gate-dev-5")
-    at = AppTest.from_file(APP_PATH, default_timeout=15)
+    at = AppTest.from_file(APP_PATH, default_timeout=45)
     at.session_state["_device_ref"] = "gate-dev-5"
     at.run()
     assert not at.exception

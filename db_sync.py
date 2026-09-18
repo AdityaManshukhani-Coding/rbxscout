@@ -426,8 +426,30 @@ def cmd_pull() -> int:
             f"No {RELEASE_TAG} release yet. Seed it once with: python db_sync.py push"
         )
     asset = next((a for a in rel["assets"] if a.get("name") == ASSET_DB), None)
+    recovered = False
     if not asset:
-        raise SyncError(f"Release {RELEASE_TAG} has no {ASSET_DB} asset yet.")
+        # Mid-swap crash recovery (2026-09-17 outage): a push that died
+        # between deleting the old catalog and renaming the incoming one
+        # leaves only `<name>.incoming` on the release — and that blob is
+        # only written AFTER byte-for-byte size verification, so it is a
+        # complete catalog by construction. Recovering it here turns a
+        # store-killing crash into a one-run hiccup: every later run pulls
+        # the recovered catalog and the next push restores the normal asset
+        # layout. Without this, pull keeps failing, no local copy ever
+        # exists, and the always-run push step cannot heal the release.
+        incoming = next(
+            (a for a in rel["assets"] if a.get("name") == ASSET_DB + INCOMING_SUFFIX),
+            None,
+        )
+        if not incoming:
+            raise SyncError(f"Release {RELEASE_TAG} has no {ASSET_DB} asset yet.")
+        recovered = True
+        asset = incoming
+        print(
+            f"pull: WARNING — no {ASSET_DB} asset on the release; recovering "
+            f"the size-verified {incoming['name']} left by an interrupted swap "
+            f"(updated {incoming['updated_at']})"
+        )
     print(f"pull: {asset['name']}  {asset['size']/1e6:.1f} MB  (updated {asset['updated_at']})")
     blob = _api("GET", asset["url"], token, expect_json=False,
                 accept="application/octet-stream")
@@ -443,6 +465,16 @@ def cmd_pull() -> int:
     state = _asset_state(rel, token)
     if state:
         STATE_PATH.write_text(state + "\n")
+    if recovered:
+        # Best-effort: rename the recovered asset back into place so the
+        # release is self-describing again. The push that follows would fix
+        # it anyway, so a failure here is reported and skipped.
+        try:
+            _api("PATCH", f"/repos/{repo_slug()}/releases/assets/{asset['id']}",
+                 token, body={"name": ASSET_DB})
+            print(f"healed: renamed {asset['name']} back to {ASSET_DB}")
+        except SyncError as exc:
+            print(f"rename-after-recovery skipped: {exc}")
     print(f"installed: {DB_PATH.name}  {len(blob)/1e6:.1f} MB  (sync #{state or '?'})")
     return 0
 
