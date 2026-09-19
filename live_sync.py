@@ -150,6 +150,7 @@ def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float, mode: st
     expansion = scan.get("expansion") or {}
     if expansion:
         web = expansion.get("spiderweb") or {}
+        recs = expansion.get("rec_mining") or {}
         drain = expansion.get("drain") or {}
         frontier = expansion.get("frontier") or {}
         print("\n" + "-" * 62)
@@ -159,6 +160,9 @@ def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float, mode: st
               f"{web.get('failed', 0)} failed (retried next run)")
         print(f"  games found     : {web.get('games_found', 0):,} · pre-gate pass: "
               f"{web.get('pregate_passed', 0):,} · enqueued: {web.get('enqueued', 0):,}")
+        print(f"rec mining        : {recs.get('seeds', 0)} seeds · {recs.get('failed', 0)} failed · "
+              f"{recs.get('recs_seen', 0):,} recs · {recs.get('known', 0):,} known/skipped · "
+              f"{recs.get('enqueued', 0)} NEW enqueued")
         print(f"queue drain       : {drain.get('claimed', 0)} claimed · {drain.get('duplicates', 0)} known · "
               f"{drain.get('qualified', 0)} QUALIFIED · {drain.get('below_gate', 0)} below gate · "
               f"{drain.get('metrics_failed', 0)} failed")

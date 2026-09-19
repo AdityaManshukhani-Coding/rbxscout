@@ -17,11 +17,12 @@ they've already grown. RoTrends/Atlas-style sites get small games via
 **structural** discovery, not search. This pilot adds exactly that, in two
 engines, without abandoning the scout philosophy (nothing dead is stored).
 
-## The two engines
+## The two engines (now three — rec mining joined 2026-09-19)
 
 | Engine | What it does | Cost |
 |---|---|---|
 | **Creator spiderwebbing** | Crawls the public portfolios of every creator already in the catalog (14,649 unique creators: 11,931 groups / 2,718 users). Portfolio payloads carry `placeVisits` free, so candidates below 20k visits are discarded **before** any hydration request. Survivors enter the discovery queue at priority 1. | ~1 request per creator (page size 100 groups / 50 users, cursor-followed) |
+| **Recommendations mining** (2026-09-19) | Harvests Roblox's player-overlap graph: for each seed game, `/v1/games/recommendations/game/{id}` returns ~6 games its players also play. Seeds are chosen ONLY from the small band (20k–100k visits) plus the 200 most recent expansion qualifiers — giant seeds return 100% already-known games. New IDs enter the queue at priority 2. A rotation cursor in `scan_pointers` (id `rec_seed`) sweeps the pool so runs never repeat seeds. | 1 lightweight GET per seed (default 50/run) |
 | **Frontier scan** | Walks universe IDs upward from the highest known ID (seeded at 10,765,584,604). Roblox assigns IDs as increasing integers, so this range is where brand-new games appear — the ones that can cross 20k visits within days of launch. 1 request per 50 IDs. | 1 request per 50 IDs |
 
 Both feed a **priority discovery queue** (spiderweb=1, seed=2, sequential=3),
@@ -44,6 +45,42 @@ These were verified against real endpoints before building:
 4. `placeVisits` in portfolio responses makes the pre-gate free — the seed
    pass's hydration cost collapses to only games already showing 20k+ visits.
 
+## Recommendations-endpoint spike (live, 2026-09-19)
+
+Verified before building the third engine — the external blueprint was wrong
+again on the numbers:
+
+1. `GET /v1/games/recommendations/game/{universeId}` — works unauthenticated,
+   HTTP 200, shape `{games: [...], nextPaginationKey}`.
+2. **maxRows is ignored** — 6 rows per page regardless of 10/25/50/200.
+3. **Pagination is fake** — 6 pages returned the same 6 games (36 rows → 6
+   unique). One request per seed is all you get.
+4. Small/low-CCU games can return **0 rows** (empty rec graph).
+5. Overlap is the decisive number: a giant seed returned **100% known** games;
+   small-band seeds returned ~2 new relevant IDs per 5 requests. Hence: seed
+   from the small band only, expect a quality trickle not a firehose.
+
+## Velocity watch — PARKED (measured 2026-09-19, do not build yet)
+
+> **TODO (Aditya's reminder list):** revisit "growth-velocity pre-gating"
+> (re-check CCU≥25 / <20k-visit games every 24h instead of discarding them for
+> 14 days). It is parked — NOT because the idea is bad, but because on
+> 2026-09-19 we measured the streams it would watch and they contain **zero**
+> such games:
+>
+> - frontier (`sequential_scan`) discards: 200 sampled, **100% dead (0 CCU)**
+>   — fresh universe IDs are mostly unpublished Studio placeholders.
+> - spiderweb discards: 200 sampled, 92% dead, rest under 25 CCU (below-gate
+>   there means low CCU — the visits pre-gate already removed low-visit rows).
+> - portfolio games the visits pre-gate drops: dead in the sampled portfolios.
+>
+> **When to reconsider:** if the EXPANSION PILOT block ever shows a `below_gate`
+> population with real CCU (or you lower the gate), a 24h re-check TTL on
+> `discovery_queue` status `velocity_watch` becomes worthwhile — the queue and
+> drain already exist, so it would be a small change. The cheaper lever that
+> captures most of the same benefit today: shorten `SPIDERWEB_RESCRAPE_DAYS`
+> from 14 to 7 (one constant).
+
 ## Pilot rates (and the knobs)
 
 Defaults live in `scout_core.py` and are env-tunable via the expander
@@ -55,6 +92,7 @@ Variables):
 | `EXPAND_SPIDERWEB_CREATORS` | 100 | creators crawled per run (~100–150 requests) |
 | `EXPAND_QUEUE_BATCHES` | 10 | ×50 candidates hydrated per run (≤500) |
 | `EXPAND_FRONTIER_BATCHES` | 10 | ×50 fresh IDs scanned per run (≤500 → ~24k/day) |
+| `EXPAND_REC_SEEDS` | 50 | recommendation seeds mined per run |
 
 At the 30-minute cadence that is ~1,500–2,000 requests/day of expansion
 traffic on top of the existing finder/hydrator load — deliberately modest

@@ -17,8 +17,8 @@
 # `queue: max` retains pending dispatches while a run is active.
 #
 # Pilot knobs (repo Variables, optional): EXPAND_SPIDERWEB_CREATORS,
-# EXPAND_QUEUE_BATCHES, EXPAND_FRONTIER_BATCHES. A 72-run automated
-# KEEP/REVERT verdict prints in every expander run log.
+# EXPAND_QUEUE_BATCHES, EXPAND_FRONTIER_BATCHES, EXPAND_REC_SEEDS. A 72-run
+# automated KEEP/REVERT verdict prints in every expander run log.
 #
 # Manual runs: Actions tab -> "Expander — Game Finder 2.0 (30 min)" -> Run workflow
 
@@ -40,6 +40,7 @@ env:
   EXPAND_SPIDERWEB_CREATORS: ${{ vars.EXPAND_SPIDERWEB_CREATORS || '' }}
   EXPAND_QUEUE_BATCHES: ${{ vars.EXPAND_QUEUE_BATCHES || '' }}
   EXPAND_FRONTIER_BATCHES: ${{ vars.EXPAND_FRONTIER_BATCHES || '' }}
+  EXPAND_REC_SEEDS: ${{ vars.EXPAND_REC_SEEDS || '' }}
 
 # ⚠️ Keep this group IDENTICAL to finder.yml / hydrator.yml — the shared
 # literal string IS the cross-workflow mutex.

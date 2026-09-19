@@ -136,7 +136,15 @@ EXPANSION_TARGET_CCU = 25
 EXPAND_SPIDERWEB_CREATORS_DEFAULT = 100  # creators per expand run (~100-150 req)
 EXPAND_QUEUE_BATCHES_DEFAULT = 10        # 10 x 50 = 500 queued candidates hydrated/run
 EXPAND_FRONTIER_BATCHES_DEFAULT = 10     # 10 x 50 = 500 fresh IDs/run (~24k/day)
+EXPAND_REC_SEEDS_DEFAULT = 50            # recommendations requests per expand run
+REC_SEED_RECENT_CAP = 200                # top-up pool: newest expansion qualifiers
 EXPANSION_QUEUE_MAX_ROWS = 2_000_000     # dedup-memory ceiling (trim oldest)
+# Verified live 2026-09-19: returns ~6 rows/page, maxRows ignored, pagination
+# repeats the same page (36 rows over 6 pages -> 6 unique). Small/low-CCU
+# games can return 0 rows (empty rec graph). Rows carry creator id/type free.
+REC_RECOMMENDATIONS_URL = (
+    "https://games.roblox.com/v1/games/recommendations/game/{universe_id}"
+)
 
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -2946,11 +2954,144 @@ class RobloxPlatformScout:
         )
         return stats
 
+    def mine_recommendations(
+        self,
+        seed_count: int = EXPAND_REC_SEEDS_DEFAULT,
+        progress_cb: Optional[Callable[[float, str], None]] = None,
+    ) -> Dict[str, int]:
+        """Harvest Roblox's player-overlap graph as a third candidate source.
+
+        For each seed universe the recommendations endpoint returns ~6 games
+        players of the seed also play (live-verified: one page, maxRows
+        ignored, pagination repeats). Seeds are chosen ONLY from the small
+        band (20k-100k visits, CCU>=25) and recent expansion qualifiers —
+        giant seeds return 100% games already in the catalog, so they are
+        excluded by design. New IDs flow into the shared discovery queue at
+        priority 2 (below fresh spiderweb candidates, above frontier), and
+        the drain's strict gate owns the 20k/25 verdict.
+
+        Seed rotation: a single 'rec_seed' scan pointer advances through the
+        pool ordered by most recently updated, so each run sweeps a fresh
+        slice of the pool with zero overlap between consecutive runs, and
+        the next run cycles back around once the pool is exhausted. Seed
+        requests count against no batch quota (1 lightweight GET per seed);
+        failures just skip the seed for this run.
+        """
+        report = progress_cb or (lambda p, m: None)
+        stats = {"seeds": 0, "failed": 0, "recs_seen": 0, "known": 0, "enqueued": 0}
+        seed_count = max(0, int(seed_count))
+        if seed_count == 0:
+            return stats
+        try:
+            with self._connect() as conn:
+                pool = [int(r[0]) for r in conn.execute(
+                    """
+                    SELECT universe_id FROM game_analytics
+                    WHERE visits BETWEEN 20000 AND 100000 AND ccu >= 25
+                    """
+                ).fetchall()]
+                recent = [int(r[0]) for r in conn.execute(
+                    """
+                    SELECT universe_id FROM game_analytics
+                    WHERE found_via = 'expansion' AND visits >= 20000 AND ccu >= 25
+                    ORDER BY last_updated DESC LIMIT ?
+                    """,
+                    (REC_SEED_RECENT_CAP,),
+                ).fetchall()]
+        except sqlite3.Error as exc:
+            log.warning("rec-mining seed query failed: %s", exc)
+            return stats
+        pool_set = set(pool)
+        seeds = list(pool_set | (set(recent) - pool_set))
+        if not seeds:
+            return stats
+        seeds.sort()  # deterministic rotation order
+        start = self._load_rec_seed_cursor() % len(seeds)
+        rotation = seeds[start:] + seeds[:start]
+        batch = rotation[:seed_count]
+        stats["seeds"] = len(batch)
+        if batch:
+            self._advance_rec_seed_cursor((start + len(batch)) % len(seeds))
+        # ~94% of rec rows point at games we already know (spike 2026-09-19).
+        # Filter against catalog + queue IN-PROCESS so only genuinely new IDs
+        # reach the queue — enqueueing known games would just burn queue rows
+        # and drain claim slots on rows that end up 'already_in_catalog'.
+        known: set = set()
+        try:
+            with self._connect() as conn:
+                known.update(int(r[0]) for r in conn.execute(
+                    "SELECT universe_id FROM game_analytics"))
+                known.update(int(r[0]) for r in conn.execute(
+                    "SELECT universe_id FROM discovery_queue"))
+        except sqlite3.Error:
+            known = set()
+        report(0.0, f"Recommendations mining: {len(batch)} small-band seeds…")
+        for index, uid in enumerate(batch, start=1):
+            status, data = self._get_json(
+                REC_RECOMMENDATIONS_URL.format(universe_id=uid))
+            if status != 200 or not isinstance(data, dict):
+                stats["failed"] += 1
+            else:
+                games = data.get("games") or []
+                stats["recs_seen"] += len(games)
+                items = []
+                for g in games:
+                    rec_uid = g.get("universeId")
+                    try:
+                        rec_uid = int(rec_uid)
+                    except (TypeError, ValueError):
+                        continue
+                    if rec_uid in known or rec_uid == uid:
+                        stats["known"] += 1
+                        continue
+                    known.add(rec_uid)  # dedup within the same harvest too
+                    # priority 2: below fresh spiderweb (1), above frontier (3)
+                    items.append((rec_uid, "rec_mining", 2))
+                stats["enqueued"] += self._enqueue_discovery(items)
+            if index % 10 == 0 or index == len(batch):
+                report(
+                    index / len(batch),
+                    f"Rec mining {index}/{len(batch)} seeds · "
+                    f"+{stats['enqueued']} new candidates enqueued",
+                )
+        return stats
+
+    def _load_rec_seed_cursor(self) -> int:
+        """Read the rec-seed rotation cursor (position in the sorted pool)."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT last_universe_id FROM scan_pointers WHERE id = 'rec_seed'"
+                ).fetchone()
+            if row and row[0] is not None:
+                return int(row[0])
+        except sqlite3.Error:
+            pass
+        return 0
+
+    def _advance_rec_seed_cursor(self, new_value: int) -> None:
+        """Persist the rec-seed rotation cursor (mod applied by the caller)."""
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO scan_pointers (id, last_universe_id, updated_at)
+                    VALUES ('rec_seed', ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(id) DO UPDATE SET
+                        last_universe_id = excluded.last_universe_id,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (int(new_value),),
+                )
+        except sqlite3.Error as exc:
+            log.warning("rec-seed cursor update failed: %s", exc)
+
     def run_expansion(
         self,
         spiderweb_creators: Optional[int] = None,
         queue_batches: Optional[int] = None,
         frontier_batches: Optional[int] = None,
+        rec_seeds: Optional[int] = None,
         progress_cb: Optional[Callable[[float, str], None]] = None,
     ) -> Dict[str, Any]:
         """One expansion pass: spiderweb → queue drain → frontier scan.
@@ -2973,9 +3114,15 @@ class RobloxPlatformScout:
             "EXPAND_FRONTIER_BATCHES",
             EXPAND_FRONTIER_BATCHES_DEFAULT if frontier_batches is None else frontier_batches,
         )
+        rec_limit = _env_int(
+            "EXPAND_REC_SEEDS",
+            EXPAND_REC_SEEDS_DEFAULT if rec_seeds is None else rec_seeds,
+        )
         result: Dict[str, Any] = {}
         report(0.05, "Expansion pass: creator spiderwebbing…")
         result["spiderweb"] = self.spiderweb_creators(web_limit, progress_cb=report)
+        report(0.25, "Expansion pass: recommendations mining…")
+        result["rec_mining"] = self.mine_recommendations(rec_limit, progress_cb=report)
         report(0.4, "Expansion pass: draining the discovery queue…")
         result["drain"] = self.drain_discovery_queue(drain_limit, progress_cb=report)
         report(0.7, "Expansion pass: frontier scan…")
@@ -3368,6 +3515,7 @@ class RobloxPlatformScout:
         report = progress_cb or (lambda p, m: None)
         result = self.run_expansion(progress_cb=report)
         web = result.get("spiderweb") or {}
+        recs = result.get("rec_mining") or {}
         drain = result.get("drain")
         frontier = result.get("frontier") or {}
         qualified = int(drain.get("qualified") or 0) + int(frontier.get("qualified") or 0)
@@ -3376,7 +3524,9 @@ class RobloxPlatformScout:
             "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "metrics_count": qualified,
             "matched_count": qualified,
-            "candidate_count": int(web.get("pregate_passed") or 0),
+            "candidate_count": (
+                int(web.get("pregate_passed") or 0) + int(recs.get("enqueued") or 0)
+            ),
             "catalog_count": int(self.load_table().shape[0]),
         })
         self._finish_scan()

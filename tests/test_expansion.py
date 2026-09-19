@@ -68,6 +68,15 @@ class ExpansionScout(RobloxPlatformScout):
                 })
             return 200, {"data": data}
 
+        # Recommendations mining: fixture key "recs" -> {seed_uid: [games]}.
+        # Missing seed -> 404 (models an endpoint failure for that seed).
+        if url.startswith(scout_core.REC_RECOMMENDATIONS_URL.replace("{universe_id}", "")):
+            uid = int(url.rstrip("/").rsplit("/", 1)[1])
+            recs = self.responses.get("recs") or {}
+            if uid in recs:
+                return 200, {"games": recs[uid], "nextPaginationKey": None}
+            return 404, None
+
         # Portfolio endpoints (cursor-aware). Fixture key: ("group", id) or
         # ("user", id) -> list of pages, each page a dict like the live API.
         for (kind, cid), pages in self.responses.get("portfolios", {}).items():
@@ -413,3 +422,137 @@ def test_scan_rejects_unknown_phase():
     import pytest
     with pytest.raises(ValueError):
         scout.scan(phases=("explode",))
+
+
+# --------------------------------------------------------------------------- #
+# Recommendations mining (third seed source, added 2026-09-19)
+# --------------------------------------------------------------------------- #
+
+
+def _rec(uid):
+    """One recommendations row, exactly the live shape (spike 2026-09-19)."""
+    return {
+        "universeId": uid,
+        "name": f"Rec {uid}",
+        "placeId": uid + 1,
+        "creatorId": 42,
+        "creatorType": "Group",
+        "creatorName": "Somebody",
+        "totalUpVotes": 3000,
+        "totalDownVotes": 100,
+    }
+
+
+def test_rec_mining_enqueues_new_ids_at_priority_2(tmp_path):
+    db = str(tmp_path / "t.db")
+    scout = ExpansionScout({
+        "recs": {
+            500: [_rec(9001), _rec(9002), _rec(500)],   # self-rec must be skipped
+            501: [_rec(9001), _rec(9003)],              # 9001 dup across seeds
+        },
+    }, db)
+    # Seeds = small-band rows (500, 501). Pool ordered ascending -> cursor 0.
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO game_analytics (universe_id, ccu, visits) VALUES (500, 30, 50000), (501, 30, 50000)"
+        )
+    stats = scout.mine_recommendations(seed_count=10)
+    assert stats["seeds"] == 2
+    assert stats["recs_seen"] == 5
+    assert stats["enqueued"] == 3                # 9001, 9002, 9003
+    assert stats["known"] == 2                   # self-rec + 9001 seen twice
+    with sqlite3.connect(db) as conn:
+        rows = dict(conn.execute(
+            "SELECT universe_id, priority FROM discovery_queue").fetchall())
+        sources = dict(conn.execute(
+            "SELECT universe_id, source FROM discovery_queue").fetchall())
+        cursor = conn.execute(
+            "SELECT last_universe_id FROM scan_pointers WHERE id='rec_seed'").fetchone()[0]
+    assert rows == {9001: 2, 9002: 2, 9003: 2}   # priority 2 (rec mining)
+    assert all(v == "rec_mining" for v in sources.values())
+    assert cursor == 0                            # full sweep wraps (mod pool size)
+
+
+def test_rec_mining_skips_ids_already_in_queue(tmp_path):
+    db = str(tmp_path / "t.db")
+    scout = ExpansionScout({
+        "recs": {500: [_rec(9001), _rec(9002)]},
+    }, db)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO game_analytics (universe_id, ccu, visits) VALUES (500, 30, 50000)")
+        conn.execute(
+            "INSERT INTO discovery_queue (universe_id, source, priority, status) "
+            "VALUES (9001, 'sequential_scan', 3, 'pending')")
+    stats = scout.mine_recommendations(seed_count=10)
+    # Existing queue rows keep their original source/priority (_enqueue_discovery
+    # contract) and are not counted as new.
+    assert stats["enqueued"] == 1
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT source, priority FROM discovery_queue WHERE universe_id=9001").fetchone()
+    assert row == ("sequential_scan", 3)
+
+
+def test_rec_mining_rotation_does_not_repeat_seeds(tmp_path):
+    db = str(tmp_path / "t.db")
+    scout = ExpansionScout({
+        "recs": {
+            500: [_rec(9001)], 501: [_rec(9002)],
+            502: [_rec(9003)], 503: [_rec(9004)],
+        },
+    }, db)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO game_analytics (universe_id, ccu, visits) "
+            "VALUES (500, 30, 50000), (501, 30, 50000), (502, 30, 50000), (503, 30, 50000)")
+    first = scout.mine_recommendations(seed_count=2)
+    second = scout.mine_recommendations(seed_count=2)
+    assert first["seeds"] == 2 and second["seeds"] == 2   # fresh slice each run
+    with sqlite3.connect(db) as conn:
+        n = conn.execute("SELECT COUNT(*) FROM discovery_queue").fetchone()[0]
+    assert n == 4                                            # no seed repeated
+
+
+def test_rec_mining_seed_failure_does_not_break_run(tmp_path):
+    db = str(tmp_path / "t.db")
+    scout = ExpansionScout({
+        "recs": {501: [_rec(9009)]},                 # seed 500 -> 404 in the mock
+    }, db)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO game_analytics (universe_id, ccu, visits) VALUES (500, 30, 50000), (501, 30, 50000)")
+    stats = scout.mine_recommendations(seed_count=10)
+    assert stats["failed"] == 1
+    assert stats["enqueued"] == 1                    # healthy seed still harvested
+
+
+def test_rec_mining_giants_and_below_band_excluded_from_pool(tmp_path):
+    db = str(tmp_path / "t.db")
+    scout = ExpansionScout({}, db)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO game_analytics (universe_id, ccu, visits, found_via) "
+            "VALUES (10, 900, 5_000_000, 'keyword'), (20, 30, 19_000, 'keyword')")
+    stats = scout.mine_recommendations(seed_count=10)
+    assert stats["seeds"] == 0   # giant + below-band rows are not valid seeds
+
+
+def test_run_expansion_includes_rec_mining(tmp_path):
+    db = str(tmp_path / "t.db")
+    scout = ExpansionScout({
+        "recs": {500: [_rec(9001)]},
+        "metrics:9001": _game(9001, ccu=30, visits=25_000),
+    }, db)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO game_analytics (universe_id, ccu, visits) VALUES (500, 30, 50000)")
+    result = scout.run_expansion(
+        spiderweb_creators=0, queue_batches=1, frontier_batches=0, rec_seeds=5,
+    )
+    assert result["rec_mining"]["enqueued"] == 1
+    assert result["drain"]["qualified"] == 1         # 9001 crossed the gate
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT found_via FROM game_analytics WHERE universe_id=9001").fetchone()
+    assert row[0] == "expansion"
