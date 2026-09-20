@@ -51,6 +51,13 @@ concurrency:
 
 jobs:
   find:
+    # Retirement guard (ATLAS_PLAN_REVIEW.md §6): Atlas seed ingestion replaces
+    # chart/keyword discovery (frontier scored 0 qualified from 11,500 evals;
+    # Atlas yields ~65-74% new IDs/page). The workflow is KEPT for instant
+    # rollback: set the repo Variable FINDER_ENABLED=1 (Settings → Secrets and
+    # variables → Actions → Variables) to re-enable discovery. The Cloudflare
+    # Worker keeps dispatching this schedule; disabled runs skip in seconds.
+    if: vars.FINDER_ENABLED == '1'
     runs-on: ubuntu-latest
     timeout-minutes: 30       # pacer can stretch on 429s; 30 min is generous
 

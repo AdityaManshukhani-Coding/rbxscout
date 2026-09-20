@@ -32,6 +32,9 @@ def counts(monkeypatch):
         }
 
     monkeypatch.setattr(catalog_fetch, "catalog_counts", fake_counts)
+    # Bypass the new process-wide 60 s counter cache (an earlier test in the
+    # run may have warmed it with real DB values).
+    monkeypatch.setattr(catalog_fetch, "catalog_counts_cached", catalog_fetch.catalog_counts)
     return calls
 
 

@@ -24,6 +24,7 @@ from scout_core import (
     DISCORD_FILTER_FALSE,
     DISCORD_FILTER_TRUE,
     DISCORD_LOGO_URL,
+    THROTTLED_STATUS,
     RobloxPlatformScout,
     apply_filters,
     compact_num,
@@ -129,6 +130,35 @@ EMPTY_DATA_COLUMNS = [
     "has_discord", "discord_url", "status", "found_via", "has_social_links",
     "avg_ccu_1d", "momentum_1d", "contacts_checked_at",
 ]
+# Columns kept in st.session_state.data. ``description`` is dropped on purpose:
+# the catalog's average description is ~0.5 KB per game, so a default result
+# set of ~10k rows carries ~5 MB of text nobody renders — per session. At
+# hundreds of users that text alone pushed the container toward its RAM
+# ceiling (an OOM kill takes every user down at once). Everything still
+# renders: no dashboard widget reads the description column.
+SESSION_KEEP_COLUMNS = [
+    "universe_id", "root_place_id", "title", "ccu", "peak_ccu", "visits", "favorites",
+    "genre", "creator_name", "creator_type", "creator_id", "icon_url",
+    "has_discord", "discord_url", "status", "found_via", "has_social_links",
+    "avg_ccu_1d", "momentum_1d", "contacts_checked_at",
+]
+
+
+def slim_result_frame(data: pd.DataFrame) -> pd.DataFrame:
+    """Trim the result set to the columns the dashboard actually keeps.
+
+    Session state holds one result frame PER browser session in one process;
+    this is the single biggest per-user memory lever. Missing columns are
+    tolerated (schema drift, demo frames) and a malformed frame passes
+    through unchanged — trimming must never be the thing that breaks a rerun.
+    """
+    try:
+        if data.empty:
+            return data
+        keep = [col for col in SESSION_KEEP_COLUMNS if col in data.columns]
+        return data[keep] if keep else data
+    except Exception:
+        return data
 DESKTOP_DIR = Path.home() / "Desktop"
 GUIDE_IMAGE_CANDIDATES = {
     number: [
@@ -380,7 +410,15 @@ def _render_gate() -> None:
     )
 
     remaining = gate.cooldown_remaining(ref)
-    if remaining <= 0:
+    if gate._expected_password() == "":
+        # Deployment not configured: fail closed with an actionable message
+        # instead of a door nobody can open (and never burn attempts on it).
+        st.error(
+            "🔒 **This deployment has no access password configured.** The "
+            "owner must set ``APP_PASSWORD`` in the app's Streamlit secrets "
+            "— until then nobody can sign in."
+        )
+    elif remaining <= 0:
         candidate = st.text_input("Password", type="password", key="gate_password")
         if st.button("Unlock", type="primary", width="stretch", key="gate_unlock"):
             result = gate.check_password(candidate, ref)
@@ -403,10 +441,13 @@ def _render_gate() -> None:
         st.warning(f"Too many wrong attempts. Try again in {mm}:{ss:02d}.")
         st.progress(min(1.0, max(0.02, 1.0 - remaining / total)))
         st.caption("Keep this tab open — the timer runs on the server, refreshing does not help.")
-        # Live countdown: the browser re-checks every 2s; once the server-side
-        # timer expires this very reload renders the password field again.
+        # Live countdown: the browser re-checks every 8 s; once the
+        # server-side timer expires this very reload renders the password
+        # field again. 2 s used to make every locked-out browser a full-page
+        # reload machine — hundreds of users in cooldown would reload-storm
+        # the container (a full script run each time).
         st.html(
-            r"<script>setTimeout(function () { window.location.reload(); }, 2000);</script>",
+            r"<script>setTimeout(function () { window.location.reload(); }, 8000);</script>",
             unsafe_allow_javascript=True,
         )
 
@@ -777,6 +818,11 @@ def get_scout() -> RobloxPlatformScout:
         st.session_state.scout = RobloxPlatformScout(
             db_path=(DB_PATH or ""),
             roblox_cookie=st.session_state.get("onboarding_cookie") or None,
+            # Per-session worker pool: every session gets its own, so keep it
+            # small — the process-wide ROBLOX_CALL_GATE (scout_core) is what
+            # actually bounds total outbound Roblox concurrency across all
+            # users; 8 workers per session just multiplied queue pressure.
+            max_workers=2,
         )
     return st.session_state.scout
 
@@ -804,6 +850,16 @@ def run_contact_scan(
     finally:
         progress.empty()
         status.empty()
+    # Roblox was throttling during this check: pages of lookups were skipped
+    # (NOT stored as "No Contact Found"), so say so instead of letting users
+    # read a transient verdict as ground truth.
+    if scout.throttle_window_active() and not refreshed.empty:
+        if "status" in refreshed.columns and (refreshed["status"] == THROTTLED_STATUS).any():
+            st.warning(
+                "⚠️ Roblox briefly rate-limited us — some games on this page "
+                "could not be checked and show “Throttled”. Re-run the check "
+                "on this page in a few minutes."
+            )
     # Protect the verdicts from catalog asset swaps: the hosted cache copy of
     # the catalog is fully replaced on every pipeline sync, which would
     # otherwise erase exactly the contact state the user just resolved. The
@@ -834,7 +890,10 @@ def update_contact_rows(base: pd.DataFrame, refreshed: pd.DataFrame) -> pd.DataF
 
 
 def load_existing_or_demo(scout: RobloxPlatformScout) -> tuple[pd.DataFrame, str]:
-    existing = scout.load_table()
+    # Pre-onboarding preview only: bound the read (a fresh catalog holds
+    # ~19k games plus a 100k+ row history table — parsing all of it just to
+    # decide "show demo data" made every cold visitor pay full freight).
+    existing = scout.load_catalog_matches(limit=500)
     if existing.empty:
         return demo_dataframe(), "demo"
     return existing, "db"
@@ -849,6 +908,9 @@ def reset_contact_page() -> None:
     st.session_state.contact_page = 1
     st.session_state.contact_loaded = set()
     st.session_state.contact_signature = ""
+    # A stale run id from a previous page/targets would attribute the next
+    # check's diagnostics to the wrong run — start clean each time.
+    st.session_state.active_run_id = None
 
 
 # --------------------------------------------------------------------------- #
@@ -883,7 +945,7 @@ def render_live_counter(compact: bool = True) -> None:
     60 s so the count ticks up live like a YouTube subscriber counter.
     """
     _tracker = (
-        catalog_fetch.catalog_counts(DB_PATH)
+        catalog_fetch.catalog_counts_cached(DB_PATH)
         if not _CATALOG_UNAVAILABLE
         else {"games": None, "target": None, "found_today": None, "last_sync": None}
     )
@@ -1116,7 +1178,9 @@ if sync or st.session_state.pending_initial_scan:
                 min_visits=int(min_visits),
                 min_ccu=int(min_ccu),
             )
-            st.session_state.data = data if not data.empty else empty_dataframe()
+            # Keep only what the dashboard renders in session state (see
+            # SESSION_KEEP_COLUMNS) — never the demo/DB fallback frame.
+            st.session_state.data = slim_result_frame(data) if not data.empty else empty_dataframe()
             # Keep the exact onboarding targets attached to the result set so
             # the dashboard cannot accidentally present a previous cached scan.
             st.session_state.result_target_min_visits = int(min_visits)
@@ -1126,9 +1190,10 @@ if sync or st.session_state.pending_initial_scan:
             reset_contact_page()
         except Exception as exc:
             st.session_state.scan_error = str(exc)
-            existing, source = load_existing_or_demo(scout)
-            st.session_state.data = existing
-            st.session_state.source = source
+            # On failure show a clear schema-stable empty frame; do NOT drag
+            # the whole tracked catalog (or demo data) into session state.
+            st.session_state.data = empty_dataframe()
+            st.session_state.source = "live"
             st.session_state.active_run_id = None
             reset_contact_page()
     # Defer the page-1 contact check to the NEXT rerun: running it inline
@@ -1158,7 +1223,10 @@ if st.session_state.source == "db":
         st.session_state.data = empty_dataframe()
         st.session_state.source = "live"
 
-df = st.session_state.data.copy()
+# No per-rerun .copy(): nothing in this script mutates the stored frame in
+# place (update_contact_rows returns a new frame). A full-frame copy per
+# rerun per session was pure memory churn under many concurrent users.
+df = st.session_state.data
 source = st.session_state.source
 if df.empty:
     if source == "demo":
@@ -1302,7 +1370,7 @@ if deep and page_ids:
                     metric_filtered = df.reset_index(drop=True)
                 else:
                     st.session_state.data = update_contact_rows(st.session_state.data, refreshed)
-                    df = st.session_state.data.copy()
+                    df = st.session_state.data
                     metric_filtered = apply_filters(
                         df,
                         search=search,
@@ -1431,8 +1499,16 @@ else:
 def game_url(row: pd.Series) -> str:
     place = row.get("root_place_id")
     title = truncate(str(row.get("title") or "game").strip(), 26)
-    if place and int(place) > 0:
-        return f"https://www.roblox.com/games/{int(place)}/{title}"
+    # Schema allows NULL/NaN root_place_id (demo/pipeline inserts create rows
+    # independently): int() on one must never take down the whole results
+    # table for the session — fall back to a keyword search link instead.
+    if place is not None and pd.notna(place):
+        try:
+            place_int = int(place)
+        except (TypeError, ValueError):
+            place_int = 0
+        if place_int > 0:
+            return f"https://www.roblox.com/games/{place_int}/{title}"
     return f"https://www.roblox.com/search?keyword={quote(str(row.get('title') or ''))}"
 
 

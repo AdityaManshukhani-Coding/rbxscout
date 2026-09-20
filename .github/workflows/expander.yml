@@ -16,9 +16,12 @@
 # drop one run's data. GitHub enforces the group repo-wide as a mutex;
 # `queue: max` retains pending dispatches while a run is active.
 #
-# Pilot knobs (repo Variables, optional): EXPAND_SPIDERWEB_CREATORS,
-# EXPAND_QUEUE_BATCHES, EXPAND_FRONTIER_BATCHES, EXPAND_REC_SEEDS. A 72-run
-# automated KEEP/REVERT verdict prints in every expander run log.
+# Knobs (repo Variables, optional): ATLAS_SWEEP_PAGES (index pages per daily
+# harvest, 0 = kill switch), ATLAS_STAT_PAGES (provisional first-paint rows
+# per harvest, 0 disables), ATLAS_REQUEST_DELAY (polite per-request delay),
+# ATLAS_DEEP_EVERY_DAYS (full catch-up sweep cadence). The retired engines
+# (spiderweb/frontier/recs) stay off by default (see scout_core.py retirement
+# constants) — set their EXPAND_* Variables to re-enable.
 #
 # Manual runs: Actions tab -> "Expander — Game Finder 2.0 (30 min)" -> Run workflow
 
@@ -33,10 +36,16 @@ permissions:
   contents: write   # create/update the catalog-latest release assets
 
 env:
-  # The expander never touches the search API; proxy pool stays empty.
-  RBXSCOUT_SEARCH_PROXY_URLS: ''
-  # Pilot rates (defaults live in scout_core.py): 100 creators, 10 queue
-  # batches (500 candidates), 10 frontier batches (500 fresh IDs) per run.
+  # Atlas fetches go direct by default (robots.txt allows crawling; tiny
+  # volume). Flip-ready: set this repo Variable to your proxy worker URL(s)
+  # and Atlas traffic shifts through them with zero code change.
+  RBXSCOUT_SEARCH_PROXY_URLS: ${{ vars.RBXSCOUT_SEARCH_PROXY_URLS || '' }}
+  # Atlas harvest knobs (defaults live in scout_core.py):
+  ATLAS_SWEEP_PAGES: ${{ vars.ATLAS_SWEEP_PAGES || '' }}
+  ATLAS_STAT_PAGES: ${{ vars.ATLAS_STAT_PAGES || '' }}
+  ATLAS_REQUEST_DELAY: ${{ vars.ATLAS_REQUEST_DELAY || '' }}
+  ATLAS_DEEP_EVERY_DAYS: ${{ vars.ATLAS_DEEP_EVERY_DAYS || '' }}
+  # Retired-engine overrides (all default to 0 in scout_core.py):
   EXPAND_SPIDERWEB_CREATORS: ${{ vars.EXPAND_SPIDERWEB_CREATORS || '' }}
   EXPAND_QUEUE_BATCHES: ${{ vars.EXPAND_QUEUE_BATCHES || '' }}
   EXPAND_FRONTIER_BATCHES: ${{ vars.EXPAND_FRONTIER_BATCHES || '' }}

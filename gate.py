@@ -12,8 +12,10 @@ fingering the password never locks everyone out. The file is never written
 with the password itself, only with attempt counts and timestamps.
 
 The password can be overridden per-deployment with the ``APP_PASSWORD``
-environment variable (or Streamlit secret) — the default covers the private
-deployments that just need *a* lock on the door.
+environment variable (or Streamlit secret) — there is deliberately NO
+hardcoded fallback password in this repo: anyone who can read the source
+could otherwise unlock every deployment. Set ``APP_PASSWORD`` as a Streamlit
+secret (or env var) before deploying.
 """
 
 from __future__ import annotations
@@ -22,14 +24,20 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 import time
 from pathlib import Path
 
-DEFAULT_PASSWORD = "Sep#2007"
 MAX_ATTEMPTS = 5  # wrong tries before the first cooldown kicks in
 BASE_COOLDOWN_SECONDS = 60.0  # first lockout; doubles after every further miss
 
 _UNLOCK_DAYS = 30  # how long an unlocked device stays unlocked
+
+# Serializes the read-modify-write cycles on the lock/unlock JSON files.
+# Concurrent attempts used to both read the same failure count and both
+# write it back, losing cooldown escalations; under many users that quietly
+# weakened the brute-force protection.
+_STATE_LOCK = threading.Lock()
 
 
 def _state_dir() -> Path:
@@ -46,11 +54,13 @@ def _unlock_path() -> Path:
 
 
 def _expected_password() -> str:
-    return (
-        os.environ.get("APP_PASSWORD")
-        or (st_secret := _streamlit_secret())
-        or DEFAULT_PASSWORD
-    )
+    """The deployment's password; empty when the owner never configured one.
+
+    No repo-side fallback: a password in a public repo is not a password.
+    When unset, check_password fails closed (and the UI explains why).
+    """
+    value = os.environ.get("APP_PASSWORD") or _streamlit_secret() or ""
+    return value
 
 
 def _streamlit_secret() -> str | None:
@@ -134,45 +144,58 @@ def record_failure(ref: str | None) -> float:
 
     Returns the remaining cooldown (0 while attempts are still free).
     """
-    state = _load_state()
-    key = _ref_key(ref)
-    entry = _entry(state, key)
-    if cooldown_remaining(ref) > 0:
-        return cooldown_remaining(ref)  # already locked; don't extend on retries
-    fails = int(entry.get("fails", 0)) + 1
-    locked_until = 0.0
-    locked_total = float(entry.get("locked_total", 0) or 0)
-    if fails >= MAX_ATTEMPTS:
-        # iPhone pattern: the first lockout is BASE, every further wrong try
-        # doubles the window — escalating but never permanent.
-        locked_total = BASE_COOLDOWN_SECONDS if locked_total <= 0 else locked_total * 2
-        locked_until = time.time() + locked_total
-    entry.update({"fails": fails, "locked_until": locked_until, "locked_total": locked_total})
-    state[key] = entry
-    _save_state(state)
+    with _STATE_LOCK:
+        state = _load_state()
+        key = _ref_key(ref)
+        entry = _entry(state, key)
+        if cooldown_remaining(ref) > 0:
+            return cooldown_remaining(ref)  # already locked; don't extend on retries
+        fails = int(entry.get("fails", 0)) + 1
+        locked_until = 0.0
+        locked_total = float(entry.get("locked_total", 0) or 0)
+        if fails >= MAX_ATTEMPTS:
+            # iPhone pattern: the first lockout is BASE, every further wrong try
+            # doubles the window — escalating but never permanent.
+            locked_total = BASE_COOLDOWN_SECONDS if locked_total <= 0 else locked_total * 2
+            locked_until = time.time() + locked_total
+        entry.update({"fails": fails, "locked_until": locked_until, "locked_total": locked_total})
+        state[key] = entry
+        _save_state(state)
     return max(0.0, locked_until - time.time())
 
 
 def reset_attempts(ref: str | None) -> None:
     """Clear attempt bookkeeping after a successful unlock."""
-    state = _load_state()
-    key = _ref_key(ref)
-    if key in state:
-        state.pop(key)
-        _save_state(state)
+    with _STATE_LOCK:
+        state = _load_state()
+        key = _ref_key(ref)
+        if key in state:
+            state.pop(key)
+            _save_state(state)
 
 
 def check_password(candidate: str, ref: str | None) -> str:
-    """Evaluate one unlock attempt; returns ``ok``/``cooldown``/``wrong``.
+    """Evaluate one unlock attempt; returns ``ok``/``cooldown``/``wrong``/``unconfigured``.
 
     Like iOS: while cooling down, even the correct password cannot skip the
     timer — but entering it does not add another failure either.
+
+    The device ref is NOT part of the password decision: the ref only keys
+    the lockout bookkeeping. Requiring it here too meant that visitors with
+    cookies/localStorage blocked (strict Safari settings, some privacy
+    browsers/extensions) had the CORRECT password rejected — they then burned
+    five tries into a cooldown and could never get in at all.
     """
     if not candidate:
         return "cooldown" if cooldown_remaining(ref) > 0 else "wrong"
     if cooldown_remaining(ref) > 0:
         return "cooldown"
-    if not ref or _hash(candidate) != _hash(_expected_password()):
+    expected = _expected_password()
+    if not expected:
+        # Fail closed: the owner has not configured APP_PASSWORD. Never treat
+        # this as a wrong password (no attempt burning) and never let it pass.
+        return "unconfigured"
+    if _hash(candidate) != _hash(expected):
         record_failure(ref)
         return "wrong"
     reset_attempts(ref)
@@ -204,14 +227,15 @@ def remember_unlock(ref: str | None) -> None:
     """
     key = _ref_key(ref)
     try:
-        state = _load_unlocks()
-        state[key] = time.time() + _UNLOCK_DAYS * 86400
-        target = _unlock_path()
-        target.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(state, handle)
-        os.replace(tmp_name, target)
+        with _STATE_LOCK:
+            state = _load_unlocks()
+            state[key] = time.time() + _UNLOCK_DAYS * 86400
+            target = _unlock_path()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(state, handle)
+            os.replace(tmp_name, target)
     except Exception:
         pass  # the session flag still unlocks this visit
 
@@ -227,19 +251,20 @@ def _load_unlocks() -> dict:
 def forget_unlock(ref: str | None) -> None:
     """Drop the remembered unlock (Forget this device), both key flavours."""
     try:
-        state = _load_unlocks()
-        keys = {_ref_key(ref)}
-        if ref:
-            keys.add(_ref_key(None))  # also drop a UA-fallback unlock
-        if keys & set(state):
-            for key in keys:
-                state.pop(key, None)
-            target = _unlock_path()
-            target.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(state, handle)
-            os.replace(tmp_name, target)
+        with _STATE_LOCK:
+            state = _load_unlocks()
+            keys = {_ref_key(ref)}
+            if ref:
+                keys.add(_ref_key(None))  # also drop a UA-fallback unlock
+            if keys & set(state):
+                for key in keys:
+                    state.pop(key, None)
+                target = _unlock_path()
+                target.parent.mkdir(parents=True, exist_ok=True)
+                fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(state, handle)
+                os.replace(tmp_name, target)
     except Exception:
         pass
 

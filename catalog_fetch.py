@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -109,10 +111,16 @@ def _overlay_path() -> Path:
 def load_contact_overlay() -> dict:
     """Return the overlay as ``{universe_id_str: {column: value}}``. Never raises."""
     try:
-        data = json.loads(_overlay_path().read_text())
+        data = json.loads(_overlay_path().read_text(encoding="utf-8"))
     except Exception:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+# Serializes overlay read-modify-write cycles across all user sessions (see
+# record_contacts: last-writer-wins here silently dropped other sessions'
+# freshly resolved verdicts).
+_OVERLAY_LOCK = threading.Lock()
 
 
 def _jsonable(value):
@@ -141,28 +149,46 @@ def record_contacts(records: dict) -> None:
     A failed write must never break the caller: the authoritative write
     already happened in the catalog DB; the overlay only protects it from
     the next asset replacement.
+
+    Concurrency-safe: a process-wide lock serializes the read-modify-write
+    (two sessions merging at once used to lose one side's rows), and the
+    file is written to a temp file + os.replace so a reader can never see a
+    half-written JSON (a torn file used to parse as {} and the next write
+    then persisted ONLY the new records — silently erasing every verdict
+    accumulated so far).
     """
     if not records:
         return
-    overlay = load_contact_overlay()
-    for uid, rec in records.items():
-        try:
-            overlay[str(int(uid))] = {
-                col: _jsonable(rec.get(col)) for col in CONTACT_COLUMNS
-            }
-        except (TypeError, ValueError, AttributeError):
-            continue
-    if len(overlay) > OVERLAY_MAX_ROWS:
-        # Keep the newest rows by checked timestamp; oldest fall off.
-        keep = sorted(
-            overlay.items(),
-            key=lambda kv: str((kv[1] or {}).get("contacts_checked_at") or ""),
-            reverse=True,
-        )[:OVERLAY_MAX_ROWS]
-        overlay = dict(keep)
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        _overlay_path().write_text(json.dumps(overlay))
+        with _OVERLAY_LOCK:
+            overlay = load_contact_overlay()
+            for uid, rec in records.items():
+                try:
+                    overlay[str(int(uid))] = {
+                        col: _jsonable(rec.get(col)) for col in CONTACT_COLUMNS
+                    }
+                except (TypeError, ValueError, AttributeError):
+                    continue
+            if len(overlay) > OVERLAY_MAX_ROWS:
+                # Keep the newest rows by checked timestamp; oldest fall off.
+                keep = sorted(
+                    overlay.items(),
+                    key=lambda kv: str((kv[1] or {}).get("contacts_checked_at") or ""),
+                    reverse=True,
+                )[:OVERLAY_MAX_ROWS]
+                overlay = dict(keep)
+            fd, tmp_name = tempfile.mkstemp(dir=str(CACHE_DIR), suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(overlay, handle)
+                os.replace(tmp_name, _overlay_path())
+            except Exception:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+                raise
     except Exception:
         pass  # overlay is an optimization, never a dependency
 
@@ -422,6 +448,40 @@ def stale_cache_fallback(exc: CatalogFetchError) -> Path | None:
 # ---------------------------------------------------------------------------
 # Counters for the dashboard tracker band
 # ---------------------------------------------------------------------------
+
+# Process-wide 60 s cache for catalog_counts. The dashboard renders the
+# tracker band on every rerun and the live view refreshes it every 60 s per
+# open tab; without the cache that is one heavy GROUP BY over the full
+# ccu_history table PER TAB PER MINUTE on a container that must also serve
+# real users. With it, the aggregate runs at most once per minute for the
+# whole process no matter how many tabs are open.
+COUNTS_CACHE_TTL = 60  # seconds
+_COUNTS_CACHE: dict = {}
+_COUNTS_CACHE_LOCK = threading.Lock()
+
+
+def catalog_counts_cached(db_path: str | Path) -> dict:
+    """60-second cached wrapper around catalog_counts (see note above)."""
+    key = str(Path(db_path))
+    now = time.monotonic()
+    with _COUNTS_CACHE_LOCK:
+        entry = _COUNTS_CACHE.get(key)
+        if entry and now - entry[0] < COUNTS_CACHE_TTL:
+            return dict(entry[1])
+    value = catalog_counts(db_path)
+    with _COUNTS_CACHE_LOCK:
+        # Keep only the current path's entry: the cached copy is at most one
+        # TTL stale for a counter band, never a correctness surface.
+        _COUNTS_CACHE.clear()
+        _COUNTS_CACHE[key] = (now, value)
+    return dict(value)
+
+
+def _reset_counts_cache() -> None:
+    """Test/ops hook: drop the cached counters (fresh read on next call)."""
+    with _COUNTS_CACHE_LOCK:
+        _COUNTS_CACHE.clear()
+
 
 def catalog_counts(db_path: str | Path) -> dict:
     """Read-only counters for the dashboard's live tracker band.

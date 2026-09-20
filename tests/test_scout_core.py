@@ -236,9 +236,12 @@ def test_contact_tier_group_then_user():
     assert rec["discord_url"] == "https://discord.gg/groupbio"
     assert rec["found_via"] == "group_description"
 
-    # Individual creator bios are intentionally not part of the contact pipeline.
+    # Individual creator bios are intentionally not part of the contact
+    # pipeline. (Different universe id: the process-wide contact memcache —
+    # one of the 400-user load fixes — shares verdicts per game, so the
+    # second scenario must not reuse id 9.)
     s = MockScout({"users/7": {"description": "msg me discord.gg/userbio"}})
-    rec = s.resolve_game_contact({"universe_id": 9, "creator_type": "User", "creator_id": 7,
+    rec = s.resolve_game_contact({"universe_id": 10, "creator_type": "User", "creator_id": 7,
                                   "description": ""})
     assert rec["discord_url"] is None
     assert rec["status"] == "No Contact Found"
@@ -951,6 +954,48 @@ def test_prune_catalog_observed_death_rule(tmp_path):
     assert strikes == 1
     assert scout.prune_catalog() == 0
     assert TIER8_STALE_PRUNE_DAYS == 14 and ZERO_CCU_STRIKES_TO_PRUNE == 4
+
+
+def test_prune_clears_queue_memory_for_rediscovery(tmp_path):
+    """Prune must also purge the game's discovery_queue rows. The queue is
+    dedup memory — a stale 'qualified' row would permanently block Atlas from
+    re-enqueuing a pruned game that later revives (viral resurgence, update,
+    seasonal return). After prune, re-enqueueing must create a fresh pending
+    row, i.e. the daily harvest can re-discover it."""
+    db = str(tmp_path / "t.db")
+    scout = RobloxPlatformScout(db_path=db)
+    scout.upsert_game({"universe_id": 77, "title": "Revival candidate", "ccu": 0, "visits": 900})
+    scout._enqueue_discovery([(77, "atlas_dev", 2)])
+    scout._mark_discovery_outcome(77, "qualified")  # exactly what the drain wrote
+
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT status, outcome FROM discovery_queue WHERE universe_id=77"
+        ).fetchone()
+    assert row == ("processed", "qualified")
+
+    # Four consecutive observed deaths -> prune fires (the row-creating
+    # INSERT does not count as a strike; only re-visits do).
+    for _ in range(4):
+        scout.upsert_game({"universe_id": 77, "title": "Revival candidate", "ccu": 0, "visits": 900})
+    assert scout.prune_catalog() == 1
+
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM game_analytics WHERE universe_id=77").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM discovery_queue WHERE universe_id=77").fetchone()[0] == 0
+
+    # The revived game looks brand-new to the harvester: a fresh pending row
+    # is created instead of being silently deduped against the corpse's memory.
+    assert scout._enqueue_discovery([(77, "atlas_dev", 2)]) == 1
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT status, source FROM discovery_queue WHERE universe_id=77"
+        ).fetchone()
+    assert row == ("pending", "atlas_dev")
+
+    # Sanity: prune returns 0 when there is nothing to prune (no crash on
+    # the empty-doomed-list fast path).
+    assert scout.prune_catalog() == 0
 
 
 def test_scheduler_picks_tiers_by_cadence_and_orders_first_in_line(tmp_path):

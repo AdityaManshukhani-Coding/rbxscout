@@ -1,6 +1,15 @@
 # 🌐 Expansion Pilot — Creator Spiderwebbing + Frontier Scan
 
 **Status:** LIVE code, shipped 2026-09-17 · **Gate:** strict 20k visits / 25 CCU
+**Update 2026-09-19:** **Atlas Dev seed ingestion is LIVE** (see
+`ATLAS_PLAN_REVIEW.md`) and is now the primary discovery source. Full
+275-page sweep measured: 12,119 games indexed, **654 genuinely new games
+crossed the strict gate** (catalog 23,883 → 24,537). Head pages run ~65–74%
+new but the full index averages ~23% new — the drain's free catalog-check
+absorbs the overlap. Spiderweb/frontier/recs are **retired to
+zero by default** (env-re-enablable); the queue drain + strict gate are
+unchanged and now hydrate Atlas seeds. Finder's discovery workflow is guarded
+off (`FINDER_ENABLED=1` re-enables); the hydrator is untouched.
 **Where the results appear:** the `EXPANSION PILOT` block at the bottom of
 every expander run log, plus the `expansion pilot : warming up …` line in the
 capacity-pilot block of *every* workflow's log (it reads `sync_health_log`).
@@ -23,6 +32,7 @@ engines, without abandoning the scout philosophy (nothing dead is stored).
 |---|---|---|
 | **Creator spiderwebbing** | Crawls the public portfolios of every creator already in the catalog (14,649 unique creators: 11,931 groups / 2,718 users). Portfolio payloads carry `placeVisits` free, so candidates below 20k visits are discarded **before** any hydration request. Survivors enter the discovery queue at priority 1. | ~1 request per creator (page size 100 groups / 50 users, cursor-followed) |
 | **Recommendations mining** (2026-09-19) | Harvests Roblox's player-overlap graph: for each seed game, `/v1/games/recommendations/game/{id}` returns ~6 games its players also play. Seeds are chosen ONLY from the small band (20k–100k visits) plus the 200 most recent expansion qualifiers — giant seeds return 100% already-known games. New IDs enter the queue at priority 2. A rotation cursor in `scan_pointers` (id `rec_seed`) sweeps the pool so runs never repeat seeds. | 1 lightweight GET per seed (default 50/run) |
+| **Atlas Dev ingestion** (2026-09-19) | Once-daily harvest of atlasdev.gg/analyze (games pre-filtered to ≥20k visits, ≥25 CCU) → discovery_queue at `atlas_dev` priority 2. 24h self-throttle, deep-sweep page cursor, honest UA, ~1 req/3 s, 429 bail-out, proxy flip via `RBXSCOUT_SEARCH_PROXY_URLS`. Optional budgeted provisional first-paint rows from game-page meta text (never into `ccu_history`). | 1 request per index page + `ATLAS_STAT_PAGES` game pages |
 | **Frontier scan** | Walks universe IDs upward from the highest known ID (seeded at 10,765,584,604). Roblox assigns IDs as increasing integers, so this range is where brand-new games appear — the ones that can cross 20k visits within days of launch. 1 request per 50 IDs. | 1 request per 50 IDs |
 
 Both feed a **priority discovery queue** (spiderweb=1, seed=2, sequential=3),

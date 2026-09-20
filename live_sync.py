@@ -149,6 +149,7 @@ def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float, mode: st
     # runs, where scan['expansion'] is populated.
     expansion = scan.get("expansion") or {}
     if expansion:
+        atlas = expansion.get("atlas") or {}
         web = expansion.get("spiderweb") or {}
         recs = expansion.get("rec_mining") or {}
         drain = expansion.get("drain") or {}
@@ -156,6 +157,11 @@ def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float, mode: st
         print("\n" + "-" * 62)
         print("EXPANSION PILOT (strict gate: 20k visits / 25 CCU)")
         print("-" * 62)
+        print(f"atlas dev         : {atlas.get('pages_fetched', 0)} pages · "
+              f"{atlas.get('fetched_ids', 0):,} IDs · {atlas.get('enqueued', 0):,} NEW enqueued · "
+              f"{atlas.get('provisional_rows', 0)} first-paint rows"
+              + ("  · THROTTLED (next window)" if atlas.get("throttled") else "")
+              + ("  · ABORTED (retry next run)" if atlas.get("aborted") else ""))
         print(f"spiderweb         : {web.get('crawled', 0)} crawled · {web.get('empty', 0)} empty · "
               f"{web.get('failed', 0)} failed (retried next run)")
         print(f"  games found     : {web.get('games_found', 0):,} · pre-gate pass: "

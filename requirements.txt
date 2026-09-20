@@ -1,4 +1,9 @@
-streamlit>=1.39
-pandas>=2.0
-requests>=2.31
-pytest>=8.0
+# Pinned exactly (no ranges): Streamlit Cloud re-installs on every redeploy,
+# so ">= " pins made any future major release silently break the app with zero
+# repo changes. Upgrade deliberately, one PR at a time, and re-pin here.
+# Verified against the working deployment 2026-09-18.
+streamlit==1.62.0
+pandas==3.0.5
+requests==2.34.2
+numpy==2.5.2
+pytest==9.1.1

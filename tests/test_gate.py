@@ -5,6 +5,7 @@ import json
 import pytest
 
 import gate
+from conftest import TEST_PASSWORD
 
 
 @pytest.fixture()
@@ -13,7 +14,7 @@ def ref():
 
 
 def test_correct_password_unlocks_and_resets(ref):
-    assert gate.check_password("Sep#2007", ref) == "ok"
+    assert gate.check_password(TEST_PASSWORD, ref) == "ok"
     assert gate.attempts_left(ref) == gate.MAX_ATTEMPTS  # bookkeeping cleared
     assert gate.cooldown_remaining(ref) == 0.0
 
@@ -50,7 +51,7 @@ def test_correct_password_during_cooldown_does_not_bypass_or_extend(ref):
     for _ in range(gate.MAX_ATTEMPTS):
         gate.check_password("nope", ref)
     remaining = gate.cooldown_remaining(ref)
-    assert gate.check_password("Sep#2007", ref) == "cooldown"  # iOS behaviour
+    assert gate.check_password(TEST_PASSWORD, ref) == "cooldown"  # iOS behaviour
     assert abs(gate.cooldown_remaining(ref) - remaining) < 2.0  # timer untouched
     assert gate.attempts_left(ref) == 0
 

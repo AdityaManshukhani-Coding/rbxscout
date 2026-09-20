@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import calendar
 import random
 import re
 import sqlite3
@@ -37,6 +38,66 @@ import pandas as pd
 import requests
 
 log = logging.getLogger("rbxscout")
+
+# --------------------------------------------------------------------------- #
+# Process-wide outbound throttling (multi-user safety)
+# --------------------------------------------------------------------------- #
+# Streamlit runs one thread per browser session inside a single process, and
+# every session gets its own RobloxPlatformScout with its own worker pool.
+# Without a shared cap, N users checking pages at once fire N × 8 concurrent
+# Roblox calls from ONE container IP → 429/403 storms → the IP gets throttled
+# and every verdict resolved during the storm comes back empty and is then
+# cached for hours. This semaphore bounds TOTAL in-flight Roblox HTTP calls
+# for the whole process no matter how many sessions exist; extra callers wait
+# (spinner) instead of triggering a ban.
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(name, "") or default))
+    except (TypeError, ValueError):
+        return default
+
+
+ROBLOX_CALL_GATE = threading.BoundedSemaphore(
+    _env_int("SS_MAX_PARALLEL_ROBLOX_CALLS", 4)
+)
+
+# Process-wide short-lived contact-verdict cache. 400 users paging through the
+# same popular games must not re-resolve the same universe 400 times in a row:
+# the first resolution is shared with everyone for CONTACT_MEMCACHE_TTL
+# seconds. (The DB-level CONTACT_RECHECK_HOURS cache remains authoritative.)
+CONTACT_MEMCACHE_TTL = 300.0  # seconds
+_CONTACT_MEMCACHE: Dict[int, Tuple[float, Dict[str, Any]]] = {}
+_CONTACT_MEMCACHE_LOCK = threading.Lock()
+_CONTACT_MEMCACHE_MAX = 2_000  # entries; well under a MB — no memory risk
+
+
+def _contact_memcache_get(uid: int) -> Optional[Dict[str, Any]]:
+    with _CONTACT_MEMCACHE_LOCK:
+        hit = _CONTACT_MEMCACHE.get(uid)
+        if not hit:
+            return None
+        ts, record = hit
+        if time.time() - ts > CONTACT_MEMCACHE_TTL:
+            _CONTACT_MEMCACHE.pop(uid, None)
+            return None
+        return dict(record)
+
+
+def _contact_memcache_put(uid: int, record: Dict[str, Any]) -> None:
+    with _CONTACT_MEMCACHE_LOCK:
+        if len(_CONTACT_MEMCACHE) >= _CONTACT_MEMCACHE_MAX:
+            oldest = min(_CONTACT_MEMCACHE, key=lambda k: _CONTACT_MEMCACHE[k][0])
+            _CONTACT_MEMCACHE.pop(oldest, None)
+        _CONTACT_MEMCACHE[uid] = (time.time(), dict(record))
+
+
+# Serializes dashboard-write bursts in this process. SQLite (even WAL) allows
+# one writer at a time; serializing the short verdict writes here is much
+# cheaper than letting them fight for the file lock ("database is locked") —
+# and unlike the file lock, losing that fight means a *silently dropped* write.
+DB_WRITE_LOCK = threading.Lock()
 
 # --------------------------------------------------------------------------- #
 # Regexes
@@ -94,6 +155,10 @@ BROWSER_HEADERS = {
 
 ROBLOX_BASE = "https://www.roblox.com"
 CONTACT_RECHECK_HOURS = 6  # skip re-resolving contacts more often than this
+# Transient verdict used while Roblox is throttling this IP: shown as-is by the
+# dashboard but NEVER persisted, so no game is ever poisoned with a fake
+# "No Contact Found" just because the container hit a rate-limit window.
+THROTTLED_STATUS = "Throttled — try again shortly"
 # Bulk place→universe resolution goes through the RoProxy mirror first:
 # direct apis.roblox.com rate-limits this endpoint to ~60 requests per
 # window per IP (measured 2026-09-02: 200×60 then sustained 429s), which
@@ -139,12 +204,43 @@ EXPAND_FRONTIER_BATCHES_DEFAULT = 10     # 10 x 50 = 500 fresh IDs/run (~24k/day
 EXPAND_REC_SEEDS_DEFAULT = 50            # recommendations requests per expand run
 REC_SEED_RECENT_CAP = 200                # top-up pool: newest expansion qualifiers
 EXPANSION_QUEUE_MAX_ROWS = 2_000_000     # dedup-memory ceiling (trim oldest)
+# Retirement (2026-09-19, ATLAS_PLAN_REVIEW.md §6): the discovery engines are
+# superseded by Atlas seed ingestion. Defaults move to 0 (full off, no code
+# edit needed to re-enable — set the env var); the queue drain keeps its
+# budget because it hydrates Atlas seeds through the strict gate.
+EXPAND_SPIDERWEB_CREATORS_RETIRED = 0
+EXPAND_FRONTIER_BATCHES_RETIRED = 0
+EXPAND_REC_SEEDS_RETIRED = 0
 # Verified live 2026-09-19: returns ~6 rows/page, maxRows ignored, pagination
 # repeats the same page (36 rows over 6 pages -> 6 unique). Small/low-CCU
 # games can return 0 rows (empty rec graph). Rows carry creator id/type free.
 REC_RECOMMENDATIONS_URL = (
     "https://games.roblox.com/v1/games/recommendations/game/{universe_id}"
 )
+
+# --------------------------------------------------------------------------- #
+# Atlas Dev seed ingestion (ATLAS_PLAN_REVIEW.md — proven live 2026-09-19).
+# atlasdev.gg/analyze lists mid-tier games (>=20k visits, >=25 CCU) — exactly
+# the band the strict gate targets. Replaces the retired discovery engines
+# (frontier: 0 qualified from 11,500 evaluated; spiderweb: 37 qualifiers
+# ever; recs: ~0.4 new IDs/request vs Atlas's ~65-74% new per page).
+# Discovery only: Atlas exposes NO stats API — CCU/visits exist solely as
+# SEO meta text on game pages, usable at most for a provisional first-paint
+# row (found_via='atlas_dev') that the hydrator overwrites with fresh Roblox
+# stats. ccu_history is NEVER written from Atlas data; the strict gate
+# always verifies via Roblox.
+# --------------------------------------------------------------------------- #
+ATLAS_BASE_URL = "https://atlasdev.gg/analyze"
+ATLAS_QUERY = "sort=totalVisits&dir=asc&totalVisitsMin=20000&ccuMin=25"
+ATLAS_PRIORITY_DEFAULT = 2          # queue tier: above frontier(3), below spiderweb(1)
+ATLAS_HOURS_DEFAULT = 24            # self-throttle: at most one harvest per day
+ATLAS_SWEEP_PAGES_DEFAULT = 3       # steady-state pages per daily harvest
+ATLAS_DEEP_PAGES_DEFAULT = 275      # one-off catch-up sweep ceiling (full index)
+ATLAS_DEEP_EVERY_DAYS_DEFAULT = 30  # re-run the deep sweep this often (0 = never)
+ATLAS_STAT_PAGES_DEFAULT = 100      # provisional first-paint rows per harvest
+ATLAS_REQUEST_DELAY_DEFAULT = 3.0   # polite per-request delay (seconds)
+ATLAS_USER_AGENT = "RbxScout/1.0 (Roblox game discovery; contact via repo)"
+ATLAS_PROXY_URLS_ENV = "RBXSCOUT_SEARCH_PROXY_URLS"  # flip-ready: shared pool var
 
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -533,6 +629,9 @@ class RobloxPlatformScout:
         self._sync_counter_path = Path(self.db_path + ".sync_state")
         self._sync_seq = self._load_sync_sequence()
         self._lock = threading.Lock()
+        # Run rows this instance created (see _finish_scan): dashboard
+        # sessions never own one, so they never rewrite pipeline rows.
+        self._own_run_ids: set = set()
         # Token-bucket pacer shared by ALL batched outbound calls (metric
         # batches, keyword slices, icons). Live evidence 2026-09-03:
         # games.roblox.com grants ~11 metric batches (≈550 games) per window
@@ -593,33 +692,63 @@ class RobloxPlatformScout:
             self._emit_interval = min(self.EMIT_MAX_INTERVAL, max(self._emit_interval, 0.2) * 1.6)
             self._next_emit = max(self._next_emit, time.monotonic() + 2.0)
 
+    THROTTLE_BACKOFF_SECONDS = 120.0
+    _throttle_until = 0.0
+    _throttle_lock = threading.Lock()
+
+    def _mark_throttled(self) -> None:
+        """A 429 from Roblox: put the whole process on a short contact-lookup
+        pause so pages being checked right now skip the rest of their lookups
+        instead of piling more calls onto a throttled IP (which is how empty
+        verdicts and IP flags happen)."""
+        with RobloxPlatformScout._throttle_lock:
+            RobloxPlatformScout._throttle_until = max(
+                RobloxPlatformScout._throttle_until,
+                time.time() + self.THROTTLE_BACKOFF_SECONDS,
+            )
+
+    def throttle_window_active(self) -> bool:
+        with RobloxPlatformScout._throttle_lock:
+            return time.time() < RobloxPlatformScout._throttle_until
+
     def _get_json(self, url: str, retries: int = 2) -> Tuple[int, Optional[Any]]:
-        """Polite GET -> (status, json-or-None). Retries transient failures."""
+        """Polite GET -> (status, json-or-None). Retries transient failures.
+
+        Every HTTP call passes through the process-wide ROBLOX_CALL_GATE so
+        total outbound concurrency stays bounded across all user sessions.
+        The gate is held across retries (the point is to bound in-flight
+        traffic, and a retry that backs off 0.6–1.2 s keeps a slot only for
+        that long). ``self.throttled`` flips True for a short window after a
+        429 so per-page orchestration can skip further lookups instead of
+        hammering a throttled IP and caching empty verdicts.
+        """
         status, data = 0, None
-        for attempt in range(retries + 1):
-            try:
-                time.sleep(random.uniform(0.02, 0.10))  # gentle rate limiting
-                res = self.session.get(url, timeout=self.request_timeout)
-                if res.status_code == 200:
-                    try:
-                        self._emit_ok()
-                        return 200, res.json()
-                    except ValueError:
-                        self._emit_ok()
-                        return 200, None
-                status = res.status_code
-                if status == 429:
-                    self._emit_throttled()
-                if status not in self.TRANSIENT_STATUSES or attempt >= retries:
-                    return status, None
-                retry_after = float(res.headers.get("Retry-After") or 0)
-                time.sleep(max(retry_after, 0.6 * (attempt + 1)))
-            except requests.RequestException as exc:
-                status = 0
-                if attempt >= retries:
-                    log.debug("GET failed %s: %s", url, exc)
-                    return 0, None
-                time.sleep(0.5 * (attempt + 1))
+        with ROBLOX_CALL_GATE:
+            for attempt in range(retries + 1):
+                try:
+                    time.sleep(random.uniform(0.02, 0.10))  # gentle rate limiting
+                    res = self.session.get(url, timeout=self.request_timeout)
+                    if res.status_code == 200:
+                        try:
+                            self._emit_ok()
+                            return 200, res.json()
+                        except ValueError:
+                            self._emit_ok()
+                            return 200, None
+                    status = res.status_code
+                    if status == 429:
+                        self._emit_throttled()
+                        self._mark_throttled()
+                    if status not in self.TRANSIENT_STATUSES or attempt >= retries:
+                        return status, None
+                    retry_after = float(res.headers.get("Retry-After") or 0)
+                    time.sleep(max(retry_after, 0.6 * (attempt + 1)))
+                except requests.RequestException as exc:
+                    status = 0
+                    if attempt >= retries:
+                        log.debug("GET failed %s: %s", url, exc)
+                        return 0, None
+                    time.sleep(0.5 * (attempt + 1))
         return status, data
 
     # ------------------------------------------------------------------ #
@@ -753,6 +882,10 @@ class RobloxPlatformScout:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=15)
         conn.execute("PRAGMA journal_mode=WAL")
+        # Wait up to 15 s for a competing writer instead of failing instantly;
+        # combined with the process-wide DB_WRITE_LOCK this makes concurrent
+        # dashboard writes serialize instead of erroring.
+        conn.execute("PRAGMA busy_timeout=15000")
         return conn
 
     def _init_sqlite(self) -> None:
@@ -1019,7 +1152,11 @@ class RobloxPlatformScout:
                 "INSERT INTO scan_runs (status, started_at) VALUES ('running', ?)",
                 (time.strftime("%Y-%m-%d %H:%M:%S"),),
             )
-            return int(cursor.lastrowid)
+            run_id = int(cursor.lastrowid)
+            own = getattr(self, "_own_run_ids", None)
+            if own is not None:
+                own.add(run_id)
+            return run_id
 
     def _finish_scan(self, **extra: Any) -> None:
         """Persist the full scan snapshot.
@@ -1028,9 +1165,18 @@ class RobloxPlatformScout:
         this without arguments; any keyword arguments passed here override the
         snapshot. Everything is written to the DB row so a restart shows the
         real status and counters instead of a stuck 'running' row.
+
+        Only runs THIS instance created via ``_begin_scan`` are ever written:
+        a dashboard session is a read-only catalog consumer, so its synthetic
+        in-memory run must never rewrite the pipeline's persisted rows (they
+        feed the "last sync" tracker).
         """
         run_id = self.last_scan.get("run_id")
         if not run_id:
+            return
+        own = getattr(self, "_own_run_ids", None)
+        if own is not None and run_id not in own:
+            self.last_scan = {**self.last_scan, **extra}
             return
         allowed = {"status", "source_count", "metrics_count", "contacts_attempted", "contacts_completed", "contact_errors", "candidate_count", "matched_count", "candidate_limit", "min_visits", "min_ccu", "error"}
         merged = {**self.last_scan, **extra}
@@ -1042,15 +1188,13 @@ class RobloxPlatformScout:
         self.last_scan = {**self.last_scan, **values}
 
     def _persist_diagnostic(self, run_id: Optional[int], uid: int, diagnostics: Dict[str, Any]) -> None:
-        import json
-        try:
-            with self._connect() as conn:
-                conn.execute(
-                    "INSERT INTO contact_diagnostics (run_id, universe_id, diagnostics_json) VALUES (?,?,?)",
-                    (run_id, uid, json.dumps(diagnostics)),
-                )
-        except sqlite3.Error as exc:
-            log.debug("Could not persist contact diagnostics for %s: %s", uid, exc)
+        # Memory-only by design under multi-user load: diagnostics are UI
+        # snapshots, not data. Persisting one row per resolved game turned
+        # every user page-view into a burst of write transactions on the
+        # shared catalog file — the main source of "database is locked"
+        # losses. The authoritative contact state still reaches the DB via
+        # _store_contact_verdicts_batch (one transaction per page).
+        return None
 
     def _set_contact_diagnostic(self, run_id: Optional[int], uid: int, diagnostics: Dict[str, Any]) -> None:
         """Update the UI snapshot and persist one diagnostic without breaking mocks."""
@@ -1082,12 +1226,17 @@ class RobloxPlatformScout:
             except sqlite3.Error as exc:
                 log.warning("Could not persist failed scan: %s", exc)
 
-    def upsert_game(self, record: Dict[str, Any]) -> None:
+    def upsert_game(self, record: Dict[str, Any], record_ccu_history: bool = True) -> None:
         """Insert/update metrics; peak_ccu grows via MAX(existing, current).
 
         Tier stamping happens automatically: the new tier is computed from the
         incoming stats, prev_tier keeps the last stamp (2+-tier climbs and 3x
         CCU jumps raise blowup_flag for the New and Upcoming watchlist).
+
+        ``record_ccu_history=False`` (Atlas provisional first-paint rows) skips
+        the ccu_history snapshot: Atlas numbers are cached third-party prose,
+        and letting them into the trend table would corrupt hydrator-built
+        history. The hydrator's next refresh writes the first real snapshot.
         """
         uid = record.get("universe_id")
         if uid is not None and record.get("tier") is None:
@@ -1166,7 +1315,7 @@ class RobloxPlatformScout:
                     record.get("blowup_at"),
                 ),
             )
-            if record.get("ccu") is not None:
+            if record.get("ccu") is not None and record_ccu_history:
                 # Microsecond-precision local timestamp. SQLite's
                 # strftime('%f') only has millisecond precision, so two
                 # rapid upserts shared one ts and the PRIMARY KEY silently
@@ -1275,6 +1424,7 @@ class RobloxPlatformScout:
         min_visits: int = 0,
         min_ccu: int = 0,
         discord: Optional[bool] = None,
+        limit: Optional[int] = None,
     ) -> pd.DataFrame:
         """Instant result set: games already in the catalog that meet the targets.
 
@@ -1297,6 +1447,7 @@ class RobloxPlatformScout:
         """
         min_visits = max(0, int(min_visits or 0))
         min_ccu = max(0, int(min_ccu or 0))
+        limit = max(0, int(limit)) if limit is not None else None
         where = ["COALESCE(visits, 0) >= ?", "COALESCE(ccu, 0) >= ?"]
         params: List[int] = [min_visits, min_ccu]
         if discord is True:
@@ -1316,7 +1467,8 @@ class RobloxPlatformScout:
                 return pd.read_sql_query(
                     "SELECT * FROM game_analytics "
                     f"WHERE {' AND '.join(where)} "
-                    "ORDER BY COALESCE(visits, 0) ASC, COALESCE(ccu, 0) ASC",
+                    "ORDER BY COALESCE(visits, 0) ASC, COALESCE(ccu, 0) ASC"
+                    + (f" LIMIT {int(limit)}" if limit else ""),
                     conn,
                     params=tuple(params),
                 )
@@ -2030,24 +2182,45 @@ class RobloxPlatformScout:
         never re-observed are caught by ``max_age_days`` staleness as a
         fallback: 0-CCU rows not seen for 14 days still die.
         Returns rows removed.
+
+        Pruned games' ``discovery_queue`` rows are deleted in the same
+        transaction: the queue is dedup memory, so a stale ``qualified`` row
+        would otherwise block Atlas (or any engine) from ever re-enqueuing a
+        pruned game that later revives. Clearing the row lets the daily
+        harvest naturally re-discover it through the strict gate.
         """
         try:
             with self._connect() as conn:
-                cursor = conn.execute(
-                    "DELETE FROM game_analytics "
-                    "WHERE COALESCE(ccu, 0) = 0 AND COALESCE(zero_ccu_strikes, 0) >= ?",
-                    (int(max_strikes),),
-                )
-                removed = cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
-                cursor = conn.execute(
-                    "DELETE FROM game_analytics "
-                    "WHERE COALESCE(ccu, 0) = 0 "
-                    "AND COALESCE(last_updated, '1970-01-01') < datetime('now', ?)",
-                    (f"-{int(TIER8_STALE_PRUNE_DAYS)} days",),
-                )
-                removed += cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+                doomed = [int(r[0]) for r in conn.execute(
+                    "SELECT universe_id FROM game_analytics "
+                    "WHERE COALESCE(ccu, 0) = 0 AND ("
+                    "  COALESCE(zero_ccu_strikes, 0) >= ?"
+                    "  OR COALESCE(last_updated, '1970-01-01') < datetime('now', ?)"
+                    ")",
+                    (int(max_strikes), f"-{int(TIER8_STALE_PRUNE_DAYS)} days"),
+                )]
+                if not doomed:
+                    return 0
+                removed = 0
+                for i in range(0, len(doomed), 900):
+                    chunk = doomed[i : i + 900]
+                    marks = ",".join("?" for _ in chunk)
+                    cur = conn.execute(
+                        f"DELETE FROM game_analytics WHERE universe_id IN ({marks})",
+                        chunk,
+                    )
+                    removed += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                    # Re-discovery unblock: purge every queue memory of the
+                    # corpse (any source/status — it must look brand-new).
+                    conn.execute(
+                        f"DELETE FROM discovery_queue WHERE universe_id IN ({marks})",
+                        chunk,
+                    )
             if removed:
-                log.info("Catalog floor-prune removed %d dead games", removed)
+                log.info(
+                    "Catalog floor-prune removed %d dead games (queue rows cleared for re-discovery)",
+                    removed,
+                )
             return removed
         except sqlite3.Error as exc:
             log.debug("Catalog floor-prune failed: %s", exc)
@@ -2338,6 +2511,12 @@ class RobloxPlatformScout:
         if not hasattr(self, "last_contact_diagnostics"):
             self.last_contact_diagnostics = {}
 
+        # Process-wide dedupe: another session may have resolved this exact
+        # game seconds ago — share that verdict instead of re-hitting Roblox.
+        shared = _contact_memcache_get(int(uid))
+        if shared is not None and not force:
+            return shared
+
         cached = self._load_contact_cache(uid)
         if cached and not force and now - cached["ts"] < CONTACT_RECHECK_HOURS * 3600:
             self._set_contact_diagnostic(run_id, uid, {
@@ -2346,6 +2525,27 @@ class RobloxPlatformScout:
                 "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             })
             return cached["record"]
+
+        # Roblox is actively throttling this IP (any session's 429 sets the
+        # flag). Skip live resolution entirely instead of hammering the IP and
+        # caching empty verdicts for hours. The verdict is NOT persisted — the
+        # game simply keeps its unchecked state and the next attempt re-runs.
+        if self.throttle_window_active():
+            self._set_contact_diagnostic(run_id, uid, {
+                "cached": False,
+                "throttled": True,
+                "selected_source": None,
+                "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            return {
+                "universe_id": int(uid),
+                "has_discord": False,
+                "discord_url": None,
+                "status": THROTTLED_STATUS,
+                "found_via": None,
+                "has_social_links": False,
+                "contacts_checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
 
         diagnostics: Dict[str, Any] = {}
 
@@ -2425,6 +2625,7 @@ class RobloxPlatformScout:
             "contacts_checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         self._store_contact_cache(uid, record)
+        _contact_memcache_put(int(uid), record)
         return record
 
     def _load_contact_cache(self, universe_id: int) -> Optional[Dict[str, Any]]:
@@ -2443,9 +2644,13 @@ class RobloxPlatformScout:
         # sources — treat them as missing so the next check re-resolves live.
         if not row or not row[5] or int(row[6] or 0) != CONTACT_RESOLVER_VERSION:
             return None
+        # contacts_checked_at is stored naive-but-UTC (the pipeline writes
+        # UTC everywhere); parse it as UTC, not server-local time. mktime
+        # would skew the 6-hour recheck window by the host's UTC offset.
         try:
-            ts = time.mktime(time.strptime(str(row[5]), "%Y-%m-%d %H:%M:%S"))
-        except ValueError:
+            parsed = time.strptime(str(row[5]), "%Y-%m-%d %H:%M:%S")
+            ts = calendar.timegm(parsed)
+        except (ValueError, OverflowError):
             return None
         return {
             "ts": ts,
@@ -2480,6 +2685,55 @@ class RobloxPlatformScout:
                 )
         except sqlite3.Error:
             pass
+
+    def _store_contact_verdicts_batch(self, records: Dict[int, Dict[str, Any]]) -> None:
+        """Persist a page of contact verdicts in ONE transaction.
+
+        Per-page checking used to open ~3 short write transactions per game
+        (verdict + diagnostic + counter updates) on a shared SQLite file —
+        dozens of concurrent writers per page across sessions, each error
+        swallowed, so lost writes surfaced only as mysteriously empty results.
+        This batches the verdict UPDATEs (the data that matters) into a single
+        locked transaction; diagnostics stay in memory only (they are UI
+        snapshots, not data — a restart losing the last page of them is
+        harmless and by design).
+        """
+        if not records:
+            return
+        rows = []
+        for uid, record in records.items():
+            try:
+                rows.append(
+                    (
+                        bool(record.get("has_discord")),
+                        record.get("discord_url"),
+                        str(record.get("status") or ""),
+                        record.get("found_via"),
+                        bool(record.get("has_social_links")),
+                        str(record.get("contacts_checked_at") or ""),
+                        CONTACT_RESOLVER_VERSION,
+                        int(uid),
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+        if not rows:
+            return
+        try:
+            with DB_WRITE_LOCK:
+                with self._connect() as conn:
+                    conn.execute("PRAGMA busy_timeout=15000")
+                    with conn:
+                        conn.executemany(
+                            "UPDATE game_analytics SET has_discord=?, discord_url=?, "
+                            "status=?, found_via=?, has_social_links=?, contacts_checked_at=?, "
+                            "contact_schema_version=? WHERE universe_id=?",
+                            rows,
+                        )
+        except sqlite3.Error as exc:
+            log.warning("Batched contact write failed (%d rows): %s", len(rows), exc)
+        for uid, record in records.items():
+            _contact_memcache_put(int(uid), dict(record))
 
     @staticmethod
     def _pick_discord(links: List[Dict[str, str]]) -> Optional[str]:
@@ -2775,6 +3029,10 @@ class RobloxPlatformScout:
         report = progress_cb or (lambda p, m: None)
         self._reset_stale_queue_claims()
         stats = {"claimed": 0, "duplicates": 0, "hydrated": 0, "qualified": 0, "below_gate": 0, "metrics_failed": 0, "batches": 0}
+        if batches <= 0:
+            # Budget 0 is a deliberate kill switch — the old max(1, limit)
+            # clamp still claimed and hydrated one row per run.
+            return stats
         claimed = self._claim_discovery_batch(batches * METRICS_BATCH_SIZE)
         if not claimed:
             report(0.5, "Discovery queue empty — nothing to drain.")
@@ -3086,6 +3344,338 @@ class RobloxPlatformScout:
         except sqlite3.Error as exc:
             log.warning("rec-seed cursor update failed: %s", exc)
 
+    # ------------------------------------------------------------------ #
+    # Atlas Dev seed ingestion (ATLAS_PLAN_REVIEW.md) — discovery only.
+    # ------------------------------------------------------------------ #
+
+    def _atlas_proxy_pool(self) -> List[str]:
+        """Flip-ready proxy pool for Atlas fetches (mirrors _search_proxy_urls).
+
+        Default is direct (robots.txt allows crawling, volume is tiny); if
+        Atlas ever throttles runner IPs, set RBXSCOUT_SEARCH_PROXY_URLS and
+        traffic shifts through the mirrors with zero code change. ``direct``
+        is the terminal entry, exactly like the search pool.
+        """
+        raw = os.environ.get(ATLAS_PROXY_URLS_ENV, "")
+        entries: List[str] = []
+        for part in re.split(r"[,;\n]+", raw or ""):
+            part = part.strip().rstrip("/")
+            if not part:
+                continue
+            if part == "direct" or re.match(r"^https?://[^/\s]+$", part):
+                if part not in entries:
+                    entries.append(part)
+            else:
+                log.warning("Ignoring malformed Atlas proxy URL: %r", part)
+        if "direct" not in entries:
+            entries.append("direct")
+        return entries
+
+    @staticmethod
+    def _parse_atlas_stat_text(text: str) -> Optional[Tuple[str, int, int]]:
+        """Extract (title, ccu, visits) from Atlas game-page meta text.
+
+        Atlas exposes stats ONLY as SEO prose — e.g.
+        ``The Black Bell [HORROR] on Atlas - 145 playing now, 29,664 total
+        visits.`` (verified live 2026-09-19: no JSON, no API routes; the
+        index payload carries IDs only). Returns None when the format changed.
+        """
+        if not text:
+            return None
+        match = re.search(
+            r"(?P<title>.+?)\s+on Atlas\s*-\s*(?P<ccu>\d[\d,]*)\s+playing now,\s+"
+            r"(?P<visits>\d[\d,]*)\s+total visits",
+            text,
+        )
+        if not match:
+            return None
+        try:
+            return (
+                match.group("title").strip(),
+                int(match.group("ccu").replace(",", "")),
+                int(match.group("visits").replace(",", "")),
+            )
+        except ValueError:
+            return None
+
+    def _atlas_fetch(self, url: str, delay: float) -> Optional[requests.Response]:
+        """One polite Atlas fetch: honest UA, optional proxy pool, backoff.
+
+        On 429/5xx the module backs off twice and then signals bail-out by
+        returning None (the caller aborts the sweep without advancing any
+        pointer, so the next run retries the same range). Response bodies
+        are never trusted for stats — callers extract IDs or meta prose.
+        """
+        for attempt, entry in enumerate(self._atlas_proxy_pool()):
+            try:
+                proxies = None
+                if entry != "direct":
+                    proxies = {"http": entry, "https": entry}
+                resp = requests.get(
+                    url,
+                    headers={"User-Agent": ATLAS_USER_AGENT, "Accept-Language": "en"},
+                    timeout=30,
+                    proxies=proxies,
+                )
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
+                if resp.status_code == 200:
+                    time.sleep(delay)
+                    return resp
+                log.warning("Atlas fetch %s -> HTTP %s", url, resp.status_code)
+                return None
+            except requests.RequestException as exc:
+                log.warning("Atlas fetch failed (%s): %s", url, exc)
+                time.sleep(1.0)
+        return None
+
+    def _atlas_pointer(self, pointer_id: str) -> Optional[float]:
+        """Read one of the atlas_* scan_pointers rows (timestamp or cursor)."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT last_universe_id, updated_at FROM scan_pointers WHERE id = ?",
+                    (pointer_id,),
+                ).fetchone()
+            if not row:
+                return None
+            if pointer_id == "atlas_page":
+                if row[0] is not None:
+                    return float(row[0])
+                return None
+            stamp = row[1] or row[0]
+            if stamp is None:
+                return None
+            # 'atlas_last_run' stores an epoch in last_universe_id — that is
+            # the authoritative stamp (updated_at refreshes on any write).
+            if pointer_id == "atlas_last_run" and row[0] is not None:
+                return float(row[0])
+            try:
+                return datetime.strptime(str(stamp)[:19], "%Y-%m-%d %H:%M:%S").timestamp()
+            except ValueError:
+                return None
+        except sqlite3.Error:
+            return None
+
+    def _set_atlas_pointer(self, pointer_id: str, value: float) -> None:
+        """Upsert one atlas_* pointer (24h throttle stamp or page cursor)."""
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO scan_pointers (id, last_universe_id, updated_at)
+                    VALUES (?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(id) DO UPDATE SET
+                        last_universe_id = excluded.last_universe_id,
+                        updated_at = CURRENT_TIMESTAMP
+                    """,
+                    (pointer_id, int(value)),
+                )
+        except sqlite3.Error as exc:
+            log.warning("atlas pointer update failed (%s): %s", pointer_id, exc)
+
+    def _provisional_atlas_row(self, uid: int, title: str, ccu: int, visits: int) -> bool:
+        """First-paint row from Atlas meta prose (optional, budgeted).
+
+        Writes ccu/visits/title with found_via='atlas_dev' and NO ccu_history
+        snapshot (Atlas numbers must never enter the trend table). The strict
+        gate still applies — only rows meeting 20k/25 are stored, mirroring
+        the queue's drain behavior. The hydrator overwrites with fresh Roblox
+        stats on first refresh; found_via is COALESCE'd so the original
+        source stamp survives. Returns True when a NEW row was created.
+        """
+        if ccu < EXPANSION_TARGET_CCU or visits < EXPANSION_TARGET_VISITS:
+            return False
+        try:
+            with self._connect() as conn:
+                known = conn.execute(
+                    "SELECT 1 FROM game_analytics WHERE universe_id = ?", (uid,)
+                ).fetchone()
+            if known:
+                return False
+            self.upsert_game(
+                {
+                    "universe_id": uid,
+                    "title": title,
+                    "ccu": ccu,
+                    "peak_ccu": ccu,
+                    "visits": visits,
+                    "found_via": "atlas_dev",
+                },
+                record_ccu_history=False,
+            )
+            return True
+        except sqlite3.Error as exc:
+            log.warning("provisional atlas row failed for %s: %s", uid, exc)
+            return False
+
+    def harvest_atlas_seeds(
+        self,
+        pages: Optional[int] = None,
+        stat_pages: Optional[int] = None,
+        throttle_hours: Optional[int] = None,
+        deep_every_days: Optional[int] = None,
+        priority: Optional[int] = None,
+        progress_cb: Optional[Callable[[float, str], None]] = None,
+    ) -> Dict[str, Any]:
+        """One Atlas harvest: 24h-throttled sweep of /analyze → discovery queue.
+
+        - ``pages``: index pages fetched per run (steady state; 0 disables).
+        - ``stat_pages``: budget of game pages fetched for provisional
+          first-paint rows (0 disables the bootstrap entirely).
+        - ``throttle_hours``: minimum hours between harvests (0 disables the
+          throttle — used by tests and manual forced runs).
+        - ``deep_every_days``: a full catch-up sweep (up to ATLAS_DEEP_PAGES)
+          runs this often; 0 = never beyond the page budget.
+
+        Freshly harvested IDs go through the existing dedup/trim
+        _enqueue_discovery with source='atlas_dev'; the queue drain owns the
+        strict gate. Failed fetches advance nothing (next run retries); 429s
+        bail out immediately. stat_pages provisional rows are written FIRST
+        (newest seeds first) and never displace queue ingestion.
+        """
+        report = progress_cb or (lambda p, m: None)
+        stats: Dict[str, Any] = {
+            "fetched_ids": 0,
+            "pages_fetched": 0,
+            "enqueued": 0,
+            "provisional_rows": 0,
+            "throttled": False,
+            "aborted": False,
+            "deep_sweep": False,
+        }
+        page_budget = (
+            max(0, int(pages))
+            if pages is not None
+            else _env_int("ATLAS_SWEEP_PAGES", ATLAS_SWEEP_PAGES_DEFAULT)
+        )
+        stat_budget = (
+            max(0, int(stat_pages))
+            if stat_pages is not None
+            else _env_int("ATLAS_STAT_PAGES", ATLAS_STAT_PAGES_DEFAULT)
+        )
+        throttle = (
+            ATLAS_HOURS_DEFAULT
+            if throttle_hours is None
+            else max(0.0, float(throttle_hours))
+        )
+        if throttle_hours is None:
+            # Ops override: ATLAS_THROTTLE_HOURS=0 forces an immediate harvest.
+            try:
+                throttle = max(0.0, float(os.environ.get("ATLAS_THROTTLE_HOURS", "") or ATLAS_HOURS_DEFAULT))
+            except ValueError:
+                pass
+        deep_days = (
+            ATLAS_DEEP_EVERY_DAYS_DEFAULT
+            if deep_every_days is None
+            else max(0, int(deep_every_days))
+        )
+        queue_priority = (
+            ATLAS_PRIORITY_DEFAULT if priority is None else max(1, int(priority))
+        )
+        try:
+            # Default 3s is the polite posture; 0 is allowed explicitly
+            # (tests / forced local runs) — never silently increased here.
+            delay = max(0.0, float(os.environ.get("ATLAS_REQUEST_DELAY", "") or ATLAS_REQUEST_DELAY_DEFAULT))
+        except ValueError:
+            delay = ATLAS_REQUEST_DELAY_DEFAULT
+        if page_budget == 0 and stat_budget == 0:
+            return stats  # kill switch: module fully disabled
+
+        # ---- 24h self-throttle (atlas_last_run pointer) --------------------
+        if throttle > 0:
+            last = self._atlas_pointer("atlas_last_run")
+            if last is not None and (time.time() - last) < throttle * 3600:
+                stats["throttled"] = True
+                return stats
+
+        # ---- deep-sweep decision (catch-up cursor in atlas_page) ----------
+        now = time.time()
+        cursor_row = None
+        try:
+            with self._connect() as conn:
+                cursor_row = conn.execute(
+                    "SELECT last_universe_id, updated_at FROM scan_pointers WHERE id = 'atlas_page'"
+                ).fetchone()
+        except sqlite3.Error:
+            cursor_row = None
+        start_page = 1
+        deep_due = False
+        if cursor_row is not None and cursor_row[0] is not None:
+            start_page = int(cursor_row[0]) or 1
+            try:
+                stamp = datetime.strptime(str(cursor_row[1] or "")[:19], "%Y-%m-%d %H:%M:%S").timestamp()
+                deep_due = deep_days > 0 and (now - stamp) >= deep_days * 86400
+            except ValueError:
+                deep_due = False
+        elif deep_days > 0:
+            deep_due = True
+        sweep_pages = page_budget
+        if deep_due:
+            sweep_pages = ATLAS_DEEP_PAGES_DEFAULT
+            stats["deep_sweep"] = True
+        if sweep_pages <= 0:
+            # No index fetching (stat bootstrap only) — still stamp the run.
+            self._set_atlas_pointer("atlas_last_run", now)
+            return stats
+
+        # ---- index sweep ---------------------------------------------------
+        harvested: Dict[int, None] = {}
+        fetched = 0
+        for page in range(start_page, start_page + sweep_pages):
+            if fetched >= sweep_pages:
+                break
+            url = f"{ATLAS_BASE_URL}?{ATLAS_QUERY}" + (f"&page={page}" if page > 1 else "")
+            resp = self._atlas_fetch(url, delay)
+            if resp is None:
+                stats["aborted"] = True
+                break  # pointer untouched: next run retries this range
+            fetched += 1
+            stats["pages_fetched"] += 1
+            for uid_s in re.findall(r'href="/analyze/(\d{8,12})"', resp.text):
+                uid = int(uid_s)
+                if uid > 0 and uid not in harvested:
+                    harvested[uid] = None
+            report(0.1 + 0.5 * fetched / max(1, sweep_pages), f"Atlas page {page}: +{len(harvested)} IDs")
+        stats["fetched_ids"] = len(harvested)
+        stats["sweep_pages"] = fetched
+        if fetched == 0:
+            return stats  # nothing succeeded; leave throttle un-stamped
+
+        # ---- provisional first-paint rows (budgeted, newest seeds first) ---
+        if stat_budget > 0:
+            done = 0
+            for uid in sorted(harvested, reverse=True):
+                if done >= stat_budget:
+                    break
+                game_html = self._atlas_fetch(f"{ATLAS_BASE_URL}/{uid}", delay)
+                if game_html is None:
+                    continue
+                done += 1
+                meta = re.search(r'<meta name="description" content="([^"]+)"', game_html.text)
+                if not meta:
+                    continue
+                parsed = self._parse_atlas_stat_text(meta.group(1))
+                if not parsed:
+                    continue
+                title, ccu, visits = parsed
+                if self._provisional_atlas_row(uid, title, ccu, visits):
+                    stats["provisional_rows"] += 1
+            report(0.7, f"Atlas first-paint rows: {stats['provisional_rows']}")
+
+        # ---- enqueue → the existing drain + strict gate own the rest -------
+        stats["enqueued"] = self._enqueue_discovery(
+            (uid, "atlas_dev", queue_priority) for uid in harvested
+        )
+
+        # ---- commit pointers ONLY after a successful harvest ---------------
+        self._set_atlas_pointer("atlas_last_run", now)
+        completed = fetched >= sweep_pages
+        self._set_atlas_pointer("atlas_page", 1 if completed else start_page + fetched)
+        report(0.95, f"Atlas harvest: +{stats['enqueued']} queued, {stats['provisional_rows']} first-paint rows")
+        return stats
+
     def run_expansion(
         self,
         spiderweb_creators: Optional[int] = None,
@@ -3102,31 +3692,52 @@ class RobloxPlatformScout:
         finder-style workflow slot, not the 5-minute hydrator.
         """
         report = progress_cb or (lambda p, m: None)
-        web_limit = _env_int(
-            "EXPAND_SPIDERWEB_CREATORS",
-            EXPAND_SPIDERWEB_CREATORS_DEFAULT if spiderweb_creators is None else spiderweb_creators,
+        # Retirement defaults (2026-09-19): spiderweb 37 lifetime qualifiers,
+        # frontier 0/11,500, recs ~0.4 new/request — Atlas (ATLAS_PLAN_REVIEW.md)
+        # replaces discovery at ~65-74% new IDs/page. The QUEUE DRAIN stays on:
+        # it is what hydrates Atlas seeds through the strict gate. Explicit
+        # parameters win over env; env wins over the retired-engine defaults.
+        web_limit = (
+            spiderweb_creators
+            if spiderweb_creators is not None
+            else _env_int("EXPAND_SPIDERWEB_CREATORS", EXPAND_SPIDERWEB_CREATORS_RETIRED)
         )
-        drain_limit = _env_int(
-            "EXPAND_QUEUE_BATCHES",
-            EXPAND_QUEUE_BATCHES_DEFAULT if queue_batches is None else queue_batches,
+        drain_limit = (
+            queue_batches
+            if queue_batches is not None
+            else _env_int("EXPAND_QUEUE_BATCHES", EXPAND_QUEUE_BATCHES_DEFAULT)
         )
-        frontier_limit = _env_int(
-            "EXPAND_FRONTIER_BATCHES",
-            EXPAND_FRONTIER_BATCHES_DEFAULT if frontier_batches is None else frontier_batches,
+        frontier_limit = (
+            frontier_batches
+            if frontier_batches is not None
+            else _env_int("EXPAND_FRONTIER_BATCHES", EXPAND_FRONTIER_BATCHES_RETIRED)
         )
-        rec_limit = _env_int(
-            "EXPAND_REC_SEEDS",
-            EXPAND_REC_SEEDS_DEFAULT if rec_seeds is None else rec_seeds,
+        rec_limit = (
+            rec_seeds
+            if rec_seeds is not None
+            else _env_int("EXPAND_REC_SEEDS", EXPAND_REC_SEEDS_RETIRED)
         )
         result: Dict[str, Any] = {}
-        report(0.05, "Expansion pass: creator spiderwebbing…")
-        result["spiderweb"] = self.spiderweb_creators(web_limit, progress_cb=report)
-        report(0.25, "Expansion pass: recommendations mining…")
-        result["rec_mining"] = self.mine_recommendations(rec_limit, progress_cb=report)
-        report(0.4, "Expansion pass: draining the discovery queue…")
+        # Atlas first (enqueue-only; its seeds drain from the NEXT run on —
+        # daily cadence), then the legacy order: spiderweb → recs → drain →
+        # frontier, so same-run enqueued candidates still drain this run.
+        report(0.02, "Expansion pass: Atlas Dev seed harvest…")
+        try:
+            result["atlas"] = self.harvest_atlas_seeds(progress_cb=report)
+        except Exception as exc:  # Atlas must never take the drain down
+            log.warning("Atlas harvest failed (drain continues): %s", exc)
+            result["atlas"] = {"error": str(exc), "enqueued": 0}
+        if web_limit:
+            report(0.2, "Expansion pass: creator spiderwebbing…")
+            result["spiderweb"] = self.spiderweb_creators(web_limit, progress_cb=report)
+        if rec_limit:
+            report(0.35, "Expansion pass: recommendations mining…")
+            result["rec_mining"] = self.mine_recommendations(rec_limit, progress_cb=report)
+        report(0.5, "Expansion pass: draining the discovery queue…")
         result["drain"] = self.drain_discovery_queue(drain_limit, progress_cb=report)
-        report(0.7, "Expansion pass: frontier scan…")
-        result["frontier"] = self.scan_frontier(frontier_limit, progress_cb=report)
+        if frontier_limit:
+            report(0.75, "Expansion pass: frontier scan…")
+            result["frontier"] = self.scan_frontier(frontier_limit, progress_cb=report)
         self.source_diagnostics["expansion"] = result
         self.last_scan["expansion"] = result
         return result
@@ -3566,7 +4177,12 @@ class RobloxPlatformScout:
         if run_id is None:
             run_id = self.last_scan.get("run_id")
         if run_id is None:
-            run_id = self._begin_scan()
+            # Synthetic in-memory run id (negative: can never collide with a
+            # pipeline scan_runs row). Dashboard sessions are read-only catalog
+            # consumers — INSERTing a scan_runs row per user page re-check was
+            # pure write contention on the shared catalog for zero value.
+            # _finish_scan skips non-owned ids, so nothing is ever written.
+            run_id = -(int(time.time() * 1000) % 1_000_000_000) - 1
             self.last_scan = {
                 "run_id": run_id,
                 "status": "running",
@@ -3587,6 +4203,8 @@ class RobloxPlatformScout:
         errors = 0
         completed = 0
         report(0.0, f"Checking Discord contacts 0/{len(metas)}…")
+        records: Dict[int, Dict[str, Any]] = {}
+        throttled_ids: List[int] = []
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             futures = {
                 pool.submit(self.resolve_game_contact, meta, force, run_id): uid
@@ -3607,10 +4225,29 @@ class RobloxPlatformScout:
                     })
                     record = None
                 if record:
-                    completed += 1
-                    self._store_contact_cache(uid, record)
+                    if record.get("status") == THROTTLED_STATUS:
+                        throttled_ids.append(uid)
+                    else:
+                        completed += 1
+                        records[uid] = record
                 report(index / max(1, len(metas)), f"Contacts checked {index}/{len(metas)}…")
 
+        # One transaction for the whole page: dozens of tiny concurrent write
+        # transactions on the shared catalog file were the main source of
+        # "database is locked" losses under multiple users.
+        self._store_contact_verdicts_batch(records)
+        for uid in throttled_ids:
+            self._set_contact_diagnostic(run_id, uid, {
+                "cached": False,
+                "throttled": True,
+                "selected_source": None,
+                "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+
+        # In-memory scan counters only. The dashboard is a read-only catalog
+        # consumer: writing one scan_runs row per user page-view (plus the
+        # finish UPDATE) was pure write contention — the 24/7 pipeline still
+        # persists its own runs from its own process.
         self.last_scan.update({
             "status": "complete",
             "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -3618,7 +4255,6 @@ class RobloxPlatformScout:
             "contacts_completed": prior_completed + completed,
             "contact_errors": prior_errors + errors,
         })
-        self._finish_scan()
         return self.load_table(ids)
 
 

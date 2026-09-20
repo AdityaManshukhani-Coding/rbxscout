@@ -370,7 +370,9 @@ def test_env_knobs_bound_the_pilot(tmp_path, monkeypatch):
     monkeypatch.setenv("EXPAND_FRONTIER_BATCHES", "0")   # kill-switch value
     monkeypatch.setenv("EXPAND_QUEUE_BATCHES", "0")
     result = scout.run_expansion()
-    assert result["frontier"]["scanned"] == 0
+    # Retired engines (default 0) produce no result block at all; a budget-0
+    # drain claims and hydrates nothing (the old max(1, limit) clamp is gone).
+    assert "frontier" not in result
     assert result["drain"]["claimed"] == 0
     # Malformed env values fall back to defaults instead of crashing a run.
     monkeypatch.setenv("EXPAND_FRONTIER_BATCHES", "garbage")
@@ -385,7 +387,10 @@ def test_env_knobs_bound_the_pilot(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
-def test_scan_expand_phase_runs_full_pass(tmp_path):
+def test_scan_expand_phase_runs_full_pass(tmp_path, monkeypatch):
+    # Spiderweb is retired by default (ATLAS_PLAN_REVIEW.md §6); this test
+    # exercises the spiderweb→queue→drain chain, so re-enable it explicitly.
+    monkeypatch.setenv("EXPAND_SPIDERWEB_CREATORS", "1")
     db = str(tmp_path / "t.db")
     scout = ExpansionScout({
         "portfolios": {

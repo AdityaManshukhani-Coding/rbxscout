@@ -5,6 +5,7 @@ from streamlit.testing.v1 import AppTest
 
 import app
 import gate
+from conftest import TEST_PASSWORD
 
 from test_app_flow import APP_PATH
 
@@ -35,7 +36,7 @@ class FakeSession(dict):
 def _gate_state(tmp_path, monkeypatch):
     """Isolated gate state (re-asserted here: this module tests the gate)."""
     monkeypatch.setenv("SS_GATE_DIR", str(tmp_path / "gate"))
-    monkeypatch.setenv("APP_PASSWORD", "Sep#2007")
+    monkeypatch.setenv("APP_PASSWORD", TEST_PASSWORD)
     monkeypatch.delenv("SS_TEST_BYPASS_GATE", raising=False)
     return tmp_path / "gate"
 
@@ -60,7 +61,7 @@ def test_correct_password_reaches_app(_gate_state):
     at = AppTest.from_file(APP_PATH, default_timeout=45)
     at.session_state["_device_ref"] = "gate-dev-2"
     at.run()
-    at.text_input(key="gate_password").set_value("Sep#2007").run()
+    at.text_input(key="gate_password").set_value(TEST_PASSWORD).run()
     at.button(key="gate_unlock").click().run()
     assert not at.exception
     assert len(at.title) > 0, "app content renders after unlock"
