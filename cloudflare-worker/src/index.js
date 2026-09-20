@@ -7,10 +7,10 @@
  *    keyword crawler can use Cloudflare's IP pool instead of the shared
  *    GitHub Actions runner IP range.
  * 2. Scheduler: every five minutes, dispatches the Hydrator workflow through
- *    GitHub's workflow_dispatch API. Every ten minutes (:00, :10, :20, :30,
- *    :40, :50) it also dispatches Finder. GitHub's internal `schedule`
- *    triggers are disabled in this repository, so Cloudflare is the only
- *    automatic clock.
+ *    GitHub's workflow_dispatch API. At :15/:45 it also dispatches the
+ *    Expander (Atlas Dev harvest + discovery-queue drain). GitHub's internal
+ *    `schedule` triggers are disabled in this repository, so Cloudflare is
+ *    the only automatic clock.
  *
  * The GitHub token is a Worker secret (`GITHUB_TOKEN`) and is never returned
  * in a response or written to logs.
@@ -27,7 +27,6 @@ const GITHUB_API_BASE = "https://api.github.com";
 const GITHUB_API_VERSION = "2022-11-28";
 const GITHUB_WORKFLOWS = {
   hydrator: "hydrator.yml",
-  finder: "finder.yml",
   expander: "expander.yml",
 };
 const GITHUB_DISPATCH_ATTEMPTS = 3;
@@ -169,18 +168,10 @@ async function dispatchDueWorkflows(controller, env) {
     ["hydrator", GITHUB_WORKFLOWS.hydrator],
   ];
 
-  // Finder runs on the same five-minute clock, but only every ten minutes
-  // (:00, :10, :20, :30, :40, :50 UTC). Keeping one Cloudflare trigger avoids
-  // two independent scheduler clocks; the shared rbxscout-sync Actions
-  // concurrency group serializes finder/hydrator when ticks coincide.
-  if (minute % 10 === 0) {
-    due.push(["finder", GITHUB_WORKFLOWS.finder]);
-  }
-
-  // Expander ("Game Finder 2.0", EXPANSION_PILOT.md) gets the odd clean
-  // minute :15/:45 — its own 30-min slot that never coincides with finder's
-  // even-minute ticks. The Actions concurrency group still serializes any
-  // overlap (e.g. a long finder run still holding the mutex at :15).
+  // Expander (Atlas Dev harvest + discovery-queue drain, EXPANSION_PILOT.md)
+  // gets the odd clean minute :15/:45 — its own 30-min slot. The Actions
+  // concurrency group still serializes any overlap with a long hydrator run
+  // still holding the mutex at :15.
   if (minute === 15 || minute === 45) {
     due.push(["expander", GITHUB_WORKFLOWS.expander]);
   }

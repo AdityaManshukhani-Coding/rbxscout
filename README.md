@@ -41,20 +41,16 @@ runs every five minutes in UTC:
   5 minutes through GitHub's `workflow_dispatch` API. It refreshes stats for
   games *already* in the catalog by draining the tier-due queue. No discovery
   traffic; tiers that are not due cost zero requests.
-- **Finder** — every ten minutes (UTC `:00`, `:10`, `:20`, `:30`, `:40`,
-  `:50`), the same Worker also dispatches
-  `.github/workflows/finder.yml`. It discovers games from the DEEP charts
-  (the full leaderboard taxonomy — ~26 sorts / ~770 games per run), the
-  Rolimons pool, and the next 200-keyword slice of the ~14.7k-word
-  dictionary (662 curated seeds + a deterministic bases×modifiers expansion;
-  a full sweep takes ~12h at the 10-minute cadence, each keyword read to
-  page 2), then hydrates new games.
-- **Expander ("Game Finder 2.0")** — on the clean `:15`/`:45` minutes (every
-  30 min), the Worker dispatches `.github/workflows/expander.yml`: the
-  catalog-expansion pilot (creator spiderwebbing + discovery-queue drain +
-  universe-ID frontier scan, strict 20k/25 gate). Pilot rates and the
-  automated KEEP/REVERT verdict are documented in
-  [EXPANSION_PILOT.md](EXPANSION_PILOT.md).
+- **Expander (Atlas Dev harvest + drain)** — on the clean `:15`/`:45` minutes (every
+  30 min), the Worker dispatches `.github/workflows/expander.yml`: the sole
+  discovery pipeline. A daily 24h-throttled harvest of
+  [atlasdev.gg/analyze](https://atlasdev.gg/analyze) enqueues mid-tier universe
+  IDs (≥20k visits, ≥25 CCU), and every run drains a bounded slice through the
+  strict gate. The legacy finders (deep-charts/keyword crawl, creator
+  spiderweb, frontier scan, recommendations mining) were **removed
+  2026-09-20** — Atlas Dev is the only discovery source. Rates and knobs are
+  documented in [EXPANSION_PILOT.md](EXPANSION_PILOT.md) and
+  [ATLAS_PLAN_REVIEW.md](ATLAS_PLAN_REVIEW.md).
 
 The GitHub workflow files intentionally contain **no `schedule:` triggers**.
 They retain `workflow_dispatch` for Cloudflare and manual runs only, so an
@@ -192,7 +188,7 @@ becomes the only automatic clock for RbxScout.
    Then watch the next Cloudflare tick in the Actions tab.
 
 The scheduler dispatches the GitHub API endpoints for `hydrator.yml` and
-`finder.yml` with `{"ref":"main"}`. A successful API dispatch means GitHub
+`expander.yml` with `{"ref":"main"}`. A successful API dispatch means GitHub
 accepted the run; the Actions page remains the source of truth for whether
 the runner completed successfully.
 

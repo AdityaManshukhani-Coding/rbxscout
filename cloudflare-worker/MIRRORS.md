@@ -127,7 +127,7 @@ home internet.
 ## Wiring it in (after any option is live)
 
 Append the URL to `RBXSCOUT_SEARCH_PROXY_URLS` in
-`.github/workflows/finder.yml` (+ hydrator.yml harmlessly):
+`.github/workflows/expander.yml` (+ hydrator.yml harmlessly):
 
 ```yaml
 RBXSCOUT_SEARCH_PROXY_URLS: >-

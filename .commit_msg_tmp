@@ -1,0 +1,19 @@
+Remove legacy discovery engines; Atlas Dev is the sole game source
+
+Deletes the original Game Finder (deep-charts crawl, Rolimons import,
+14.7k-keyword omni-search crawler, search-proxy IP pool) along with the
+expansion-era engines (creator spiderwebbing, frontier scan, recommendations
+mining) and their schema (keyword_crawl_state, creator_spiderweb_log),
+fixtures, and tests. finder.yml is deleted and the Cloudflare scheduler
+drops its finder tick; the expander is renamed to "Atlas Dev harvest +
+drain" and scans now accept only hydrate/expand phases (default: both).
+live_sync loses the --only finder option; the expansion pilot verdict now
+aggregates drain + Atlas numbers. The hydrate pass no longer spends budget
+on unverified new IDs - the queue drain owns those through the strict
+20k/25 gate.
+
+179 tests pass (30 dead-engine tests removed, budget test rewritten for
+the Atlas-only flow).
+
+Generated with Codebuff
+Co-Authored-By: Codebuff <noreply@codebuff.com>

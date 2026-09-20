@@ -28,7 +28,7 @@ on:
 permissions:
   contents: write   # create/update the catalog-latest release assets
 
-# ⚠️ Keep this group IDENTICAL to finder.yml — the shared literal string
+# ⚠️ Keep this group IDENTICAL to expander.yml — the shared literal string
 # IS the cross-workflow mutex. Changing one without the other re-opens
 # the two-writer race on the catalog release.
 concurrency:

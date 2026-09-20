@@ -2,8 +2,8 @@
 RbxScout — Automated Roblox Scouting & Contact Identification (core engine).
 
 Sourcing pipeline:
-  1. Roblox Discovery (explore-api get-sorts)  -> live front-page charts (universeIds embedded)
-  2. Rolimon's gamelist (fallback/bulk)        -> placeIds resolved to universeIds
+  1. Atlas Dev analyze index                   -> mid-tier universeIds (daily harvest)
+  2. discovery-queue drain (expander)          -> strict-gate verified hydration
   3. games.roblox.com batch metrics            -> CCU, visits, favorites, genre, creator
   4. thumbnails.roblox.com batch icons
 
@@ -26,7 +26,6 @@ import re
 import sqlite3
 import threading
 import time
-import uuid
 from datetime import datetime
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -180,43 +179,18 @@ DEFAULT_CANDIDATE_LIMIT = 10_000  # safety ceiling after batch place resolution
 HYDRATION_BUDGET_PER_SYNC = 150
 
 # --------------------------------------------------------------------------- #
-# Catalog expansion pilot (creator spiderwebbing + frontier scan).
-# Full story in EXPANSION_PILOT.md. Phase-0 spike, live 2026-09-17:
-#   * /v2/groups/{id}/games?accessFilter=Public accepts limit=100
-#   * /v2/users/{id}/games?accessFilter=Public caps at limit=50 (100 -> 400)
+# Catalog expansion (Atlas Dev seed harvest + discovery-queue drain). The
+# legacy discovery engines (creator spiderweb, frontier scan, recommendations
+# mining) were REMOVED 2026-09-20 — Atlas Dev is the sole discovery source
+# now (ATLAS_PLAN_REVIEW.md).
 #   * the metrics batch endpoint REJECTS >50 universe IDs ("Too many
-#     universe IDs were requested."), so the scan batch is 50, not 100
-#   * portfolio payloads carry `placeVisits` for free -> candidates are
-#     pre-gated by visits BEFORE any hydration request is spent
+#     universe IDs were requested."), so the drain batch is 50, not 100
 # --------------------------------------------------------------------------- #
 METRICS_BATCH_SIZE = 50          # verified hard cap of /v1/games?universeIds
-SPIDERWEB_GROUP_LIMIT = 100      # page size for /v2/groups/{id}/games
-SPIDERWEB_USER_LIMIT = 50        # page size for /v2/users/{id}/games (real cap)
-SPIDERWEB_MAX_PAGES = 10         # cursor-follow ceiling per creator
-SPIDERWEB_RESCRAPE_DAYS = 14     # re-spider each creator at most this often
-SPIDERWEB_VISITS_PREGATE = 20_000  # portfolio rows below this never hydrate
 EXPANSION_TARGET_VISITS = 20_000   # strict gate: nothing below target is stored
 EXPANSION_TARGET_CCU = 25
-# Pilot rates (env-tunable; conservative defaults until the 72-run verdict):
-EXPAND_SPIDERWEB_CREATORS_DEFAULT = 100  # creators per expand run (~100-150 req)
 EXPAND_QUEUE_BATCHES_DEFAULT = 10        # 10 x 50 = 500 queued candidates hydrated/run
-EXPAND_FRONTIER_BATCHES_DEFAULT = 10     # 10 x 50 = 500 fresh IDs/run (~24k/day)
-EXPAND_REC_SEEDS_DEFAULT = 50            # recommendations requests per expand run
-REC_SEED_RECENT_CAP = 200                # top-up pool: newest expansion qualifiers
 EXPANSION_QUEUE_MAX_ROWS = 2_000_000     # dedup-memory ceiling (trim oldest)
-# Retirement (2026-09-19, ATLAS_PLAN_REVIEW.md §6): the discovery engines are
-# superseded by Atlas seed ingestion. Defaults move to 0 (full off, no code
-# edit needed to re-enable — set the env var); the queue drain keeps its
-# budget because it hydrates Atlas seeds through the strict gate.
-EXPAND_SPIDERWEB_CREATORS_RETIRED = 0
-EXPAND_FRONTIER_BATCHES_RETIRED = 0
-EXPAND_REC_SEEDS_RETIRED = 0
-# Verified live 2026-09-19: returns ~6 rows/page, maxRows ignored, pagination
-# repeats the same page (36 rows over 6 pages -> 6 unique). Small/low-CCU
-# games can return 0 rows (empty rec graph). Rows carry creator id/type free.
-REC_RECOMMENDATIONS_URL = (
-    "https://games.roblox.com/v1/games/recommendations/game/{universe_id}"
-)
 
 # --------------------------------------------------------------------------- #
 # Atlas Dev seed ingestion (ATLAS_PLAN_REVIEW.md — proven live 2026-09-19).
@@ -232,7 +206,7 @@ REC_RECOMMENDATIONS_URL = (
 # --------------------------------------------------------------------------- #
 ATLAS_BASE_URL = "https://atlasdev.gg/analyze"
 ATLAS_QUERY = "sort=totalVisits&dir=asc&totalVisitsMin=20000&ccuMin=25"
-ATLAS_PRIORITY_DEFAULT = 2          # queue tier: above frontier(3), below spiderweb(1)
+ATLAS_PRIORITY_DEFAULT = 2          # queue tier (drain processes lowest first)
 ATLAS_HOURS_DEFAULT = 24            # self-throttle: at most one harvest per day
 ATLAS_SWEEP_PAGES_DEFAULT = 3       # steady-state pages per daily harvest
 ATLAS_DEEP_PAGES_DEFAULT = 275      # one-off catch-up sweep ceiling (full index)
@@ -335,182 +309,6 @@ def tier_jump_count(previous: Optional[int], current: Optional[int]) -> int:
     if previous is None or current is None:
         return 0
     return int(current) - int(previous)
-
-# Keyword dictionary for the omni-search crawler (Phase 2).
-# = curated seeds (below, 662 words — positions are STABLE because the crawl
-#   cursor keyword_crawl_state.next_index is positional) appended with the
-#   deterministic expansion from keyword_expansion.py (~14k bases×modifiers).
-# Each sync crawls the next KEYWORDS_PER_SYNC-word slice of this list.
-# NOTE: keep edits append-only (seeds first, expansion last), or reset
-# keyword_crawl_state.next_index to 0 after big mid-list edits.
-_SEED_KEYWORDS = [
-    # -- Slice 1: Action Prefixes & Core Mechanics (words 1-87) ------------
-    "steal a", "rob a", "grow a", "build a", "escape the", "survive the",
-    "raise a", "feed a", "catch a", "collect the", "upgrade your", "buy a",
-    "sell a", "duplicate", "duping", "trading", "auction", "steal", "rob",
-    "heist", "loot", "snatch", "raid", "break into", "break out", "run from",
-    "hide from", "beat the", "defeat the", "absorb", "merge", "fuse",
-    "evolve", "hatch", "spin for", "roll for", "luck", "rng", "flex",
-    "flexing", "wealth", "millionaire", "billionaire", "richest", "poorest",
-    "zero to hero", "1% luck", "99% impossible", "hard mode", "hardcore",
-    "infinite", "unlimited", "auto farm", "auto click", "rebirth",
-    "prestige", "ascension", "multiplier", "speedrun", "obby but",
-    "tycoon but", "simulator but", "game but", "world but", "every second",
-    "every click", "every step", "+1 speed", "+1 jump", "+1 size",
-    "+1 strength", "+1 brainrot", "+1 cash", "+1 power", "grow bigger",
-    "get taller", "get stronger", "get richer", "reach the end",
-    "reach the top", "climb the", "fall down", "don't fall", "don't die",
-    "red light green light", "floor is lava", "glass bridge",
-    # -- Slice 2: Brainrot, Meme & Viral Tropes (words 88-169) -------------
-    "brainrot", "skibidi", "gyatt", "rizz", "rizzler", "mewing", "looksmax",
-    "fanum tax", "ohio", "grimace", "sigma", "alpha", "omega", "sussy",
-    "amogus", "imposter", "pibby", "glitch", "goon", "edge", "jelq",
-    "zesty", "chungus", "bing chilling", "griddy", "quandale", "caseoh",
-    "kaicenat", "speed", "streamer", "viral", "tiktoker", "youtube",
-    "trending", "brainrot god", "la vacca", "saturno", "saturnita",
-    "gassy", "pomni", "digital circus", "mascot horror", "huggy", "poppy",
-    "banban", "garten", "fnaf", "freddy", "bendy", "baldi", "granny",
-    "slap", "smurf cat", "strawberry elephant", "blud", "dawg", "capybara",
-    "doge", "cheems", "nyan", "pepe", "wojak", "chad", "gigachad", "NPC",
-    "doomer", "bloomer", "soyjak", "skull emoji", "brainrot tycoon",
-    "brainrot simulator", "steal brainrot", "rob brainrot", "brainrot obby",
-    "brainrot rng", "brainrot evolution", "brainrot fight", "brainrot merge",
-    "brainrot box", "brainrot trade", "brainrot empire", "brainrot escape",
-    # -- Slice 3: Game Genres & Setting Modifiers (words 170-265) ----------
-    "obby", "tycoon", "simulator", "horror", "anime", "parkour", "clicker",
-    "roleplay", "zombie", "pet", "race", "tower", "fighting", "shooter",
-    "survival", "escape", "puzzle", "builder", "farming", "city", "story",
-    "adventure", "magic", "sword", "ninja", "pirate", "space", "dragon",
-    "monster", "dungeon", "arena", "battle", "war", "army", "kingdom",
-    "empire", "castle", "hero", "superhero", "villain", "prison", "school",
-    "hospital", "hotel", "restaurant", "cafe", "bakery", "salon", "spa",
-    "gym", "dance", "music", "art", "fashion", "model", "beauty", "makeup",
-    "dress", "wedding", "baby", "family", "date", "love", "romance",
-    "vampire", "werewolf", "ghost", "haunted", "spooky", "creepy", "dark",
-    "night", "murder", "mystery", "detective", "spy", "military", "naval",
-    "aviation", "spaceflight", "sci-fi", "cyberpunk", "steampunk",
-    "post apocalypse", "wasteland", "nuclear", "fallout", "wilderness",
-    "ocean", "deep sea", "subterranean", "cave", "portal", "multiversal",
-    "quantum", "apocalyptic",
-    # -- Slice 4: Emerging Meta Mechanics & RNG Hooks (words 266-335) ------
-    "aura", "rolls", "spins", "luck potion", "luck boost", "admin abuse",
-    "+1",
-    "admin event", "secret drop", "mythic drop", "legendary drop",
-    "brainrot god drop", "pity system", "trade market", "market crash",
-    "inflation", "base skin", "red carpet", "fuse machine", "rng machine",
-    "luck machine", "mutation", "shiny", "inverted", "golden", "rainbow",
-    "void", "cosmic", "celestial", "galactic", "divine", "cursed",
-    "blessed", "enchanted", "awakened", "transcended", "infinite luck",
-    "10x luck", "100x luck", "weekend event", "update log", "patch notes",
-    "secret room", "secret code", "dev code", "free code", "free ugc",
-    "robux boost", "vip pass", "gamepass", "private server", "custom server",
-    "server hop", "auto spin", "auto roll", "potion brewing", "card pack",
-    "gacha", "lootbox", "crate opening", "mystery box", "roulette",
-    "wheel spin", "jackpot", "high roller", "fortune", "outcome",
-    "probability", "odds", "golden roll", "secret luck",
-    # -- Slice 5: Anime, Pop Culture & Fandom Hooks (words 336-398) --------
-    "blox fruits", "anime battlegrounds", "strongest battlegrounds",
-    "blade ball", "anime fighting", "anime tycoon", "anime adventures",
-    "anime last stand", "jujutsu", "demon slayer", "one piece", "naruto",
-    "dragon ball", "attack on titan", "chainsaw man", "spy x family",
-    "my hero", "hunter hunter", "solo leveling", "tower of god",
-    "god of high school", "fire force", "black clover", "dr stone",
-    "re zero", "sword art online", "konosuba", "overlord", "slime isekai",
-    "mushoku tensei", "shield hero", "blue lock", "haikyuu", "kaiju no 8",
-    "wind breaker", "dandadan", "kagurabachi", "sakamoto days", "frieren",
-    "apothecary diaries", "undead unluck", "shangri la frontier", "mashle",
-    "domain expansion", "hollow purple", "bankai", "gear 5",
-    "ultra instinct", "demon mark", "sun breathing", "shadow monarch",
-    "aura flex", "haki", "devil fruit", "stand power", "chakra", "nen",
-    "grimoire", "zanpakuto", "kagune", "titan shift", "breathing style",
-    "cursed technique",
-    # -- Slice 6: High-Retention Economy & Systems (words 399-466) ---------
-    "level up", "max level", "level cap", "exponential", "stat point",
-    "skill tree", "mastery", "rank", "tier list", "meta", "best build",
-    "weapon craft", "blacksmith", "forging", "alchemy", "enchantment",
-    "soulbound", "untradeable", "auction house", "player market", "economy",
-    "stock market", "company", "business", "monopoly", "factory",
-    "automation", "worker", "minion", "pet evolution", "pet fusion",
-    "pet tier", "egg hatch", "giant pet", "huge pet", "titanic pet",
-    "exclusive pet", "secret pet", "event pet", "limited edition", "badge",
-    "achievement", "leaderboard", "top 1", "rank 1", "global rank",
-    "season pass", "battle pass", "daily streak", "daily reward",
-    "spin wheel", "login reward", "play time reward", "afk area", "world 1",
-    "world 2", "dimension", "rebirth area", "rebirth currency", "gems",
-    "diamonds", "coins", "cash", "tokens", "souls", "energy", "mana",
-    "power",
-    # -- Slice 7: Stealth, Horror & Social Friction (words 467-531) --------
-    "doors", "piggy", "evade", "pressure", "grace", "specter",
-    "phasmophobia", "lethal company", "content warning", "mimic", "entity",
-    "stalker", "jumpscare", "flashlight", "stamina", "insanity", "anomaly",
-    "backrooms", "level 0", "liminal space", "scp", "foundation",
-    "containment", "outbreak", "anomaly scanner", "night guard",
-    "camera monitor", "maze", "labyrinth", "hide and seek", "prop hunt",
-    "sheriff", "innocent", "traitor", "deceiver", "lying",
-    "social deduction", "lie", "betrayal", "backstab", "trust", "alliance",
-    "voice chat", "proximity chat", "mic up", "roast battle", "rap battle",
-    "court room", "judge", "jury", "executioner", "jailbreak", "prison life",
-    "cop vs robber", "wanted level", "bank robbery", "vault breach",
-    "laser dodge", "lockpick", "security cameras", "security guard",
-    "trespassing", "escape room", "keycard", "vent system",
-    # -- Slice 8: Social, Simulation & Creative Sandboxes (words 532-594) --
-    "brookhaven", "royale high", "adopt me", "grow a garden", "bloxburg",
-    "meepcity", "livtopia", "berry avenue", "club", "party", "house design",
-    "mansion", "penthouse", "luxury car", "supercar", "hypercar", "driving",
-    "drifting", "drag race", "offroad", "plane pilot", "flight sim",
-    "train sim", "ship captain", "submarine", "space station", "colony",
-    "civilization", "city builder", "empire builder", "castle defence",
-    "tower defence", "wave survival", "base defense", "base building",
-    "sandbox", "terraforming", "mining", "excavation", "digging",
-    "underground", "ocean exploration", "scuba", "subnautica style",
-    "raft building", "island survival", "crafting recipe",
-    "survival simulator", "homestead", "farming sim", "livestock",
-    "greenhouse", "crop yield", "harvest", "weather", "seasons", "winter",
-    "summer", "disaster", "natural disaster", "tornado", "tsunami",
-    "volcano",
-    # -- Slice 9: Combat, PvP & Movement Mechanics (words 595-661) ---------
-    "battlegrounds", "reflex pvp", "parry", "block", "dodge", "dash",
-    "combo", "air combo", "knockback", "ragdoll", "execution", "finisher",
-    "weapon skill", "sword fighting", "gun fight", "sniper", "hitscan",
-    "projectile", "raycast", "fps", "tps", "battle royale", "deathmatch",
-    "team deathmatch", "capture the flag", "king of the hill",
-    "zone control", "faction war", "guild war", "clan war", "tournament",
-    "ranked ladder", "elo", "matchmaking", "casual", "competitive", "sweat",
-    "tryhard", "mechanics", "tech", "animation cancel", "combo extender",
-    "passive skill", "ultimate", "cooldown", "stamina bar", "health bar",
-    "shield", "armor pen", "lifesteal", "critical hit", "headshot",
-    "true damage", "stun", "freeze", "burn", "poison", "shock", "wall run",    "double jump", "grappling hook", "jetpack", "glider", "slide", "mantle",
-    "vault", "sprint",
-]
-
-# Full dictionary = seeds + expansion (appended, never reshuffled — the DB
-# crawl cursor is a position, so the live cursor keeps working unchanged:
-# it simply continues from wherever it is into the expansion, then wraps).
-from keyword_expansion import KEYWORD_EXPANSION  # noqa: E402
-
-KEYWORD_DICTIONARY = _SEED_KEYWORDS + KEYWORD_EXPANSION
-
-# Number of keywords to crawl per sync (rotating slice) — the ~14.7k-word
-# dictionary swept 200 words at a time = full coverage in ~74 syncs, i.e. a
-# complete sweep in ~12h at the 10-minute finder cadence. (The old monitored
-# keyword trial — keep/revert verdicts in the finder log — has been retired.)
-KEYWORDS_PER_SYNC = 200
-
-# --- Deep charts (explore-api) ---------------------------------------------- #
-# get-sorts page 1 embeds only 5 sorts (~465 games). Its response carries a
-# nextSortsPageToken cursor that walks the FULL chart taxonomy — Top Earning,
-# Top Rated, Most Popular, Top Paid Access and every genre leaderboard
-# ("Trending in RPG", …). Roblox serves ~26 sorts / ~770 unique games over
-# ~5 pages today; the cap below is only a runaway-cursor safety ceiling.
-# The charts endpoint is the polite one (no 429 tantrums like omni-search),
-# so the whole walk costs a handful of lenient requests per finder run.
-CHARTS_SORT_PAGES = 8
-
-# Keyword-crawl depth: page 1 + pageToken follow-ups per keyword. omni-search
-# returns nextPageToken; page 2 catches games ranked just past the first page
-# for that keyword. Quality decays fast per page and the search budget is the
-# fragile one, so depth is capped at 2 by design (decision 2026-09-07).
-SEARCH_PAGES_PER_KEYWORD = 2
 
 # --------------------------------------------------------------------------- #
 # Small helpers
@@ -633,7 +431,7 @@ class RobloxPlatformScout:
         # sessions never own one, so they never rewrite pipeline rows.
         self._own_run_ids: set = set()
         # Token-bucket pacer shared by ALL batched outbound calls (metric
-        # batches, keyword slices, icons). Live evidence 2026-09-03:
+        # batches, icons). Live evidence 2026-09-03:
         # games.roblox.com grants ~11 metric batches (≈550 games) per window
         # before hard 429s (no Retry-After). The interval therefore adapts:
         # 429s stretch it (window refill beats re-hammering), 200s decay it
@@ -750,134 +548,6 @@ class RobloxPlatformScout:
                         return 0, None
                     time.sleep(0.5 * (attempt + 1))
         return status, data
-
-    # ------------------------------------------------------------------ #
-    # Search-proxy IP pool (keyword crawler escape hatch)
-    # ------------------------------------------------------------------ #
-
-    def _search_proxy_urls(self) -> List[str]:
-        """Parse RBXSCOUT_SEARCH_PROXY_URLS into an ordered proxy URL list.
-
-        Accepts comma, semicolon or newline separators; blank entries are
-        dropped. The pool always ends with the direct Roblox URL so direct is
-        the terminal fallback even when proxies are configured.
-        """
-        raw = os.environ.get(self.SEARCH_PROXY_URLS_ENV, "")
-        entries: List[str] = []
-        for part in re.split(r"[,;\n]+", raw or ""):
-            part = part.strip().rstrip("/")
-            if not part:
-                continue
-            if part == "direct" or re.match(r"^https?://[^/\s]+$", part):
-                entries.append(part)
-            else:
-                log.warning("Ignoring malformed search proxy URL: %r", part)
-        return entries + ["direct"]
-
-    def _search_request_url(self, base: str, keyword: str, sid: str, page_token: Optional[str] = None) -> str:
-        """Build the omni-search URL for one pool entry.
-
-        ``direct`` goes straight to Roblox; anything else is a proxy base URL
-        that mirrors the same path+query, e.g.
-        ``https://rbx-search-proxy.<you>.workers.dev`` →
-        ``https://rbx-search-proxy.<you>.workers.dev/search-api/omni-search?...``.
-        ``page_token`` paginates past result page 1 (omni-search returns a
-        ``nextPageToken``). Malformed proxy entries (no scheme/host) are
-        skipped.
-        """
-        q = quote(keyword)
-        path_query = f"search-api/omni-search?searchQuery={q}&pageType=all&sessionId={sid}"
-        if page_token:
-            path_query += f"&pageToken={quote(str(page_token), safe='')}"
-        if base == "direct":
-            return f"https://apis.roblox.com/{path_query}"
-        # Entries are validated in _search_proxy_urls; belt-and-suspenders:
-        return f"{base}/{path_query}"
-
-    def _search_pool_request(self, keyword: str, page_token: Optional[str] = None) -> Tuple[int, Optional[Any]]:
-        """Try the omni-search endpoint through the IP pool in order.
-
-        ``page_token`` fetches a later result page for the same keyword
-        (page 1 response carries ``nextPageToken``).
-
-        Pool order = every configured proxy, then direct Roblox. A proxy
-        attempt counts as failed on: network error, HTTP >= 500, or a 200
-        whose body is not the expected omni-search JSON (bad JSON with a 200
-        would otherwise poison the results). A 403/429 fails that PROXY only —
-        Roblox's own limits differ per IP pool, so those statuses do not
-        poison the direct attempt. Success = first 200 with parseable JSON.
-        Per-proxy failures are remembered on the instance so one dead proxy
-        stops costing a timeout on every keyword.
-        """
-        pool = self._search_proxy_urls()
-        sid = str(uuid.uuid4())
-        status, data = 0, None
-        for i, base in enumerate(pool):
-            if base != "direct" and self._search_pool_benched(base):
-                continue  # benched proxy: skip straight past it
-            url = self._search_request_url(base, keyword, sid, page_token=page_token)
-            if i > 0:
-                time.sleep(0.25)  # small settle between pool entries
-            try:
-                if base == "direct":
-                    self._emit_pace()
-                    status, data = self._get_json(url)
-                else:
-                    res = self.session.get(url, timeout=self.SEARCH_PROXY_TIMEOUT)
-                    if res.status_code == 200:
-                        try:
-                            status, data = 200, res.json()
-                        except ValueError:
-                            status, data = 200, None
-                    else:
-                        status = res.status_code
-                if status == 200 and data is not None:
-                    self._search_pool_ok(base)
-                    return status, data
-                if base != "direct":
-                    self._search_pool_fail(base)
-            except requests.RequestException as exc:
-                log.debug("Search proxy %s failed for %r: %s", base, keyword, exc)
-                status, data = 0, None
-                if base != "direct":
-                    self._search_pool_fail(base)
-        return status, data
-
-    def _search_pool_ok(self, base: str) -> None:
-        """A pool entry served a 200: clear its failure streak."""
-        if not hasattr(self, "_search_pool_health"):
-            self._search_pool_health = {}
-        self._search_pool_health[base] = {"fails": 0}
-
-    def _search_pool_fail(self, base: str) -> None:
-        """Record a pool-entry failure; after 3 consecutive fails the entry is
-        benched for 5 minutes so later keywords skip straight past it."""
-        if not hasattr(self, "_search_pool_health"):
-            self._search_pool_health = {}
-        entry = self._search_pool_health.setdefault(base, {"fails": 0, "bench_until": 0.0})
-        entry["fails"] = entry.get("fails", 0) + 1
-        if entry["fails"] >= 3:
-            entry["bench_until"] = time.monotonic() + 300.0
-            entry["fails"] = 0
-            log.warning("Search proxy %s benched for 5 minutes after repeated failures", base)
-
-    def _search_pool_benched(self, base: str) -> bool:
-        if not hasattr(self, "_search_pool_health"):
-            self._search_pool_health = {}
-        entry = self._search_pool_health.get(base)
-        return bool(entry and time.monotonic() < entry.get("bench_until", 0.0))
-
-    def _search_pool_snapshot(self) -> Dict[str, Any]:
-        """Diagnostics: which pool entry answered, bench state at crawl end."""
-        health = getattr(self, "_search_pool_health", {})
-        return {
-            "pool": self._search_proxy_urls(),
-            "benched": [b for b in health if self._search_pool_benched(b)],
-        }
-
-    # ------------------------------------------------------------------ #
-    # SQLite persistence
-    # ------------------------------------------------------------------ #
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=15)
@@ -1018,15 +688,6 @@ class RobloxPlatformScout:
             )
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS keyword_crawl_state (
-                    id INTEGER PRIMARY KEY CHECK (id = 1),
-                    next_index INTEGER DEFAULT 0,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            conn.execute(
-                """
                 CREATE TABLE IF NOT EXISTS sync_health_log (
                     run_id       INTEGER PRIMARY KEY,
                     mode         TEXT,
@@ -1045,9 +706,6 @@ class RobloxPlatformScout:
                     extra TEXT
                 )
                 """
-            )
-            conn.execute(
-                "INSERT OR IGNORE INTO keyword_crawl_state (id, next_index) VALUES (1, 0)"
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ga_visits ON game_analytics(visits)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_ga_ccu ON game_analytics(ccu)")
@@ -1075,17 +733,6 @@ class RobloxPlatformScout:
             )
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS creator_spiderweb_log (
-                    creator_id   INTEGER NOT NULL,
-                    creator_type TEXT NOT NULL,
-                    scraped_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    game_count   INTEGER DEFAULT 0,
-                    PRIMARY KEY (creator_id, creator_type)
-                )
-                """
-            )
-            conn.execute(
-                """
                 CREATE TABLE IF NOT EXISTS discovery_queue (
                     universe_id  INTEGER PRIMARY KEY,
                     source       TEXT,
@@ -1099,21 +746,6 @@ class RobloxPlatformScout:
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_dq_status ON discovery_queue(status, priority)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_csw_scraped ON creator_spiderweb_log(scraped_at)"
-            )
-            # Seed the frontier pointer once at the highest known universe
-            # ID: the scanner walks UPWARD from there into never-seen ranges
-            # (Roblox assigns IDs as increasing integers). INSERT OR IGNORE
-            # makes the seed exactly-once via the PRIMARY KEY — a WHERE
-            # NOT EXISTS around an aggregate would still emit one row.
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO scan_pointers (id, last_universe_id)
-                SELECT 'frontier_scan', COALESCE(MAX(universe_id), 10765584604)
-                FROM game_analytics
-                """
             )
 
     def _load_persisted_diagnostics(self) -> None:
@@ -1428,11 +1060,11 @@ class RobloxPlatformScout:
     ) -> pd.DataFrame:
         """Instant result set: games already in the catalog that meet the targets.
 
-        Pure SQLite — no discovery, no keyword crawl, no Roblox requests. This
+        Pure SQLite — no discovery, no Roblox requests. This
         backs the dashboard's "Sync live data" / "Start my first scan" buttons:
-        the 24/7 pipeline (Cloudflare cron → finder/hydrator workflows) already
+        the 24/7 pipeline (Cloudflare cron → hydrator/expander workflows) already
         discovered and hydrated the games, so the UI must only read and filter,
-        not re-run the finder. With no thresholds set, only games the pipeline
+        not re-run discovery. With no thresholds set, only games the pipeline
         has actually hydrated (they carry a ccu_history snapshot) are returned.
 
         ``discord`` narrows by known contact state: True = games with a
@@ -1536,203 +1168,8 @@ class RobloxPlatformScout:
         return df
 
     # ------------------------------------------------------------------ #
-    # Sourcing
+    # Place resolution (contact/scan support)
     # ------------------------------------------------------------------ #
-
-    # Keyword slices MUST carry a sessionId. Live evidence 2026-09-03:
-    # without it the endpoint answers HTTP 200 with searchResults: [] for
-    # every keyword (93/100 calls "OK", zero games parsed); with it, 40
-    # games per keyword return. Mirrors the explore-api get-sorts pattern.
-    OMNI_SEARCH_URL = (
-        "https://apis.roblox.com/search-api/omni-search"
-        "?searchQuery={q}&pageType=all&sessionId={sid}"
-    )
-    # Search-proxy fallback pool: GitHub Actions runners share a small egress
-    # IP range, so the omni-search endpoint throttles every sync to 429s
-    # (breaker trips within the first keywords). The worker proxy below is a
-    # Cloudflare Worker that mirrors the omni-search route from Cloudflare's
-    # IP pool — the same trick as the RoProxy mirror used for place
-    # resolution. Env var holds a comma/newline-separated URL list; the
-    # "direct" pool (Roblox itself) is always the last fallback so a down
-    # proxy can never take the crawler down.
-    SEARCH_PROXY_URLS_ENV = "RBXSCOUT_SEARCH_PROXY_URLS"
-    SEARCH_PROXY_TIMEOUT = 8.0  # workers cold-start; a bit above request_timeout
-
-    def fetch_discovery_games(self) -> List[Dict[str, Any]]:
-        """Roblox Discovery (explore-api): DEEP charts crawl.
-
-        Page 1 of get-sorts embeds only 5 sorts (~465 games). The response
-        carries a ``nextSortsPageToken`` cursor that walks the FULL chart
-        taxonomy — Top Earning, Top Rated, Most Popular, Top Paid Access and
-        every genre leaderboard ("Trending in RPG", …): ~26 sorts and ~770
-        unique games over ~5 polite requests today. Every page embeds its
-        sorts' games with universeId + playerCount, so no per-sort follow-up
-        requests are needed. Leaderboards rank by players playing right now,
-        which makes them exactly the net that catches successful games our
-        keyword crawl is blind to (search matches names; charts rank players).
-
-        The cursor must ride the SAME sessionId it was minted for, so one
-        UUID session id is generated per crawl and reused for every page.
-        ``CHARTS_SORT_PAGES`` caps the walk as a runaway-cursor ceiling. A
-        failed page keeps the results gathered so far — the charts endpoint
-        is the lenient one and partial data still widens the pond.
-        """
-        sid = str(uuid.uuid4())
-        url: Optional[str] = (
-            f"https://apis.roblox.com/explore-api/v1/get-sorts?sessionId={sid}"
-        )
-        games: Dict[int, Dict[str, Any]] = {}
-        status = 0
-        pages = 0
-        sort_count = 0
-        for _ in range(max(1, CHARTS_SORT_PAGES)):
-            page_status, data = self._get_json(url)
-            if page_status != 200 or not data:
-                if pages == 0:
-                    status = page_status  # page 1 dead: report the failure
-                break
-            status = 200
-            pages += 1
-            for sort in data.get("sorts") or []:
-                sort_games = sort.get("games") or []
-                if not sort_games:
-                    continue  # filters/metadata sorts carry no games
-                sort_count += 1
-                for g in sort_games:
-                    uid = g.get("universeId")
-                    if not uid:
-                        continue
-                    cur = games.setdefault(
-                        int(uid),
-                        {
-                            "universe_id": int(uid),
-                            "root_place_id": g.get("rootPlaceId"),
-                            "name": g.get("name"),
-                            "playing": g.get("playerCount"),
-                            "up_votes": g.get("totalUpVotes"),
-                            "down_votes": g.get("totalDownVotes"),
-                        },
-                    )
-                    # prefer the highest playerCount seen across charts
-                    if g.get("playerCount") and (cur.get("playing") or 0) < g["playerCount"]:
-                        cur.update(
-                            playing=g.get("playerCount"),
-                            root_place_id=g.get("rootPlaceId"),
-                        )
-            token = data.get("nextSortsPageToken")
-            if not token:
-                break
-            url = (
-                "https://apis.roblox.com/explore-api/v1/get-sorts"
-                f"?sessionId={sid}&sortsPageToken={token}"
-            )
-        self.source_diagnostics["discovery"] = {
-            "status": status,
-            "records": len(games),
-            "sorts": sort_count,
-            "pages": pages,
-        }
-        log.info(
-            "Discovery deep charts: %d page(s) -> %d sorts, %d games",
-            pages,
-            sort_count,
-            len(games),
-        )
-        return list(games.values())
-
-    def fetch_rolimons_games(self) -> Dict[int, Dict[str, Any]]:
-        """Rolimon's index (fallback/bulk): placeId -> {name, ccu, icon_url}.
-
-        Rolimon's only returns place IDs. It gives CCU (live playing), name, and
-        icon — no universe IDs, no visits, no favorites. All metric hydration
-        (CCU totals, visits, favorites, genre, creator) is done later by this
-        engine against games.roblox.com.
-
-        This method only parses the page; persisting the full catalog into the
-        DB happens in ``import_rolimons_catalog`` so scans can load the snapshot
-        instead of re-fetching the full index on every sync.
-        """
-        status, data = self._get_json("https://api.rolimons.com/games/v1/gamelist")
-        out: Dict[int, Dict[str, Any]] = {}
-        if hasattr(self, "source_diagnostics"):
-            self.source_diagnostics["rolimons"] = {"status": status}
-        if status == 200 and data and isinstance(data, dict) and data.get("success"):
-            for place_id, entry in (data.get("games") or {}).items():
-                try:
-                    place_id = int(place_id)
-                    name, playing, icon = entry[0], entry[1], entry[2]
-                except (ValueError, IndexError, TypeError):
-                    continue
-                out[place_id] = {
-                    "place_id": place_id,
-                    "name": name,
-                    "playing": playing or 0,
-                    "icon_url": icon if isinstance(icon, str) else None,
-                }
-        if hasattr(self, "source_diagnostics"):
-            self.source_diagnostics["rolimons"]["records"] = len(out)
-        log.info("Rolimon's index returned %d games", len(out))
-        return out
-
-    def import_rolimons_catalog(self) -> int:
-        """Persist the full Rolimon's gamelist into ``rolimons_catalog``.
-
-        This is the one-time bulk export (~7,000 entries). Once persisted, scans
-        load the local snapshot instead of re-fetching the Rolimon's index for
-        every candidate they consider.
-
-        Returns the number of rows in the catalog after the import (inserted +
-        existing). The table is append-or-replace per ``place_id``, so future
-        imports refresh stale entries without a separate delete pass.
-        """
-        live = self.fetch_rolimons_games()
-        if not live:
-            rol_status = (
-                self.source_diagnostics.get("rolimons", {}).get("status")
-                if hasattr(self, "source_diagnostics")
-                else None
-            )
-            if rol_status != 200:
-                log.warning("Rolimon's import skipped: index fetch failed (%s)", rol_status)
-            return self.catalog_place_count()
-        try:
-            with self._connect() as conn:
-                conn.executemany(
-                    "INSERT OR REPLACE INTO rolimons_catalog (place_id, name, playing, icon_url, cached_at) "
-                    "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)",
-                    [
-                        (info["place_id"], info["name"], info["playing"], info["icon_url"])
-                        for info in live.values()
-                    ],
-                )
-                count = conn.execute("SELECT COUNT(*) FROM rolimons_catalog").fetchone()[0]
-            log.info("Rolimon's catalog persisted %d entries", count)
-            return count
-        except sqlite3.Error as exc:
-            log.warning("Could not persist rolimons_catalog: %s", exc)
-            return self.catalog_place_count()
-
-    def catalog_place_count(self) -> int:
-        """Current number of persisted Rolimon's place entries."""
-        try:
-            with self._connect() as conn:
-                return int(conn.execute("SELECT COUNT(*) FROM rolimons_catalog").fetchone()[0])
-        except sqlite3.Error:
-            return 0
-
-    def load_rolimons_catalog(self) -> pd.DataFrame:
-        """Load the persisted Rolimon's snapshot.
-
-        Returns columns ``place_id``, ``name``, ``playing``, ``icon_url``
-        (plus any DB-added columns). Empty DataFrame when the catalog has not
-        been imported yet.
-        """
-        try:
-            with self._connect() as conn:
-                return pd.read_sql_query("SELECT * FROM rolimons_catalog", conn)
-        except (pd.errors.DatabaseError, sqlite3.Error):
-            return pd.DataFrame()
-
     def resolve_universe_ids(self, place_ids: Iterable[int]) -> Dict[int, int]:
         """Resolve place→universe mappings.
 
@@ -1783,8 +1220,8 @@ class RobloxPlatformScout:
         not_found = 0
         breaker_tripped = False
         # Per-place resolution against the healthy universes endpoint sees
-        # scattered noise: some place IDs in the Rolimon's list are deleted
-        # games (404) and occasional transient errors. Those must NOT trip the
+        # scattered noise: some place IDs resolved from deleted games are
+        # dead (404) and occasional transient errors occur. Those must NOT trip the
         # breaker — only sustained endpoint failure should. The plan target is
         # ≥25 consecutive hard failures (see GAMES_DB_PLAN.md); a fully dead
         # endpoint fails every request and still aborts quickly.
@@ -1894,281 +1331,6 @@ class RobloxPlatformScout:
 
         return {**cached, **resolved}
 
-    def fetch_search_games(self, keywords: List[str]) -> Dict[int, Dict[str, Any]]:
-        """Omni-search keyword crawler (Phase 2): discover games by keyword.
-
-        Up to ``SEARCH_PAGES_PER_KEYWORD`` (2) requests per keyword against
-        ``apis.roblox.com/search-api/omni-search?searchQuery=KW&pageType=all``:
-        page 1, then a ``pageToken`` follow-up using the response's
-        ``nextPageToken`` to catch games ranked just past the first page.
-        Page 2 failures never trip the circuit breaker and never poison page
-        1's success; their contribution is counted in diagnostics
-        (``page2_new``). The response already carries universe IDs (verified
-        live: ~40 games per keyword, no cookie, ~0.5 s per call), so no
-        place→universe conversion is needed.
-
-        Every keyword request is routed through the search-proxy IP pool
-        (``_search_pool_request``): configured Cloudflare Worker proxies first
-        (GitHub Actions runners share a small egress IP range and get 429-
-        throttled), direct Roblox always last as the terminal fallback.
-        Threaded with a circuit breaker: if the first 5 keyword calls all
-        fail, abort the slice — partial results are kept.
-
-        Returns ``{universe_id: {"universe_id", "title", "root_place_id"}}``
-        (no CCU — the batch hydrator supplies live stats afterwards).
-        """
-        if not hasattr(self, "source_diagnostics"):
-            self.source_diagnostics = {}
-        out: Dict[int, Dict[str, Any]] = {}
-        statuses: List[int] = []
-        pages_fetched = 0
-        page2_new = 0
-        if not keywords:
-            self.source_diagnostics["keyword_crawl"] = {
-                "keywords": 0, "records": 0, "breaker_tripped": False,
-                "pool": self._search_pool_snapshot(),
-            }
-            return out
-
-        def parse_payload(data: Any) -> int:
-            """Merge one omni-search payload into ``out``; return new-uid count."""
-            fresh = 0
-            # Response shape (verified live): searchResults[] each with
-            # contents[] carrying universeId + name.
-            for group in data.get("searchResults") or []:
-                for content in group.get("contents") or []:
-                    try:
-                        uid = int(content["universeId"])
-                    except (KeyError, TypeError, ValueError):
-                        continue
-                    if uid not in out:
-                        out[uid] = {
-                            "universe_id": uid,
-                            "title": content.get("name") or "Unknown",
-                            "root_place_id": content.get("rootPlaceId"),
-                        }
-                        fresh += 1
-            return fresh
-
-        def work(keyword: str):
-            """Page 1 + (depth-capped) pageToken follow-up for one keyword."""
-            results = []
-            depth = max(1, SEARCH_PAGES_PER_KEYWORD)
-            token: Optional[str] = None
-            for _ in range(depth):
-                # Only pass page_token when following up: calling with an
-                # explicit None kwarg would still break callers that override
-                # _search_pool_request with the original one-arg signature.
-                if token:
-                    status, data = self._search_pool_request(keyword, page_token=token)
-                else:
-                    status, data = self._search_pool_request(keyword)
-                results.append((status, data))
-                if status != 200 or not data:
-                    break
-                token = data.get("nextPageToken")
-                if not token:
-                    break
-            return results
-
-        consecutive_failures = 0
-        breaker_tripped = False
-        successful_keywords = 0
-        failed_keywords = 0
-        with ThreadPoolExecutor(max_workers=min(self.max_workers, 8)) as pool:
-            futures = {pool.submit(work, kw): kw for kw in keywords}
-
-            def trip_breaker() -> None:
-                nonlocal breaker_tripped
-                breaker_tripped = True
-                log.warning(
-                    "Keyword crawler circuit breaker tripped after %d consecutive failures; "
-                    "cancelling remaining keyword requests",
-                    consecutive_failures,
-                )
-                for f in futures:
-                    f.cancel()
-
-            for fut in as_completed(futures):
-                kw = futures[fut]
-                try:
-                    page_results = fut.result()
-                except Exception as exc:  # network-level failure counts as a miss
-                    log.debug("Keyword %r failed: %s", kw, exc)
-                    statuses.append(0)
-                    failed_keywords += 1
-                    consecutive_failures += 1
-                    if consecutive_failures >= 5 and not breaker_tripped:
-                        trip_breaker()
-                        break
-                    continue
-                keyword_ok = False
-                for page_no, (status, data) in enumerate(page_results, start=1):
-                    statuses.append(status)
-                    if status != 200 or not data:
-                        continue  # a dead page 2 must not poison page 1's success
-                    keyword_ok = True
-                    pages_fetched += 1
-                    fresh = parse_payload(data)
-                    if page_no > 1:
-                        page2_new += fresh  # requests beyond page 1 = deep pages
-                if keyword_ok:
-                    successful_keywords += 1
-                    consecutive_failures = 0
-                else:
-                    failed_keywords += 1
-                    consecutive_failures += 1
-                    if consecutive_failures >= 5 and not breaker_tripped:
-                        trip_breaker()
-                        break
-        crawl_diag = self._search_pool_snapshot()
-        crawl_diag.update({
-            "keywords": len(keywords),
-            "successful_keywords": successful_keywords,
-            "failed_keywords": failed_keywords,
-            "breaker_tripped": breaker_tripped,
-            "records": len(out),
-            "pages_fetched": pages_fetched,
-            "page2_new": page2_new,
-            "search_depth": max(1, SEARCH_PAGES_PER_KEYWORD),
-        })
-        self.source_diagnostics["keyword_crawl"] = crawl_diag
-        log.info(
-            "Keyword crawler: %d keywords x %d page(s) -> %d unique games "
-            "(%d from page 2+)",
-            len(keywords),
-            max(1, SEARCH_PAGES_PER_KEYWORD),
-            len(out),
-            page2_new,
-        )
-        return out
-
-    def _load_keyword_cursor(self) -> int:
-        """Read the rotating keyword-slice cursor from keyword_crawl_state."""
-        try:
-            with self._connect() as conn:
-                row = conn.execute(
-                    "SELECT next_index FROM keyword_crawl_state WHERE id = 1"
-                ).fetchone()
-                return int(row[0]) if row else 0
-        except sqlite3.Error:
-            return 0
-
-    def _advance_keyword_cursor(self, next_index: int) -> None:
-        """Persist the rotating keyword-slice cursor (wraps at the end)."""
-        try:
-            with self._connect() as conn:
-                conn.execute(
-                    "UPDATE keyword_crawl_state SET next_index = ?, updated_at = CURRENT_TIMESTAMP "
-                    "WHERE id = 1",
-                    (next_index,),
-                )
-        except sqlite3.Error as exc:
-            log.debug("Could not persist keyword_crawl_state: %s", exc)
-
-    def next_keyword_slice(self) -> Tuple[List[str], int, int]:
-        """Take the next ~KEYWORDS_PER_SYNC slice of the keyword dictionary.
-
-        The cursor rotates: after the whole dictionary has been swept it wraps
-        back to the top, so every sync keeps discovering newly published games.
-        Returns ``(keywords, start_index, end_index)`` for diagnostics.
-        """
-        total = len(KEYWORD_DICTIONARY)
-        if total == 0:
-            return [], 0, 0
-        start = self._load_keyword_cursor() % total
-        end = min(start + KEYWORDS_PER_SYNC, total)
-        keywords = KEYWORD_DICTIONARY[start:end]
-        next_index = 0 if end >= total else end
-        self._advance_keyword_cursor(next_index)
-        return keywords, start, end
-
-    def build_rolimons_candidate_pool(
-        self,
-        min_ccu: int = 0,
-        candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
-    ) -> Dict[int, Dict[str, Any]]:
-        """Build the Rolimon's-backed candidate pool from the local catalog.
-
-        When the Rolimon's catalog has been imported, every catalog entry is a
-        candidate — not just the top N — so scans no longer discard the bulk of
-        Rolimon's entries because they were never placed into the candidate pool.
-
-        CCU pre-gate keeps potentially dead entries out of the expensive
-        resolution + hydration step, but the catalog itself still retains them
-        (the table is not truncated here).
-
-        Returns ``{universe_id: {"universe_id", "root_place_id", "name", "playing", "icon_url"}}``.
-
-        Universe IDs come from the place_map cache first, then from fresh
-        resolution of unresolved catalog entries up to ``candidate_limit``.
-        This means an imported Rolimon's catalog can feed the full candidate pool
-        on its own, not just the already-resolved subset.
-        """
-        if not hasattr(self, "load_rolimons_catalog"):
-            return {}
-        catalog = self.load_rolimons_catalog()
-        if catalog.empty:
-            log.info("Rolimon's candidate pool empty: catalog not imported yet")
-            return {}
-        # CCU pre-gate: Rolimon's `playing` is fresh-ish; drop obvious
-        # sub-threshold entries so the candidate pool stays aligned with the
-        # live target and resolution work stays bounded.
-        if min_ccu > 0:
-            catalog = catalog[catalog["playing"].fillna(0) >= min_ccu]
-        if catalog.empty:
-            return {}
-        # Rank by playing so the highest-CCU entries are resolved first.
-        ranked = catalog.sort_values("playing", ascending=False)
-        place_ids = [int(p) for p in ranked["place_id"]]
-
-        # Phase 1: DB-resident universe mappings.
-        cached: Dict[int, int] = {}
-        try:
-            with self._connect() as conn:
-                if place_ids:
-                    rows = conn.execute(
-                        f"SELECT place_id, universe_id FROM place_map "
-                        f"WHERE place_id IN ({','.join('?' for _ in place_ids)})",
-                        place_ids,
-                    ).fetchall()
-                    cached = {int(pid): int(uid) for pid, uid in rows}
-        except sqlite3.Error:
-            cached = {}
-
-        # Phase 2: fresh resolution for unresolved catalog entries up to the
-        # candidate budget.
-        unresolved = [pid for pid in place_ids if pid not in cached]
-        resolved_live: Dict[int, int] = {}
-        if unresolved:
-            resolved_live = self.resolve_universe_ids(unresolved)
-            try:
-                with self._connect() as conn:
-                    conn.executemany(
-                        "INSERT OR REPLACE INTO place_map (place_id, universe_id, resolved_at) "
-                        "VALUES (?, ?, CURRENT_TIMESTAMP)",
-                        list(resolved_live.items()),
-                    )
-                    for pid, uid in resolved_live.items():
-                        cached[pid] = uid
-            except sqlite3.Error:
-                pass
-
-        pool: Dict[int, Dict[str, Any]] = {}
-        for _, row in ranked.iterrows():
-            pid = int(row["place_id"])
-            uid = cached.get(pid)
-            if uid is None or uid in pool:
-                continue
-            pool[uid] = {
-                "universe_id": uid,
-                "root_place_id": pid,
-                "name": row["name"],
-                "playing": int(row["playing"] or 0),
-                "icon_url": row["icon_url"],
-            }
-            if len(pool) >= candidate_limit:
-                break
         return pool
 
     def prune_catalog(self, max_strikes: int = ZERO_CCU_STRIKES_TO_PRUNE) -> int:
@@ -2449,18 +1611,6 @@ class RobloxPlatformScout:
         }
         return out
 
-    def fetch_trending_universe_ids(self, limit: int = 500) -> List[int]:
-        """Bulk popular universe ids (Discovery first, Rolimon's fallback)."""
-        ids = [g["universe_id"] for g in self.fetch_discovery_games()]
-        if not ids:
-            roli = self.fetch_rolimons_games()
-            top = sorted(roli.values(), key=lambda g: -g["playing"])[:limit]
-            resolved = self.resolve_universe_ids([g["place_id"] for g in top])
-            ids = list(resolved.values())
-        return ids[:limit]
-
-    # ------------------------------------------------------------------ #
-    # Contact resolution (Tiers 1-4)
     # ------------------------------------------------------------------ #
 
     @staticmethod
@@ -2743,8 +1893,8 @@ class RobloxPlatformScout:
         return None
 
     # ------------------------------------------------------------------ #
-    # Catalog expansion pilot: creator spiderwebbing + frontier scan
-    # (EXPANSION_PILOT.md — strict gate: nothing below 20k visits / 25 CCU
+    # Catalog expansion: Atlas Dev seed harvest + discovery-queue drain
+    # (ATLAS_PLAN_REVIEW.md — strict gate: nothing below 20k visits / 25 CCU
     # is ever stored in game_analytics; discards live in discovery_queue)
     # ------------------------------------------------------------------ #
 
@@ -2831,142 +1981,6 @@ class RobloxPlatformScout:
             and int(meta.get("ccu") or 0) >= EXPANSION_TARGET_CCU
         }
 
-    def fetch_creator_portfolio(
-        self, creator_id: int, creator_type: str
-    ) -> Optional[List[Dict[str, Any]]]:
-        """Fetch one creator's public game portfolio (cursor-followed).
-
-        Verified live 2026-09-17 (Phase-0 spike):
-          * groups: /v2/groups/{id}/games?accessFilter=Public — limit 100 OK
-          * users:  /v2/users/{id}/games?accessFilter=Public — limit 50 (100 -> HTTP 400)
-          * both paginate via nextPageCursor and carry placeVisits for free
-        Returns portfolio rows {universe_id, name, root_place_id, place_visits}.
-        Returns None when the FIRST page fails (deleted group, banned user,
-        429 window) so the caller does NOT log the creator — the next expand
-        run retries them. Returns [] only for a real empty portfolio.
-        """
-        creator_type = (creator_type or "User").strip().capitalize()
-        if creator_type == "Group":
-            base = f"https://games.roblox.com/v2/groups/{int(creator_id)}/games"
-            limit = SPIDERWEB_GROUP_LIMIT
-        else:
-            base = f"https://games.roblox.com/v2/users/{int(creator_id)}/games"
-            limit = SPIDERWEB_USER_LIMIT
-        games: List[Dict[str, Any]] = []
-        cursor: Optional[str] = None
-        for page_index in range(SPIDERWEB_MAX_PAGES):
-            url = f"{base}?accessFilter=Public&limit={limit}&sortOrder=Asc"
-            if cursor:
-                url += f"&cursor={quote(str(cursor), safe='')}"
-            status, data = self._get_json(url)
-            if status != 200 or not isinstance(data, dict):
-                if page_index == 0:
-                    return None  # unknown state — retryable, creator not logged
-                break           # later-page failure: keep earlier pages
-            for g in data.get("data") or []:
-                uid = g.get("id")
-                if not uid:
-                    continue
-                root = g.get("rootPlace") if isinstance(g.get("rootPlace"), dict) else {}
-                try:
-                    place_visits = int(g.get("placeVisits") or 0)
-                except (TypeError, ValueError):
-                    place_visits = 0
-                games.append({
-                    "universe_id": int(uid),
-                    "name": g.get("name"),
-                    "root_place_id": (root or {}).get("id"),
-                    "place_visits": place_visits,
-                })
-            cursor = data.get("nextPageCursor")
-            if not cursor:
-                break
-        return games
-
-    def _log_spiderweb(self, creator_id: int, creator_type: str, game_count: int) -> None:
-        creator_type = (creator_type or "User").strip().capitalize()
-        try:
-            with self._connect() as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO creator_spiderweb_log "
-                    "(creator_id, creator_type, scraped_at, game_count) "
-                    "VALUES (?, ?, CURRENT_TIMESTAMP, ?)",
-                    (int(creator_id), creator_type, int(game_count)),
-                )
-        except sqlite3.Error as exc:
-            log.warning("creator_spiderweb_log write failed: %s", exc)
-
-    def spiderweb_creators(
-        self,
-        limit_creators: int = EXPAND_SPIDERWEB_CREATORS_DEFAULT,
-        progress_cb: Optional[Callable[[float, str], None]] = None,
-    ) -> Dict[str, int]:
-        """Crawl portfolios for the next slice of not-recently-crawled creators.
-
-        Seed list = every distinct (creator_id, creator_type) already in
-        game_analytics — pure SQL, zero request cost (~14.6k creators today).
-        Creators logged within SPIDERWEB_RESCRAPE_DAYS are skipped; failed
-        fetches (None) are never logged so they retry next run; genuinely
-        empty portfolios log with game_count=0 and retry after the TTL.
-        Every portfolio game passing the free placeVisits pre-gate is
-        enqueued at priority 1 ("group_spiderweb") for the queue drain.
-        """
-        report = progress_cb or (lambda p, m: None)
-        cutoff = time.strftime(
-            "%Y-%m-%d %H:%M:%S",
-            time.gmtime(time.time() - SPIDERWEB_RESCRAPE_DAYS * 86400),
-        )
-        stats = {"crawled": 0, "failed": 0, "empty": 0, "games_found": 0, "pregate_passed": 0, "enqueued": 0}
-        try:
-            with self._connect() as conn:
-                rows = conn.execute(
-                    """
-                    SELECT DISTINCT ga.creator_id, COALESCE(ga.creator_type, 'User')
-                    FROM game_analytics ga
-                    WHERE ga.creator_id IS NOT NULL
-                      AND NOT EXISTS (
-                        SELECT 1 FROM creator_spiderweb_log l
-                        WHERE l.creator_id = ga.creator_id
-                          AND l.creator_type = COALESCE(ga.creator_type, 'User')
-                          AND l.scraped_at > ?
-                      )
-                    ORDER BY ga.creator_id
-                    LIMIT ?
-                    """,
-                    (cutoff, max(1, int(limit_creators))),
-                ).fetchall()
-        except sqlite3.Error as exc:
-            log.warning("spiderweb seed query failed: %s", exc)
-            return stats
-        if not rows:
-            return stats
-        report(0.0, f"Spiderwebbing {len(rows)} creators…")
-        for index, (creator_id, creator_type) in enumerate(rows, start=1):
-            games = self.fetch_creator_portfolio(creator_id, creator_type)
-            if games is None:
-                stats["failed"] += 1  # not logged — retried next run
-            elif not games:
-                stats["empty"] += 1
-                self._log_spiderweb(creator_id, creator_type, 0)
-            else:
-                stats["crawled"] += 1
-                stats["games_found"] += len(games)
-                passing = [
-                    g for g in games
-                    if int(g.get("place_visits") or 0) >= SPIDERWEB_VISITS_PREGATE
-                ]
-                stats["pregate_passed"] += len(passing)
-                stats["enqueued"] += self._enqueue_discovery(
-                    (int(g["universe_id"]), "group_spiderweb", 1) for g in passing
-                )
-                self._log_spiderweb(creator_id, creator_type, len(games))
-            if index % 10 == 0 or index == len(rows):
-                report(
-                    index / len(rows),
-                    f"Spiderweb {index}/{len(rows)} creators · "
-                    f"+{stats['games_found']} games · +{stats['pregate_passed']} pass pre-gate",
-                )
-        return stats
 
     def _reset_stale_queue_claims(self) -> None:
         """Self-heal 'processing' claims left by a crashed run (claims only
@@ -3018,13 +2032,13 @@ class RobloxPlatformScout:
     ) -> Dict[str, int]:
         """Hydrate queued candidates and store ONLY strict-gate qualifiers.
 
-        Claims up to ``batches`` x 50 pending IDs (priority 1 spiderweb first),
+        Claims up to ``batches`` x 50 pending IDs in priority order,
         skips IDs already in the catalog (the hydrator owns refreshing those),
         hydrates the rest through the shared paced metrics endpoint, and
         upserts qualifying games via upsert_game — full tier stamping, blow-up
         flag, ccu_history snapshot, found_via='expansion'. Every evaluated ID
         gets an outcome in the queue so nothing is re-hydrated before the
-        14-day re-spider window re-enqueues it.
+        daily Atlas harvest re-enqueues it.
         """
         report = progress_cb or (lambda p, m: None)
         self._reset_stale_queue_claims()
@@ -3100,249 +2114,42 @@ class RobloxPlatformScout:
         )
         return stats
 
-    def load_frontier_pointer(self) -> int:
-        """Read the frontier-scan high-water mark (defaults to the seed ID)."""
-        try:
-            with self._connect() as conn:
-                row = conn.execute(
-                    "SELECT last_universe_id FROM scan_pointers WHERE id = 'frontier_scan'"
-                ).fetchone()
-            if row and row[0]:
-                return int(row[0])
-        except sqlite3.Error:
-            pass
-        return 10_765_584_604  # Phase-0 seed: max known universe ID 2026-09-17
 
-    def _advance_frontier_pointer(self, new_value: int) -> None:
-        try:
-            with self._connect() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO scan_pointers (id, last_universe_id, updated_at)
-                    VALUES ('frontier_scan', ?, CURRENT_TIMESTAMP)
-                    ON CONFLICT(id) DO UPDATE SET
-                        last_universe_id = excluded.last_universe_id,
-                        updated_at = CURRENT_TIMESTAMP
-                    """,
-                    (int(new_value),),
-                )
-        except sqlite3.Error as exc:
-            log.warning("frontier pointer update failed: %s", exc)
-
-    def scan_frontier(
+    def run_expansion(
         self,
-        batches: int = EXPAND_FRONTIER_BATCHES_DEFAULT,
+        queue_batches: Optional[int] = None,
         progress_cb: Optional[Callable[[float, str], None]] = None,
-    ) -> Dict[str, int]:
-        """Sequential universe-ID scan upward from the frontier pointer.
+    ) -> Dict[str, Any]:
+        """One expansion pass: Atlas Dev harvest → discovery-queue drain.
 
-        Roblox assigns universe IDs as increasing integers, so scanning the
-        range just past the highest known ID catches brand-new games — the
-        ones that can hit 20k visits within days of launch. Each batch of 50
-        IDs costs ONE metrics request; strict-gate qualifiers are upserted
-        with found_via='expansion' and everything else is recorded in the
-        discovery queue (outcome='below_gate') so a range is never re-spent.
-        The pointer only advances AFTER evaluation, so a crashed run re-scans
-        its range instead of skipping it.
+        Atlas Dev is the sole discovery engine — the creator spiderweb,
+        frontier scan, and recommendations mining were removed 2026-09-20
+        (ATLAS_PLAN_REVIEW.md). The drain hydrates Atlas seeds through the
+        strict 20k/25 gate. Both sub-steps are bounded and share the pacer,
+        so this pass can never breach the hydrator's T1/T2 floors — it runs
+        inside the expander workflow slot, not the 5-minute hydrator.
         """
         report = progress_cb or (lambda p, m: None)
-        stats = {"scanned": 0, "already_known": 0, "qualified": 0, "below_gate": 0, "start_id": 0, "end_id": 0}
-        batches = max(0, int(batches))
-        if batches == 0:
-            return stats
-        start = self.load_frontier_pointer() + 1
-        ids = list(range(start, start + batches * METRICS_BATCH_SIZE))
-        stats["start_id"] = start
-        stats["end_id"] = ids[-1]
-        existing: set = set()
-        try:
-            with self._connect() as conn:
-                for i in range(0, len(ids), 900):
-                    chunk = ids[i : i + 900]
-                    marks = ",".join("?" for _ in chunk)
-                    have = conn.execute(
-                        f"SELECT universe_id FROM game_analytics WHERE universe_id IN ({marks})",
-                        chunk,
-                    ).fetchall()
-                    existing.update(int(r[0]) for r in have)
-        except sqlite3.Error:
-            existing = set()
-        to_check = [uid for uid in ids if uid not in existing]
-        stats["already_known"] = len(existing)
-        report(0.2, f"Frontier scan {start:,} → {ids[-1]:,} ({len(to_check)} fresh IDs)…")
-        if to_check:
-            all_metas = self.fetch_game_metrics(to_check)
-            qualified = self._qualified_only(all_metas)
-            stats["qualified"] = len(qualified)
-            stats["below_gate"] = sum(1 for uid in to_check if uid in all_metas and uid not in qualified)
-            for uid, meta in qualified.items():
-                self.upsert_game({
-                    "universe_id": int(uid),
-                    "root_place_id": meta.get("root_place_id"),
-                    "title": meta.get("title"),
-                    "ccu": meta.get("ccu"),
-                    "peak_ccu": meta.get("ccu"),
-                    "visits": meta.get("visits"),
-                    "favorites": meta.get("favorites"),
-                    "genre": meta.get("genre"),
-                    "creator_name": meta.get("creator_name"),
-                    "creator_type": meta.get("creator_type"),
-                    "creator_id": meta.get("creator_id"),
-                    "description": meta.get("description"),
-                    "found_via": "expansion",
-                })
-            # Record every evaluated discard (and evaluated-and-qualified ID)
-            # in the dedup memory so future spiderweb/seed passes skip them.
-            self._enqueue_discovery(
-                (uid, "sequential_scan", 3) for uid in to_check
-            )
-            for uid in to_check:
-                outcome = "qualified" if uid in qualified else (
-                    "below_gate" if uid in all_metas else "metrics_failed"
-                )
-                self._mark_discovery_outcome(uid, outcome)
-            stats["scanned"] = len(to_check)
-        # Only NOW move the high-water mark: a crash above leaves the range
-        # to be re-scanned next run instead of silently skipped.
-        self._advance_frontier_pointer(ids[-1])
-        report(
-            0.95,
-            f"Frontier advanced to {ids[-1]:,} · {stats['qualified']} qualified · "
-            f"{stats['below_gate']} below gate",
+        drain_limit = (
+            queue_batches
+            if queue_batches is not None
+            else _env_int("EXPAND_QUEUE_BATCHES", EXPAND_QUEUE_BATCHES_DEFAULT)
         )
-        return stats
-
-    def mine_recommendations(
-        self,
-        seed_count: int = EXPAND_REC_SEEDS_DEFAULT,
-        progress_cb: Optional[Callable[[float, str], None]] = None,
-    ) -> Dict[str, int]:
-        """Harvest Roblox's player-overlap graph as a third candidate source.
-
-        For each seed universe the recommendations endpoint returns ~6 games
-        players of the seed also play (live-verified: one page, maxRows
-        ignored, pagination repeats). Seeds are chosen ONLY from the small
-        band (20k-100k visits, CCU>=25) and recent expansion qualifiers —
-        giant seeds return 100% games already in the catalog, so they are
-        excluded by design. New IDs flow into the shared discovery queue at
-        priority 2 (below fresh spiderweb candidates, above frontier), and
-        the drain's strict gate owns the 20k/25 verdict.
-
-        Seed rotation: a single 'rec_seed' scan pointer advances through the
-        pool ordered by most recently updated, so each run sweeps a fresh
-        slice of the pool with zero overlap between consecutive runs, and
-        the next run cycles back around once the pool is exhausted. Seed
-        requests count against no batch quota (1 lightweight GET per seed);
-        failures just skip the seed for this run.
-        """
-        report = progress_cb or (lambda p, m: None)
-        stats = {"seeds": 0, "failed": 0, "recs_seen": 0, "known": 0, "enqueued": 0}
-        seed_count = max(0, int(seed_count))
-        if seed_count == 0:
-            return stats
+        result: Dict[str, Any] = {}
+        # Atlas first (enqueue-only; its seeds drain from the NEXT run on —
+        # daily cadence), then the drain so same-run enqueued candidates
+        # (manual/forced harvests) still process this run.
+        report(0.02, "Expansion pass: Atlas Dev seed harvest…")
         try:
-            with self._connect() as conn:
-                pool = [int(r[0]) for r in conn.execute(
-                    """
-                    SELECT universe_id FROM game_analytics
-                    WHERE visits BETWEEN 20000 AND 100000 AND ccu >= 25
-                    """
-                ).fetchall()]
-                recent = [int(r[0]) for r in conn.execute(
-                    """
-                    SELECT universe_id FROM game_analytics
-                    WHERE found_via = 'expansion' AND visits >= 20000 AND ccu >= 25
-                    ORDER BY last_updated DESC LIMIT ?
-                    """,
-                    (REC_SEED_RECENT_CAP,),
-                ).fetchall()]
-        except sqlite3.Error as exc:
-            log.warning("rec-mining seed query failed: %s", exc)
-            return stats
-        pool_set = set(pool)
-        seeds = list(pool_set | (set(recent) - pool_set))
-        if not seeds:
-            return stats
-        seeds.sort()  # deterministic rotation order
-        start = self._load_rec_seed_cursor() % len(seeds)
-        rotation = seeds[start:] + seeds[:start]
-        batch = rotation[:seed_count]
-        stats["seeds"] = len(batch)
-        if batch:
-            self._advance_rec_seed_cursor((start + len(batch)) % len(seeds))
-        # ~94% of rec rows point at games we already know (spike 2026-09-19).
-        # Filter against catalog + queue IN-PROCESS so only genuinely new IDs
-        # reach the queue — enqueueing known games would just burn queue rows
-        # and drain claim slots on rows that end up 'already_in_catalog'.
-        known: set = set()
-        try:
-            with self._connect() as conn:
-                known.update(int(r[0]) for r in conn.execute(
-                    "SELECT universe_id FROM game_analytics"))
-                known.update(int(r[0]) for r in conn.execute(
-                    "SELECT universe_id FROM discovery_queue"))
-        except sqlite3.Error:
-            known = set()
-        report(0.0, f"Recommendations mining: {len(batch)} small-band seeds…")
-        for index, uid in enumerate(batch, start=1):
-            status, data = self._get_json(
-                REC_RECOMMENDATIONS_URL.format(universe_id=uid))
-            if status != 200 or not isinstance(data, dict):
-                stats["failed"] += 1
-            else:
-                games = data.get("games") or []
-                stats["recs_seen"] += len(games)
-                items = []
-                for g in games:
-                    rec_uid = g.get("universeId")
-                    try:
-                        rec_uid = int(rec_uid)
-                    except (TypeError, ValueError):
-                        continue
-                    if rec_uid in known or rec_uid == uid:
-                        stats["known"] += 1
-                        continue
-                    known.add(rec_uid)  # dedup within the same harvest too
-                    # priority 2: below fresh spiderweb (1), above frontier (3)
-                    items.append((rec_uid, "rec_mining", 2))
-                stats["enqueued"] += self._enqueue_discovery(items)
-            if index % 10 == 0 or index == len(batch):
-                report(
-                    index / len(batch),
-                    f"Rec mining {index}/{len(batch)} seeds · "
-                    f"+{stats['enqueued']} new candidates enqueued",
-                )
-        return stats
-
-    def _load_rec_seed_cursor(self) -> int:
-        """Read the rec-seed rotation cursor (position in the sorted pool)."""
-        try:
-            with self._connect() as conn:
-                row = conn.execute(
-                    "SELECT last_universe_id FROM scan_pointers WHERE id = 'rec_seed'"
-                ).fetchone()
-            if row and row[0] is not None:
-                return int(row[0])
-        except sqlite3.Error:
-            pass
-        return 0
-
-    def _advance_rec_seed_cursor(self, new_value: int) -> None:
-        """Persist the rec-seed rotation cursor (mod applied by the caller)."""
-        try:
-            with self._connect() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO scan_pointers (id, last_universe_id, updated_at)
-                    VALUES ('rec_seed', ?, CURRENT_TIMESTAMP)
-                    ON CONFLICT(id) DO UPDATE SET
-                        last_universe_id = excluded.last_universe_id,
-                        updated_at = CURRENT_TIMESTAMP
-                    """,
-                    (int(new_value),),
-                )
-        except sqlite3.Error as exc:
-            log.warning("rec-seed cursor update failed: %s", exc)
+            result["atlas"] = self.harvest_atlas_seeds(progress_cb=report)
+        except Exception as exc:  # Atlas must never take the drain down
+            log.warning("Atlas harvest failed (drain continues): %s", exc)
+            result["atlas"] = {"error": str(exc), "enqueued": 0}
+        report(0.5, "Expansion pass: draining the discovery queue…")
+        result["drain"] = self.drain_discovery_queue(drain_limit, progress_cb=report)
+        self.source_diagnostics["expansion"] = result
+        self.last_scan["expansion"] = result
+        return result
 
     # ------------------------------------------------------------------ #
     # Atlas Dev seed ingestion (ATLAS_PLAN_REVIEW.md) — discovery only.
@@ -3676,72 +2483,6 @@ class RobloxPlatformScout:
         report(0.95, f"Atlas harvest: +{stats['enqueued']} queued, {stats['provisional_rows']} first-paint rows")
         return stats
 
-    def run_expansion(
-        self,
-        spiderweb_creators: Optional[int] = None,
-        queue_batches: Optional[int] = None,
-        frontier_batches: Optional[int] = None,
-        rec_seeds: Optional[int] = None,
-        progress_cb: Optional[Callable[[float, str], None]] = None,
-    ) -> Dict[str, Any]:
-        """One expansion pass: spiderweb → queue drain → frontier scan.
-
-        Pilot rates come from the env knobs (see EXPANSION_PILOT.md); every
-        sub-step is bounded and the whole pass reuses the shared pacer, so it
-        can never breach the hydrator's T1/T2 floors — it runs inside the
-        finder-style workflow slot, not the 5-minute hydrator.
-        """
-        report = progress_cb or (lambda p, m: None)
-        # Retirement defaults (2026-09-19): spiderweb 37 lifetime qualifiers,
-        # frontier 0/11,500, recs ~0.4 new/request — Atlas (ATLAS_PLAN_REVIEW.md)
-        # replaces discovery at ~65-74% new IDs/page. The QUEUE DRAIN stays on:
-        # it is what hydrates Atlas seeds through the strict gate. Explicit
-        # parameters win over env; env wins over the retired-engine defaults.
-        web_limit = (
-            spiderweb_creators
-            if spiderweb_creators is not None
-            else _env_int("EXPAND_SPIDERWEB_CREATORS", EXPAND_SPIDERWEB_CREATORS_RETIRED)
-        )
-        drain_limit = (
-            queue_batches
-            if queue_batches is not None
-            else _env_int("EXPAND_QUEUE_BATCHES", EXPAND_QUEUE_BATCHES_DEFAULT)
-        )
-        frontier_limit = (
-            frontier_batches
-            if frontier_batches is not None
-            else _env_int("EXPAND_FRONTIER_BATCHES", EXPAND_FRONTIER_BATCHES_RETIRED)
-        )
-        rec_limit = (
-            rec_seeds
-            if rec_seeds is not None
-            else _env_int("EXPAND_REC_SEEDS", EXPAND_REC_SEEDS_RETIRED)
-        )
-        result: Dict[str, Any] = {}
-        # Atlas first (enqueue-only; its seeds drain from the NEXT run on —
-        # daily cadence), then the legacy order: spiderweb → recs → drain →
-        # frontier, so same-run enqueued candidates still drain this run.
-        report(0.02, "Expansion pass: Atlas Dev seed harvest…")
-        try:
-            result["atlas"] = self.harvest_atlas_seeds(progress_cb=report)
-        except Exception as exc:  # Atlas must never take the drain down
-            log.warning("Atlas harvest failed (drain continues): %s", exc)
-            result["atlas"] = {"error": str(exc), "enqueued": 0}
-        if web_limit:
-            report(0.2, "Expansion pass: creator spiderwebbing…")
-            result["spiderweb"] = self.spiderweb_creators(web_limit, progress_cb=report)
-        if rec_limit:
-            report(0.35, "Expansion pass: recommendations mining…")
-            result["rec_mining"] = self.mine_recommendations(rec_limit, progress_cb=report)
-        report(0.5, "Expansion pass: draining the discovery queue…")
-        result["drain"] = self.drain_discovery_queue(drain_limit, progress_cb=report)
-        if frontier_limit:
-            report(0.75, "Expansion pass: frontier scan…")
-            result["frontier"] = self.scan_frontier(frontier_limit, progress_cb=report)
-        self.source_diagnostics["expansion"] = result
-        self.last_scan["expansion"] = result
-        return result
-
     # ------------------------------------------------------------------ #
     # Full scan orchestration
     # ------------------------------------------------------------------ #
@@ -3760,29 +2501,27 @@ class RobloxPlatformScout:
     ) -> pd.DataFrame:
         """Fetch metrics, apply target thresholds, and optionally check contacts.
 
-        ``candidate_limit`` deliberately bounds place-to-universe expansion. The
-        Roblox/Rolimon's sources do not expose one public, bulk endpoint for all
-        visit metrics, so resolving every catalog entry would be needlessly slow.
-        Contact requests are separate so the UI can load them page by page.
+        ``candidate_limit`` is a legacy bound from the removed discovery
+        phases; the discovery-queue drain and the tier scheduler own all
+        selection now. Contact requests are separate so the UI can load them
+        page by page.
 
-        ``phases`` splits the two jobs that used to share one run budget:
+        ``phases`` splits the pipeline's jobs:
         - ``"hydrate"`` — drain the tier-due refresh queue for games ALREADY
           in the catalog. No discovery requests; the cheap, fast pass the
           5-minute cron runs. Tier cadences are wall-clock hours, so this
           stays correct at any call frequency.
-        - ``"find"`` — discovery charts + Rolimons + the next keyword slice;
-          every candidate found is hydrated immediately (a mandatory one-time
-          pass — a game with no stats cannot be tiered).
-        - ``None`` (default) — the historical full pipeline: find + hydrate.
+        - ``"expand"`` — Atlas Dev harvest + discovery-queue drain through
+          the strict gate (the expander workflow's pass).
+        - ``None`` (default) — full pipeline: hydrate + expand.
         """
         selected = [p.strip().lower() for p in (phases or ()) if p and p.strip()]
-        invalid = [p for p in selected if p not in ("find", "hydrate", "expand")]
+        invalid = [p for p in selected if p not in ("hydrate", "expand")]
         if invalid:
             raise ValueError(
-                f"Unknown scan phases: {invalid}. Use 'find', 'hydrate', 'expand', or None."
+                f"Unknown scan phases: {invalid}. Use 'hydrate', 'expand', or None."
             )
-        phase_set = set(selected) or {"find", "hydrate"}
-        do_find = "find" in phase_set
+        phase_set = set(selected) or {"hydrate", "expand"}
         do_hydrate = "hydrate" in phase_set
         do_expand = "expand" in phase_set
         report = progress_cb or (lambda p, m: None)
@@ -3840,129 +2579,15 @@ class RobloxPlatformScout:
             return self._scan_expand(min_visits, min_ccu, progress_cb)
 
         try:
-            if do_find:
-                report(0.02, "Crawling deep charts (full leaderboard taxonomy)…")
-                discovery = self.fetch_discovery_games()
-            else:
-                discovery = []  # hydrate-only: zero discovery traffic
-            self.last_scan["keyword_slice_start"] = 0
-            self.last_scan["keyword_slice_end"] = 0
-            self.last_scan["keyword_discovered"] = 0
-
+            # Discovery (the former find phase: deep charts, Rolimons,
+            # keyword crawler) was removed 2026-09-20 — Atlas Dev is the sole
+            # candidate source now; full runs hydrate the tier-due queue only.
             # ------------------------------------------------------------------
-            # Rolimon's backend: DB-backed full catalog, not a live top-N slice.
-            # ------------------------------------------------------------------
-            catalog_count = self.catalog_place_count()
-            catalog_loaded = catalog_count > 0
-            if do_find and not catalog_loaded:
-                report(0.05, "Importing full Rolimon's catalog…")
-                catalog_count = self.import_rolimons_catalog()
-                catalog_loaded = catalog_count > 0
-            self.source_diagnostics["rolimons"] = {
-                "status": (
-                    self.source_diagnostics.get("rolimons", {}).get("status")
-                    if self.source_diagnostics.get("rolimons")
-                    else 200
-                ),
-                "records": catalog_count,
-                "catalog_loaded": catalog_loaded,
-                "imported_now": not catalog_loaded or catalog_count == catalog_count,
-            }
-            # Fix: diagnostic `records` should reflect what was actually used
-            # (catalog size), not a stale fetch count.
-            self.source_diagnostics["rolimons"]["records"] = catalog_count
-
-            candidates: Dict[int, Dict[str, Any]] = {}
-
-            # Discovery: universe IDs direct, ranked by live CCU.
-            discovery_ranked = sorted(
-                discovery,
-                key=lambda g: -(g.get("playing") or (g.get("up_votes") or 0) / 50 or 0),
-            )
-            if min_ccu > 0:
-                discovery_ranked = [
-                    g for g in discovery_ranked if int(g.get("playing") or 0) >= min_ccu
-                ]
-            if not do_find:
-                discovery_ranked = []
-            for game in discovery_ranked:
-                uid = int(game["universe_id"])
-                if uid in candidates:
-                    continue
-                candidates[uid] = game
-                if len(candidates) >= candidate_limit:
-                    break
-
-            # DB-backed Rolimon's pool.
-            # Discovery already filled candidates from the front page; if slots
-            # remain, Rolimon's catalog entries are added with full resolution so
-            # more niche games can enter the candidate pool. (Find phase only.)
-            slots = max(0, candidate_limit - len(candidates))
-            roli_pool = (
-                self.build_rolimons_candidate_pool(
-                    min_ccu=min_ccu,
-                    candidate_limit=slots,
-                )
-                if do_find
-                else {}
-            )
-            for uid, meta in roli_pool.items():
-                if uid in candidates:
-                    continue
-                candidates[uid] = meta
-                if len(candidates) >= candidate_limit:
-                    break
-
-            # Phase 2: keyword crawler — take the next rotating slice of the
-            # keyword dictionary (KEYWORDS_PER_SYNC words) and advance the
-            # cursor, wrapping back to the top of the dictionary after the
-            # last slice. This makes the catalog grow every sync without a
-            # separate cron server.
-            # separate cron server. (Find phase only; the throttled omni-search
-            # endpoint never runs on hydrate-only passes, and the cursor must
-            # not advance on those either.)
-            kw_start, kw_end, search_games = 0, 0, {}
-            if do_find:
-                keywords, kw_start, kw_end = self.next_keyword_slice()
-                report(0.12, f"Keyword slice {kw_start + 1}–{kw_end} of {len(KEYWORD_DICTIONARY)}…")
-                search_games = self.fetch_search_games(keywords)
-                self.last_scan.update({
-                    "keyword_slice_start": kw_start,
-                    "keyword_slice_end": kw_end,
-                    "keyword_discovered": len(search_games),
-                })
-            for uid, info in search_games.items():
-                if uid not in candidates:
-                    candidates[uid] = {
-                        "universe_id": uid,
-                        "root_place_id": info.get("root_place_id"),
-                        "name": info.get("title"),
-                        "playing": 0,
-                    }
-
-            ranked = sorted(
-                candidates.values(),
-                key=lambda g: -(g.get("playing") or (g.get("up_votes") or 0) / 50 or 0),
-            )[:candidate_limit]
-            universe_ids = [int(g["universe_id"]) for g in ranked]
-            self.last_scan["candidate_count"] = len(universe_ids)
-            if not universe_ids and not do_hydrate:
-                # Find/full runs with zero candidates have nothing to do.
-                # A hydrate-only run EXPECTS zero candidates (no discovery)
-                # and falls through to drain the tier-due queue instead.
-                report(1.0, "No games sourced.")
-                self.last_scan.update({"status": "complete", "metrics_count": 0, "matched_count": 0})
-                self._finish_scan()
-                return pd.DataFrame()
-
-            # ------------------------------------------------------------------
-            # Budgeted hydration: brand-new candidates first (they have no
-            # stats yet, so they cannot be tiered — a mandatory one-time pass),
-            # then known games selected by tier cadence until the per-sync
-            # request budget is spent. Whatever does not fit rolls to the next
-            # sync; tiers not due cost zero requests. Find-only runs skip
-            # draining the known-game queue entirely — that is the hydrator's
-            # job now, so discovery can never starve it.
+            # Budgeted hydration: known games selected by tier cadence until
+            # the per-sync request budget is spent. Whatever does not fit
+            # rolls to the next sync; tiers not due cost zero requests.
+            # New-game hydration is owned by the discovery-queue drain, which
+            # runs on expand passes (Atlas seeds) — never here.
             # ------------------------------------------------------------------
             if do_hydrate:
                 schedule = self.load_tier_refresh_ids(
@@ -3973,28 +2598,13 @@ class RobloxPlatformScout:
             self.last_scan["tier_schedule"] = schedule["groups"]
             self.last_scan["tier_counts"] = schedule["tier_counts"]
             known_due = schedule["ids"]
-            existing: set = set()
-            try:
-                with self._connect() as conn:
-                    for i in range(0, len(universe_ids), 900):
-                        chunk = universe_ids[i : i + 900]
-                        marks = ",".join("?" for _ in chunk)
-                        rows = conn.execute(
-                            f"SELECT universe_id FROM game_analytics WHERE universe_id IN ({marks})",
-                            chunk,
-                        ).fetchall()
-                        existing.update(int(r[0]) for r in rows)
-            except sqlite3.Error:
-                existing = set()
-            new_ids = [uid for uid in universe_ids if uid not in existing]
             budget_cap = HYDRATION_BUDGET_PER_SYNC * 50
-            budget_ids = new_ids + known_due  # known_due are catalog rows; no overlap with new_ids
-            hydration_ids = budget_ids[:budget_cap]
+            hydration_ids = known_due[:budget_cap]
             self.last_scan["hydration_budget"] = {
-                "new": len(new_ids),
+                "new": 0,
                 "known_due": len(known_due),
                 "hydrated": len(hydration_ids),
-                "deferred": max(0, len(budget_ids) - len(hydration_ids)),
+                "deferred": max(0, len(known_due) - len(hydration_ids)),
                 "budget_batches": HYDRATION_BUDGET_PER_SYNC,
             }
 
@@ -4029,7 +2639,7 @@ class RobloxPlatformScout:
                     "ccu": meta.get("ccu"),
                     "peak_ccu": max(
                         int(meta.get("ccu") or 0),
-                        int(candidates.get(uid, {}).get("playing") or 0),
+                        int(meta.get("peak_ccu") or 0),
                     ),
                     "visits": meta.get("visits"),
                     "favorites": meta.get("favorites"),
@@ -4068,7 +2678,7 @@ class RobloxPlatformScout:
                     "ccu": meta.get("ccu"),
                     "peak_ccu": max(
                         int(meta.get("ccu") or 0),
-                        int(candidates.get(uid, {}).get("playing") or 0),
+                        int(meta.get("peak_ccu") or 0),
                     ),
                     "visits": meta.get("visits"),
                     "favorites": meta.get("favorites"),
@@ -4120,24 +2730,20 @@ class RobloxPlatformScout:
 
         Runs inside scan() so the run lands in scan_runs (dashboard diagnostics)
         and inherits the standard run lifecycle; the strict gate is enforced by
-        drain_discovery_queue/scan_frontier regardless of the caller's
-        min_visits/min_ccu arguments (the expander workflow passes 20000/25).
+        drain_discovery_queue regardless of the caller's min_visits/min_ccu
+        arguments (the expander workflow passes 20000/25).
         """
         report = progress_cb or (lambda p, m: None)
         result = self.run_expansion(progress_cb=report)
-        web = result.get("spiderweb") or {}
-        recs = result.get("rec_mining") or {}
+        atlas = result.get("atlas") or {}
         drain = result.get("drain")
-        frontier = result.get("frontier") or {}
-        qualified = int(drain.get("qualified") or 0) + int(frontier.get("qualified") or 0)
+        qualified = int(drain.get("qualified") or 0)
         self.last_scan.update({
             "status": "complete",
             "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "metrics_count": qualified,
             "matched_count": qualified,
-            "candidate_count": (
-                int(web.get("pregate_passed") or 0) + int(recs.get("enqueued") or 0)
-            ),
+            "candidate_count": int(atlas.get("enqueued") or 0),
             "catalog_count": int(self.load_table().shape[0]),
         })
         self._finish_scan()

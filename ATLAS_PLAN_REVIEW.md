@@ -185,6 +185,17 @@ safety = the *option*, not the default.
 
 ## 6. Retiring Finder + Expander, all-in on the hydrator — **verdict: yes, with one safety net**
 
+> **✅ EXECUTED 2026-09-20, one step further than planned:** the engines were
+> not just env-retired but **deleted outright** — `spiderweb_creators`,
+> `scan_frontier`, `mine_recommendations`, `fetch_creator_portfolio`, the rec
+> seed cursor, the `SPIDERWEB_*`/`EXPAND_*_DEFAULT`/`*_RETIRED` constants, the
+> `REC_RECOMMENDATIONS_URL` endpoint, and the `creator_spiderweb_log` table
+> (schema + live_sync summary) are gone. `finder.yml` is deleted and the
+> Cloudflare worker no longer dispatches a finder tick. `run_expansion()` is
+> now **Atlas harvest → drain** only. The safety net below was honored: the
+> drain and the `rbxscout-sync` mutex remain, and the queue had 0 pending rows
+> before removal.
+
 The live queue data settles this:
 
 - **Frontier scan: provably dead.** 11,500 evaluated IDs, 0 qualified, 0 new

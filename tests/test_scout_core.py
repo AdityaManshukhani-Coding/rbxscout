@@ -501,39 +501,6 @@ def test_stale_running_runs_are_aborted_on_init(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Rolimon's catalog (one-time bulk import + DB-backed candidate pool)
-# --------------------------------------------------------------------------- #
-
-
-class RolimonsImportScout(RobloxPlatformScout):
-    """Scout whose Rolimon's fetch returns a canned gamelist."""
-
-    def __init__(self, gamelist, db_path=":memory:"):
-        self.db_path = db_path
-        self.max_workers = 1
-        self.request_timeout = 1
-        self.session = None
-        self.has_cookie = False
-        self.gamelist = gamelist
-        self._lock = None
-        self.last_contact_diagnostics = {}
-        self.last_scan = {}
-        self.last_metrics = {}
-        self.source_diagnostics = {}
-        self.blowup_watch_events = {}
-        self._sync_counter_path = scout_core.Path(db_path + ".sync_state")
-        self._sync_seq = self._load_sync_sequence()
-        self._emit_pace_lock = threading.Lock()
-        self._next_emit = 0.0
-        self._emit_interval = scout_core.RobloxPlatformScout.BATCH_EMIT_INTERVAL
-        self._init_sqlite()
-
-    def _get_json(self, url, retries=1):
-        if url == "https://api.rolimons.com/games/v1/gamelist":
-            return 200, {"success": True, "games": self.gamelist}
-        return 404, None
-
-
 class MockScout(RobloxPlatformScout):
     """Scout with canned _get_json responses keyed by exact URL."""
 
@@ -561,13 +528,6 @@ class MockScout(RobloxPlatformScout):
         # Exact-match first (used by Rolimons / metrics / icon tests that
         # provide full URLs as keys). Omni-search URLs carry a per-call
         # sessionId, so match those on their fixed prefix.
-        if url.startswith("https://apis.roblox.com/search-api/omni-search"):
-            payload = self.responses.get("omni-search")
-            if payload is None:
-                return 404, None
-            if isinstance(payload, tuple) and len(payload) == 2 and isinstance(payload[0], int):
-                return payload
-            return 200, payload
         if url in self.responses:
             payload = self.responses[url]
             if isinstance(payload, tuple) and len(payload) == 2 and isinstance(payload[0], int):
@@ -587,213 +547,6 @@ class MockScout(RobloxPlatformScout):
                 return payload
             return 200, payload
         return 404, None
-
-
-def _rolimons_gamelist(entries):
-    """Build a Rolimon's gamelist dict from (place_id, name, playing, icon) tuples."""
-    out = {}
-    for pid, name, playing, icon in entries:
-        out[str(pid)] = [name, playing, icon]
-    return out
-
-
-def test_rolimons_catalog_persists_full_index(tmp_path):
-    db = str(tmp_path / "t.db")
-    scout = MockScout(
-        {
-            "https://api.rolimons.com/games/v1/gamelist": (
-                200,
-                {"success": True, "games": _rolimons_gamelist([
-                    (100, "Small Game A", 40, "https://icon.a"),
-                    (200, "Small Game B", 5, "https://icon.b"),
-                    (300, "Big Game C", 2500, "https://icon.c"),
-                ])},
-            ),
-        },
-        db_path=db,
-    )
-    count = scout.import_rolimons_catalog()
-    assert count == 3
-
-    with sqlite3.connect(db) as conn:
-        rows = conn.execute(
-            "SELECT place_id, name, playing, icon_url FROM rolimons_catalog ORDER BY place_id"
-        ).fetchall()
-    assert rows == [
-        (100, "Small Game A", 40, "https://icon.a"),
-        (200, "Small Game B", 5, "https://icon.b"),
-        (300, "Big Game C", 2500, "https://icon.c"),
-    ]
-    assert scout.catalog_place_count() == 3
-
-
-def test_rolimons_catalog_refreshes_existing_entries(tmp_path):
-    db = str(tmp_path / "t.db")
-    scout = MockScout(
-        {
-            "https://api.rolimons.com/games/v1/gamelist": (
-                200,
-                {"success": True, "games": _rolimons_gamelist([
-                    (100, "Small Game A", 40, "https://icon.a"),
-                ])},
-            ),
-        },
-        db_path=db,
-    )
-    scout.import_rolimons_catalog()
-    # A second import with updated playing/icon should overwrite.
-    scout.responses["https://api.rolimons.com/games/v1/gamelist"] = (
-        200,
-        {"success": True, "games": _rolimons_gamelist([(100, "Small Game A v2", 60, "https://icon.new")])},
-    )
-    scout.import_rolimons_catalog()
-    with sqlite3.connect(db) as conn:
-        name, playing, icon = conn.execute(
-            "SELECT name, playing, icon_url FROM rolimons_catalog WHERE place_id=100"
-        ).fetchone()
-    assert name == "Small Game A v2"
-    assert playing == 60
-    assert icon == "https://icon.new"
-
-
-def test_rolimons_candidate_pool_empty_before_import(tmp_path):
-    db = str(tmp_path / "t.db")
-    scout = RobloxPlatformScout(db_path=db)
-    assert scout.build_rolimons_candidate_pool() == {}
-    assert scout.catalog_place_count() == 0
-
-
-def test_rolimons_candidate_pool_uses_only_resolved_entries(tmp_path):
-    db = str(tmp_path / "t.db")
-    scout = RobloxPlatformScout(db_path=db)
-    # Seed catalog without any universe mapping.
-    with sqlite3.connect(db) as conn:
-        conn.execute(
-            "INSERT INTO rolimons_catalog (place_id, name, playing, icon_url) "
-            "VALUES (111, 'Unresolved', 999, 'https://icon')"
-        )
-    assert scout.build_rolimons_candidate_pool() == {}
-
-    # Add a place_map entry — now it appears, with the same playing the
-    # catalog reported (no hydration yet).
-    with sqlite3.connect(db) as conn:
-        conn.execute(
-            "INSERT INTO place_map (place_id, universe_id) VALUES (111, 909)"
-        )
-    pool = scout.build_rolimons_candidate_pool(min_ccu=50)
-    assert pool == {
-        909: {
-            "universe_id": 909,
-            "root_place_id": 111,
-            "name": "Unresolved",
-            "playing": 999,
-            "icon_url": "https://icon",
-        }
-    }
-
-
-def test_rolimons_candidate_pool_applies_min_ccu_gate(tmp_path):
-    db = str(tmp_path / "t.db")
-    scout = RobloxPlatformScout(db_path=db)
-    with sqlite3.connect(db) as conn:
-        conn.execute(
-            "INSERT INTO rolimons_catalog (place_id, name, playing, icon_url) "
-            "VALUES (111, 'Hot', 2000, 'https://icon1')"
-        )
-        conn.execute(
-            "INSERT INTO rolimons_catalog (place_id, name, playing, icon_url) "
-            "VALUES (222, 'Cold', 10, 'https://icon2')"
-        )
-        conn.execute("INSERT INTO place_map (place_id, universe_id) VALUES (111, 909)")
-        conn.execute("INSERT INTO place_map (place_id, universe_id) VALUES (222, 910)")
-
-    pool = scout.build_rolimons_candidate_pool(min_ccu=25)
-    assert set(pool.keys()) == {909}
-    assert pool[909]["name"] == "Hot"
-
-    pool_all = scout.build_rolimons_candidate_pool(min_ccu=0)
-    assert set(pool_all.keys()) == {909, 910}
-
-
-def test_rolimons_candidate_pool_sorts_by_playing(tmp_path):
-    db = str(tmp_path / "t.db")
-    scout = RobloxPlatformScout(db_path=db)
-    with sqlite3.connect(db) as conn:
-        conn.execute(
-            "INSERT INTO rolimons_catalog (place_id, name, playing, icon_url) "
-            "VALUES (100, 'Mid', 500, 'https://icon1')"
-        )
-        conn.execute(
-            "INSERT INTO rolimons_catalog (place_id, name, playing, icon_url) "
-            "VALUES (200, 'Hot', 5000, 'https://icon2')"
-        )
-        conn.execute(
-            "INSERT INTO rolimons_catalog (place_id, name, playing, icon_url) "
-            "VALUES (300, 'Small', 50, 'https://icon3')"
-        )
-        conn.execute("INSERT INTO place_map (place_id, universe_id) VALUES (100, 801)")
-        conn.execute("INSERT INTO place_map (place_id, universe_id) VALUES (200, 802)")
-        conn.execute("INSERT INTO place_map (place_id, universe_id) VALUES (300, 803)")
-
-    pool = scout.build_rolimons_candidate_pool(candidate_limit=2)
-    keys = list(pool.keys())
-    assert keys == [802, 801]  # hot first, mid second; small cut by limit
-
-
-def test_scan_pools_rolimons_catalog_not_just_top_n(tmp_path):
-    """When Rolimon's catalog is loaded, every qualifying entry can enter the
-    candidate pool via the catalog-backed path, not only a top-N slice from the
-    live fetch."""
-    db = str(tmp_path / "t.db")
-    scout = MockScout(
-        {
-            "https://apis.roblox.com/explore-api/v1/get-sorts": {"sorts": []},
-            "https://api.rolimons.com/games/v1/gamelist": (
-                200,
-                {"success": True, "games": _rolimons_gamelist([
-                    (100, "Big Rolimons Game", 2000, "https://icon1"),
-                    (200, "Small Rolimons Game", 30, "https://icon2"),
-                ])},
-            ),
-            "https://games.roblox.com/v1/games?universeIds=801": {
-                "data": [
-                    {
-                        "id": 801,
-                        "rootPlaceId": 100,
-                        "name": "Big Rolimons Game",
-                        "playing": 2000,
-                        "visits": 99_000,
-                        "favoritedCount": 1_000,
-                        "genre": "Games",
-                        "creator": {"id": 1, "name": "Dev", "type": "User"},
-                        "description": "",
-                    }
-                ],
-            },
-            "https://apis.roblox.com/universes/v1/places/100/universe": {
-                "universeId": 801,
-            },
-            "https://thumbnails.roblox.com/v1/games/icons": {
-                "data": [
-                    {"targetId": 801, "state": "Completed", "imageUrl": "https://thumb"},
-                ]
-            },
-        },
-        db_path=db,
-    )
-    # Seed the catalog via the import path so the scan uses DB-backed pool.
-    scout.import_rolimons_catalog()
-
-    df = scout.scan(
-        min_visits=50_000,
-        min_ccu=50,
-        candidate_limit=5,
-        progress_cb=lambda p, m: None,
-    )
-    assert not df.empty
-    assert set(df["title"]) == {"Big Rolimons Game"}
-    row = df.iloc[0]
-    assert int(row["visits"]) == 99_000
 
 
 # --------------------------------------------------------------------------- #
@@ -1108,8 +861,6 @@ class BudgetScout(MockScout):
     30_000 values (deferred games keep their stale stats)."""
 
     def _get_json(self, url, retries=1):
-        if url.startswith("https://apis.roblox.com/search-api/omni-search"):
-            return super()._get_json(url, retries)
         if url.startswith("https://games.roblox.com/v1/games?universeIds="):
             raw_ids = url.split("universeIds=")[1].split("&")[0].split(",")
             return 200, {"data": [
@@ -1124,26 +875,21 @@ class BudgetScout(MockScout):
         return super()._get_json(url, retries)
 
 
-def test_scan_budget_splits_new_first_then_known_due(tmp_path):
-    """The per-sync budget is a hard ceiling: NEW candidates hydrate first
-    (mandatory one-time pass), known-due games fill the remaining slots in
-    tier-priority order, and the overflow rolls to the next sync."""
+def test_scan_budget_caps_known_due_hydration(tmp_path):
+    """The per-sync budget is a hard ceiling: known-due games fill the slots
+    in tier-priority order and the overflow rolls to the next sync. New-game
+    hydration is owned by the discovery-queue drain on expand passes, so a
+    pending Atlas seed is NOT spent here (strict-gate verified there)."""
     db = str(tmp_path / "t.db")
-    scout = BudgetScout(
-        {
-            "https://apis.roblox.com/explore-api/v1/get-sorts": {"sorts": []},
-            "https://apis.roblox.com/search-api/omni-search": (200, {"searchResults": []}),
-        },
-        db_path=db,
-    )
+    scout = BudgetScout({}, db_path=db)
     with sqlite3.connect(db) as conn:
+        # A pending Atlas seed: must NOT hydrate on the hydrate pass —
+        # the drain owns it (and re-verifies the strict gate).
         conn.execute(
-            "INSERT INTO rolimons_catalog (place_id, name, playing, icon_url) "
-            "VALUES (100, 'New Hot Game', 2000, 'https://icon1')"
+            "INSERT INTO discovery_queue (universe_id, source, priority, status) "
+            "VALUES (801, 'atlas_dev', 2, 'pending')"
         )
-        conn.execute("INSERT INTO place_map (place_id, universe_id) VALUES (100, 801)")
-        # 60 known T1 games due this sync; with a 1-batch budget only 49 of
-        # them can fit after the new candidate takes the first slot.
+        # 60 known T1 games due this sync; with a 1-batch budget only 50 fit.
         for uid in range(1000, 1060):
             conn.execute(
                 "INSERT INTO game_analytics (universe_id, tier, ccu, visits, last_updated) "
@@ -1152,23 +898,28 @@ def test_scan_budget_splits_new_first_then_known_due(tmp_path):
             )
     scout_core.HYDRATION_BUDGET_PER_SYNC = 1  # ceiling: 50 games (1 batch)
     try:
-        scout.scan(min_visits=50_000, min_ccu=50, candidate_limit=5, progress_cb=lambda p, m: None)
+        scout.scan(min_visits=50_000, min_ccu=50, progress_cb=lambda p, m: None,
+                   phases=("hydrate",))
     finally:
         scout_core.HYDRATION_BUDGET_PER_SYNC = 150
 
     hydration = scout.last_scan["hydration_budget"]
-    assert hydration["new"] == 1
+    assert hydration["new"] == 0
+    assert hydration["known_due"] == 50                  # scheduler honors the budget
     assert hydration["hydrated"] == 50                   # exactly one batch
-    assert hydration["deferred"] == 1                    # overflow rolled, not overspent
+    assert hydration["deferred"] == 0
 
+    with sqlite3.connect(db) as conn:
+        # The drain never ran on this hydrate-only pass.
+        assert conn.execute(
+            "SELECT status FROM discovery_queue WHERE universe_id=801"
+        ).fetchone()[0] == "pending"
     table = scout.load_table().set_index("universe_id")
-    assert int(table.loc[801]["visits"]) == 99_000       # new candidate hydrated first
-    known_upgraded = {
+    upgraded = {
         uid for uid in range(1000, 1060) if int(table.loc[uid]["visits"]) == 99_000
     }
-    assert len(known_upgraded) == 49                     # 50 slots minus the new candidate
-    assert known_upgraded == set(range(1000, 1049))      # priority order, tail deferred
-    deferred = {uid for uid in range(1000, 1060) if uid not in known_upgraded}
+    assert upgraded == set(range(1000, 1050))            # priority order, tail deferred
+    deferred = {uid for uid in range(1000, 1060) if uid not in upgraded}
     assert all(int(table.loc[uid]["visits"]) == 30_000 for uid in deferred)  # untouched
 
 
@@ -1190,8 +941,8 @@ def test_sync_counter_persists_across_restarts(tmp_path):
 
 def test_hydrate_phase_never_calls_discovery_endpoints(tmp_path):
     """phases=('hydrate',) must drain the tier-due queue and spend zero
-    requests on discovery: no explore-api, no omni-search, and the keyword
-    cursor must not advance. This is the contract the 5-min workflow runs on."""
+    requests on discovery: no Atlas fetch, no queue drain. This is the
+    contract the 5-min workflow runs on."""
     calls = []
 
     class ProbeScout(MockScout):
@@ -1215,7 +966,6 @@ def test_hydrate_phase_never_calls_discovery_endpoints(tmp_path):
             "INSERT INTO game_analytics (universe_id, tier, ccu, visits, last_updated) "
             "VALUES (902, 3, 30, 80000, '1970-01-01')"
         )
-        conn.execute("UPDATE keyword_crawl_state SET next_index = 160 WHERE id = 1")
 
     scout.scan(
         min_visits=20_000,
@@ -1226,271 +976,20 @@ def test_hydrate_phase_never_calls_discovery_endpoints(tmp_path):
     )
 
     assert scout.last_scan["status"] == "complete"
-    assert all("explore-api" not in u for u in calls)      # no discovery traffic
-    assert all("omni-search" not in u for u in calls)      # no keyword crawler
+    assert all("atlasdev.gg" not in u for u in calls)      # no Atlas traffic
+    assert not scout.last_scan.get("expansion")            # no drain on hydrate runs
     assert any("games.roblox.com/v1/games" in u for u in calls)  # did hydrate
-    with sqlite3.connect(tmp_path / "h.db") as conn:
-        assert conn.execute("SELECT next_index FROM keyword_crawl_state WHERE id=1").fetchone()[0] == 160
-
-
-def test_find_phase_hydrates_new_but_skips_known_due_queue(tmp_path):
-    """phases=('find',) keeps discovery (keyword cursor advances) and gives
-    every NEW candidate its mandatory first hydration, but never spends
-    budget on the known-game refresh queue — that is the hydrator's job."""
-    db = str(tmp_path / "f.db")
-    scout = BudgetScout(
-        {
-            "https://apis.roblox.com/explore-api/v1/get-sorts": {"sorts": []},
-            "https://apis.roblox.com/search-api/omni-search": (200, {"searchResults": []}),
-        },
-        db_path=db,
-    )
-    with sqlite3.connect(db) as conn:
-        conn.execute(
-            "INSERT INTO rolimons_catalog (place_id, name, playing, icon_url) "
-            "VALUES (100, 'New Hot Game', 2000, 'https://icon1')"
-        )
-        conn.execute("INSERT INTO place_map (place_id, universe_id) VALUES (100, 801)")
-        # Known stale T1 game that the FIND pass must leave untouched.
-        conn.execute(
-            "INSERT INTO game_analytics (universe_id, tier, ccu, visits, last_updated) "
-            "VALUES (7000, 1, 30, 30000, '1970-01-01')"
-        )
-    scout_core.HYDRATION_BUDGET_PER_SYNC = 1
-    try:
-        scout.scan(
-            min_visits=50_000,
-            min_ccu=50,
-            candidate_limit=5,
-            progress_cb=lambda p, m: None,
-            phases=("find",),
-        )
-    finally:
-        scout_core.HYDRATION_BUDGET_PER_SYNC = 150
-
-    assert scout.last_scan["status"] == "complete"
-    assert scout.last_scan["hydration_budget"]["known_due"] == 0  # queue untouched
-    assert scout.last_scan["keyword_slice_end"] > 0               # crawler ran
-    table = scout.load_table().set_index("universe_id")
-    assert int(table.loc[801]["visits"]) == 99_000                # new game hydrated
-    assert int(table.loc[7000]["visits"]) == 30_000               # known game untouched
 
 
 def test_invalid_phase_raises_and_full_pipeline_default(tmp_path):
-    """Unknown phases raise loudly; omitting phases keeps the historical
-    full pipeline (UI compatibility)."""
+    """Unknown phases raise loudly; omitting phases runs the full
+    pipeline (hydrate + expand) for UI compatibility."""
     scout = MockScout({}, db_path=str(tmp_path / "i.db"))
     with pytest.raises(ValueError, match="Unknown scan phases"):
         scout.scan(progress_cb=lambda p, m: None, phases=("hydrate", "nonsense"))
 
 
 # ---------------------------------------------------------------------------
-# Search-proxy IP pool (keyword crawler fallback)
-# ---------------------------------------------------------------------------
-
-
-OMNI_BODY = {"searchResults": [{"contents": [{"universeId": 42, "name": "G", "rootPlaceId": 7}]}]}
-
-
-def _set_proxy_env(monkeypatch, value):
-    monkeypatch.setenv("RBXSCOUT_SEARCH_PROXY_URLS", value)
-
-
-class SearchPoolScout(RobloxPlatformScout):
-    """Scout with canned responses for the search-proxy pool, keyed by leg."""
-
-    def __init__(self, behavior, db_path=":memory:"):
-        self.db_path = db_path
-        self.max_workers = 2
-        self.request_timeout = 1
-        self.session = mock.MagicMock()
-        self.has_cookie = False
-        self.behavior = behavior
-        self.calls = []
-        self._emit_pace = lambda: None
-        self._emit_ok = lambda: None
-        self._emit_throttled = lambda: None
-
-    def _get_json(self, url, retries=1):
-        """Direct-Roblox leg: dispatched by behavior["direct"]."""
-        self.calls.append(url)
-        handler = self.behavior.get("direct", lambda url: (200, OMNI_BODY))
-        return handler(url)
-
-    def _fake_response(self, url):
-        handler = self.behavior.get("proxy", lambda url: (200, OMNI_BODY))
-        status, body = handler(url)
-        response = mock.MagicMock()
-        response.status_code = status
-        if isinstance(body, Exception):
-            response.json.side_effect = body
-        else:
-            response.json.return_value = body
-        return response
-
-    def _search_pool_request(self, keyword):
-        """Run the production pool walk with the session GET mocked out."""
-        scout = self
-
-        def session_get(url, timeout=None):
-            scout.calls.append(url)
-            return scout._fake_response(url)
-
-        with mock.patch.object(self.session, "get", side_effect=session_get):
-            return RobloxPlatformScout._search_pool_request(self, keyword)
-
-
-def test_search_pool_builds_direct_url_for_keywords():
-    s = SearchPoolScout({})
-    url = s._search_request_url("direct", "steal a", "SID")
-    assert url == (
-        "https://apis.roblox.com/search-api/omni-search"
-        "?searchQuery=steal%20a&pageType=all&sessionId=SID"
-    )
-
-
-def test_search_pool_builds_proxy_url_for_keywords():
-    s = SearchPoolScout({})
-    url = s._search_request_url("https://rbx-search.example.workers.dev", "steal a", "SID")
-    assert url == (
-        "https://rbx-search.example.workers.dev/search-api/omni-search"
-        "?searchQuery=steal%20a&pageType=all&sessionId=SID"
-    )
-
-
-def test_search_pool_env_parsing_and_malformed_entries(monkeypatch):
-    _set_proxy_env(monkeypatch, "https://a.workers.dev ,;; not-a-url\nhttps://b.workers.dev/")
-    s = SearchPoolScout({})
-    pool = s._search_proxy_urls()
-    assert pool == ["https://a.workers.dev", "https://b.workers.dev", "direct"]
-
-
-def test_search_pool_empty_env_falls_back_to_direct_only(monkeypatch):
-    _set_proxy_env(monkeypatch, "")
-    s = SearchPoolScout({"direct": lambda url: (200, OMNI_BODY)})
-    out = s.fetch_search_games(["obby"])
-    assert out == {42: {"universe_id": 42, "title": "G", "root_place_id": 7}}
-    diag = s.source_diagnostics["keyword_crawl"]
-    assert diag["successful_keywords"] == 1
-    assert diag["pool"] == ["direct"]
-    assert diag["breaker_tripped"] is False
-
-
-def test_search_pool_proxy_used_before_direct(monkeypatch):
-    """With a proxy configured, direct Roblox must not be touched on success."""
-    _set_proxy_env(monkeypatch, "https://proxy-a.workers.dev")
-    s = SearchPoolScout({"direct": lambda url: pytest.fail("direct must not be called")})
-    status, data = s._search_pool_request("obby")
-    assert status == 200 and data == OMNI_BODY
-    assert len(s.calls) == 1
-    assert s.calls[0].startswith("https://proxy-a.workers.dev/search-api/omni-search")
-    assert "searchQuery=obby" in s.calls[0]
-
-
-def test_search_pool_falls_back_when_proxy_500s(monkeypatch):
-    """A 5xx proxy must be skipped and the direct leg must still serve the keyword."""
-    _set_proxy_env(monkeypatch, "https://proxy-a.workers.dev")
-    s = SearchPoolScout({
-        "proxy": lambda url: (503, None),
-        "direct": lambda url: (200, OMNI_BODY),
-    })
-    status, data = s._search_pool_request("obby")
-    assert status == 200 and data == OMNI_BODY
-    # proxy attempted (and 503'd) then direct succeeded
-    assert sum("proxy-a.workers.dev" in u for u in s.calls) == 1
-    assert any("apis.roblox.com/search-api/omni-search" in u for u in s.calls)
-
-
-def test_search_pool_bad_json_200_is_a_proxy_failure(monkeypatch):
-    """A 200 with a non-JSON body from a proxy must not be served as a result."""
-    _set_proxy_env(monkeypatch, "https://proxy-a.workers.dev")
-    s = SearchPoolScout({
-        "proxy": lambda url: (200, ValueError("bad json")),
-        "direct": lambda url: (200, OMNI_BODY),
-    })
-    status, data = s._search_pool_request("obby")
-    assert status == 200 and data == OMNI_BODY
-
-
-def test_search_pool_403_falls_through_to_direct(monkeypatch):
-    """A proxy 403 fails that proxy only; the direct leg is still attempted."""
-    _set_proxy_env(monkeypatch, "https://proxy-a.workers.dev")
-    s = SearchPoolScout({
-        "proxy": lambda url: (403, None),
-        "direct": lambda url: (200, OMNI_BODY),
-    })
-    status, data = s._search_pool_request("obby")
-    assert status == 200 and data == OMNI_BODY
-
-
-def test_search_pool_all_proxies_down_direct_still_tries(monkeypatch):
-    """Every proxy failing must not take the crawler down: direct serves the keyword."""
-    _set_proxy_env(monkeypatch, "https://proxy-a.workers.dev, https://proxy-b.workers.dev")
-    s = SearchPoolScout({
-        "proxy": lambda url: (500, None),
-        "direct": lambda url: (200, OMNI_BODY),
-    })
-    status, data = s._search_pool_request("obby")
-    assert status == 200 and data == OMNI_BODY
-    diag = s._search_pool_snapshot()
-    assert diag["pool"] == [
-        "https://proxy-a.workers.dev",
-        "https://proxy-b.workers.dev",
-        "direct",
-    ]
-
-
-def test_search_pool_degrades_after_repeated_failures(monkeypatch):
-    """3 consecutive proxy failures bench it for 5 minutes (skipped next keyword)."""
-    _set_proxy_env(monkeypatch, "https://proxy-a.workers.dev")
-    s = SearchPoolScout({
-        "proxy": lambda url: (500, None),
-        "direct": lambda url: (200, OMNI_BODY),
-    })
-    for _ in range(3):
-        s._search_pool_request("obby")
-    assert s._search_pool_benched("https://proxy-a.workers.dev") is True
-    s.calls.clear()
-    s._search_pool_request("obby")
-    assert len(s.calls) == 1  # direct only -- benched proxy skipped
-    assert s.calls[0].startswith("https://apis.roblox.com/")
-
-
-def test_search_pool_breaker_uses_fallback_pool(monkeypatch):
-    """The keyword crawler must survive a hard-failing proxy and still parse results."""
-    _set_proxy_env(monkeypatch, "https://proxy-a.workers.dev")
-    s = SearchPoolScout({
-        "proxy": lambda url: (503, None),
-        "direct": lambda url: (200, OMNI_BODY),
-    })
-    out = s.fetch_search_games(["obby", "tycoon", "simulator"])
-    assert 42 in out
-    diag = s.source_diagnostics["keyword_crawl"]
-    assert diag["breaker_tripped"] is False
-    assert diag["successful_keywords"] == 3
-    assert diag["pool"][0] == "https://proxy-a.workers.dev"
-    assert diag["pool"][-1] == "direct"
-
-
-def test_search_pool_breaker_trips_when_everything_fails(monkeypatch):
-    """Proxy + direct both hard-down -> breaker trips after 5 consecutive failures."""
-    _set_proxy_env(monkeypatch, "https://proxy-a.workers.dev")
-    s = SearchPoolScout({
-        "proxy": lambda url: (500, None),
-        "direct": lambda url: (429, None),
-    })
-    out = s.fetch_search_games([f"kw{i}" for i in range(8)])
-    assert out == {}
-    diag = s.source_diagnostics["keyword_crawl"]
-    assert diag["breaker_tripped"] is True
-    assert diag["successful_keywords"] == 0
-    # The breaker counts completed results only: 5 failures recorded, the
-    # remaining futures were cancelled and never entered the tally.
-    assert diag["failed_keywords"] == 5
-    assert diag["keywords"] == 8
-
-
-# --------------------------------------------------------------------------- #
 # Catalog-only result set (the dashboard's read-only sync)
 # --------------------------------------------------------------------------- #
 

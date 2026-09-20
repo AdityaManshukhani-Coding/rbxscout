@@ -126,11 +126,10 @@ def expansion_trial_verdict(db_path: str, window: int = EXP_TRIAL_MIN_RUNS) -> d
     if len(runs) < EXP_TRIAL_MIN_RUNS:
         return {"state": "warming", "runs": len(runs), "need": EXP_TRIAL_MIN_RUNS}
 
-    drained = sum(int((r.get("drain") or {}).get("hydrated") or 0) for r in runs)
-    scanned = sum(int((r.get("frontier") or {}).get("scanned") or 0) for r in runs)
+    drained = sum(int((r.get("drain") or {}).get("claimed") or 0) for r in runs)
+    scanned = sum(int((r.get("atlas") or {}).get("fetched_ids") or 0) for r in runs)
     qualified = (
         sum(int((r.get("drain") or {}).get("qualified") or 0) for r in runs)
-        + sum(int((r.get("frontier") or {}).get("qualified") or 0) for r in runs)
     )
     failed_batches = sum(int(r.get("metrics_failed") or 0) for r in runs)
     checked = drained + scanned

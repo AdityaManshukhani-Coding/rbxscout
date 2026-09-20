@@ -276,7 +276,7 @@ def test_proxy_flip_routes_through_pool(scout, monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# run_expansion integration + retirement defaults
+# run_expansion integration
 # --------------------------------------------------------------------------- #
 
 
@@ -285,23 +285,20 @@ def test_run_expansion_runs_atlas_and_keeps_drain(scout, monkeypatch):
     result = scout.run_expansion(queue_batches=0)  # drain budget off for speed
     assert result["atlas"]["enqueued"] == 3
     assert result["drain"]["claimed"] == 0
-    # Retired engines produce no keys at default settings.
     assert "spiderweb" not in result
     assert "frontier" not in result
     assert "rec_mining" not in result
 
 
-def test_retired_engines_reenable_via_env_or_params(scout, monkeypatch):
-    monkeypatch.setenv("EXPAND_FRONTIER_BATCHES", "1")
-    called = {"frontier": 0}
-
-    def fake_frontier(batches, progress_cb=None):
-        called["frontier"] = batches
-        return {"scanned": batches * 50}
-
-    monkeypatch.setattr(scout, "scan_frontier", fake_frontier)
-    monkeypatch.setenv("ATLAS_SWEEP_PAGES", "0")
-    monkeypatch.setenv("ATLAS_STAT_PAGES", "0")
-    result = scout.run_expansion(queue_batches=0)
-    assert called["frontier"] == 1
-    assert result["frontier"]["scanned"] == 50
+def test_removed_engines_stay_removed(scout, monkeypatch):
+    """The legacy discovery engines are gone from the codebase entirely."""
+    import pytest
+    for attr in ("spiderweb_creators", "scan_frontier", "mine_recommendations"):
+        assert not hasattr(scout, attr), attr
+    for const in (
+        "EXPAND_SPIDERWEB_CREATORS_DEFAULT", "EXPAND_FRONTIER_BATCHES_DEFAULT",
+        "EXPAND_REC_SEEDS_DEFAULT", "REC_RECOMMENDATIONS_URL",
+        "EXPAND_SPIDERWEB_CREATORS_RETIRED", "EXPAND_FRONTIER_BATCHES_RETIRED",
+        "EXPAND_REC_SEEDS_RETIRED",
+    ):
+        assert not hasattr(scout_core, const), const

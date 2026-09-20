@@ -1,15 +1,20 @@
-# 🌐 Expansion Pilot — Creator Spiderwebbing + Frontier Scan
+# 🌐 Expansion Pilot — Atlas Dev Harvest + Discovery-Queue Drain
 
-**Status:** LIVE code, shipped 2026-09-17 · **Gate:** strict 20k visits / 25 CCU
+> **✅ REMOVAL COMPLETE (2026-09-20):** the creator spiderweb, frontier scan,
+> and recommendations-mining engines have been **deleted from the codebase**
+> (commit "Remove legacy discovery engines…"). `finder.yml` is deleted, the
+> Cloudflare scheduler no longer dispatches a finder tick, and the expander is
+> now **Atlas Dev harvest → queue drain** only. Everything below the banner is
+> the historical record of the retired engines; the **drain + strict gate**
+> sections still describe live behavior.
+
+**Status:** LIVE code · **Gate:** strict 20k visits / 25 CCU
 **Update 2026-09-19:** **Atlas Dev seed ingestion is LIVE** (see
 `ATLAS_PLAN_REVIEW.md`) and is now the primary discovery source. Full
 275-page sweep measured: 12,119 games indexed, **654 genuinely new games
 crossed the strict gate** (catalog 23,883 → 24,537). Head pages run ~65–74%
 new but the full index averages ~23% new — the drain's free catalog-check
-absorbs the overlap. Spiderweb/frontier/recs are **retired to
-zero by default** (env-re-enablable); the queue drain + strict gate are
-unchanged and now hydrate Atlas seeds. Finder's discovery workflow is guarded
-off (`FINDER_ENABLED=1` re-enables); the hydrator is untouched.
+absorbs the overlap.
 **Where the results appear:** the `EXPANSION PILOT` block at the bottom of
 every expander run log, plus the `expansion pilot : warming up …` line in the
 capacity-pilot block of *every* workflow's log (it reads `sync_health_log`).

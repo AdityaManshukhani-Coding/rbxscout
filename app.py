@@ -1169,9 +1169,9 @@ if sync or st.session_state.pending_initial_scan:
     st.session_state.scan_error = ""
     with st.spinner("Loading games that meet your targets..."):
         try:
-            # Read-only catalog query — no discovery, no keyword crawl, no
-            # Roblox requests. The 24/7 pipeline (Cloudflare cron → finder
-            # and hydrator workflows) owns discovery and hydration; this
+            # Read-only catalog query — no discovery, no Roblox requests.
+            # The 24/7 pipeline (Cloudflare cron → hydrator and expander
+            # workflows) owns discovery and hydration; this
             # button only pulls what it already stored. Results page one is
             # ready instantly; contacts still load page by page below.
             data = _read_catalog(

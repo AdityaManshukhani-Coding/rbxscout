@@ -1,17 +1,17 @@
-# RbxScout expander — "Game Finder 2.0", the catalog-expansion pilot (every 30 min).
+# RbxScout expander — Atlas Dev seed harvest + discovery-queue drain (every 30 min).
 #
-# The third discovery engine (EXPANSION_PILOT.md): creator spiderwebbing
-# (crawls the public portfolios of every creator already in the catalog),
-# a priority discovery-queue drain, and a frontier scan that walks fresh
-# universe-ID ranges upward from the highest known ID. Strict gate: only
-# games meeting 20k visits / 25 CCU are stored — everything else is recorded
-# in discovery_queue as dedup memory, never as a catalog row.
+# The sole discovery pipeline (ATLAS_PLAN_REVIEW.md): a daily 24h-throttled
+# harvest of atlasdev.gg/analyze enqueues mid-tier universe IDs into the
+# priority discovery queue; every run then drains a bounded slice of the
+# queue through the strict gate. Only games meeting 20k visits / 25 CCU are
+# stored — everything else is recorded in discovery_queue as dedup memory,
+# never as a catalog row.
 #
 # The catalog lives on the rolling Release `catalog-latest` (asset
-# rbx_scout.db): pull -> sync -> push, same as finder/hydrator.
+# rbx_scout.db): pull -> sync -> push, same as hydrator.
 #
 # ⚠️ Race safety: this workflow declares the SAME `rbxscout-sync` Actions
-# concurrency group as finder.yml and hydrator.yml. The DB is one binary
+# concurrency group as hydrator.yml. The DB is one binary
 # SQLite file — two pull/sync/push cycles running at once would silently
 # drop one run's data. GitHub enforces the group repo-wide as a mutex;
 # `queue: max` retains pending dispatches while a run is active.
@@ -19,13 +19,12 @@
 # Knobs (repo Variables, optional): ATLAS_SWEEP_PAGES (index pages per daily
 # harvest, 0 = kill switch), ATLAS_STAT_PAGES (provisional first-paint rows
 # per harvest, 0 disables), ATLAS_REQUEST_DELAY (polite per-request delay),
-# ATLAS_DEEP_EVERY_DAYS (full catch-up sweep cadence). The retired engines
-# (spiderweb/frontier/recs) stay off by default (see scout_core.py retirement
-# constants) — set their EXPAND_* Variables to re-enable.
+# ATLAS_DEEP_EVERY_DAYS (full catch-up sweep cadence), EXPAND_QUEUE_BATCHES
+# (queue-drain batches per run).
 #
-# Manual runs: Actions tab -> "Expander — Game Finder 2.0 (30 min)" -> Run workflow
+# Manual runs: Actions tab -> "Expander — Atlas Dev harvest + drain (30 min)" -> Run workflow
 
-name: Expander — Game Finder 2.0 (30 min)
+name: Expander — Atlas Dev harvest + drain (30 min)
 
 on:
 # Automatic dispatching is owned by the Cloudflare Worker in
@@ -45,13 +44,10 @@ env:
   ATLAS_STAT_PAGES: ${{ vars.ATLAS_STAT_PAGES || '' }}
   ATLAS_REQUEST_DELAY: ${{ vars.ATLAS_REQUEST_DELAY || '' }}
   ATLAS_DEEP_EVERY_DAYS: ${{ vars.ATLAS_DEEP_EVERY_DAYS || '' }}
-  # Retired-engine overrides (all default to 0 in scout_core.py):
-  EXPAND_SPIDERWEB_CREATORS: ${{ vars.EXPAND_SPIDERWEB_CREATORS || '' }}
+  # Queue-drain budget (default 10 batches = 500 candidates/run):
   EXPAND_QUEUE_BATCHES: ${{ vars.EXPAND_QUEUE_BATCHES || '' }}
-  EXPAND_FRONTIER_BATCHES: ${{ vars.EXPAND_FRONTIER_BATCHES || '' }}
-  EXPAND_REC_SEEDS: ${{ vars.EXPAND_REC_SEEDS || '' }}
 
-# ⚠️ Keep this group IDENTICAL to finder.yml / hydrator.yml — the shared
+# ⚠️ Keep this group IDENTICAL to hydrator.yml — the shared
 # literal string IS the cross-workflow mutex.
 concurrency:
   group: rbxscout-sync
@@ -84,12 +80,12 @@ jobs:
       - name: Run test suite (protects the catalog from bad pushes)
         run: python -m pytest tests -q
 
-      - name: Run expander (spiderweb + queue drain + frontier scan)
+      - name: Run expander (Atlas harvest + queue drain)
         run: python live_sync.py --only expander --min-visits 20000 --min-ccu 25
 
       # One-way door: an expansion pass that evaluated IDs but failed to
-      # persist would re-evaluate the same ranges next run (the frontier
-      # pointer only advances after a successful DB write). Fail visibly.
+      # persist would re-evaluate the same seeds next run (the Atlas cursor
+      # only advances after a successful DB write). Fail visibly.
       - name: Push catalog to release store
         if: always()
         run: python db_sync.py push
