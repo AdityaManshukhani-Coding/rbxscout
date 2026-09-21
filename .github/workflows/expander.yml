@@ -56,7 +56,8 @@ concurrency:
 jobs:
   expand:
     runs-on: ubuntu-latest
-    timeout-minutes: 30      # pacer can stretch on 429s; matches finder
+    timeout-minutes: 60      # must fit a full deep sweep (275 pages) + drain;
+                             # steady-state runs finish in ~2 min anyway
 
     steps:
       - name: Check out repo
