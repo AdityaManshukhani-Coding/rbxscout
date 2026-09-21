@@ -206,7 +206,7 @@ def test_provisional_never_overwrites_real_catalog_rows(scout, monkeypatch):
     with sqlite3.connect(scout.db_path) as conn:
         conn.execute(
             "INSERT INTO game_analytics (universe_id, ccu, visits, found_via, title) "
-            "VALUES (9200000001, 55, 40_000, 'keyword', 'Real Row')"
+            "VALUES (9200000001, 55, 40000, 'keyword', 'Real Row')"
         )
     _patch_http(
         monkeypatch,
@@ -259,7 +259,10 @@ def test_kill_switch_disables_everything(scout, monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
-def test_proxy_pool_direct_by_default(scout):
+def test_proxy_pool_direct_by_default(scout, monkeypatch):
+    # CI exports repo Variables (e.g. RBXSCOUT_SEARCH_PROXY_URLS) into the
+    # environment; the default-direct contract must hold without them.
+    monkeypatch.delenv("RBXSCOUT_SEARCH_PROXY_URLS", raising=False)
     assert scout._atlas_proxy_pool() == ["direct"]
 
 
