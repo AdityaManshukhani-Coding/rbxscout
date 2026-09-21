@@ -17,6 +17,28 @@
  */
 
 const UPSTREAM = "https://apis.roblox.com";
+// Path-mirror allowlist for the Atlas harvester: GET requests to
+// /atlas/<target-url> are relayed to atlasdev.gg through Cloudflare's IP
+// pool (the harvester's `direct` leg can be throttled from datacenter IP
+// ranges). Host-locked, method-locked, and rate-limited like omni-search.
+const ATLAS_MIRROR_HOST = "atlasdev.gg";
+const ATLAS_RATE_LIMIT_PER_MINUTE = 30;
+const ATLAS_RATE_LIMIT_WINDOW_MS = 60_000;
+const atlasBuckets = new Map();
+
+function atlasRateLimited(ip) {
+  const now = Date.now();
+  const bucket = atlasBuckets.get(ip) || [];
+  while (bucket.length && now - bucket[0] > ATLAS_RATE_LIMIT_WINDOW_MS) {
+    bucket.shift();
+  }
+  if (bucket.length >= ATLAS_RATE_LIMIT_PER_MINUTE) {
+    return true;
+  }
+  bucket.push(now);
+  atlasBuckets.set(ip, bucket);
+  return false;
+}
 const RATE_LIMIT_PER_MINUTE = 120;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 
@@ -231,6 +253,43 @@ export default {
     }
     if (request.method !== "GET") {
       return new Response("method not allowed", { status: 405, headers: CORS_HEADERS });
+    }
+    // Atlas path-mirror: /https://atlasdev.gg/analyze?... — the full target
+    // URL is the path suffix plus this request's query string. The target
+    // body is returned verbatim; only atlasdev.gg is allowed.
+    if (url.pathname.startsWith("/http")) {
+      if (rateLimited(clientIp(request))) {
+        return new Response("rate limited", { status: 429, headers: CORS_HEADERS });
+      }
+      if (atlasRateLimited(clientIp(request))) {
+        return new Response("rate limited", { status: 429, headers: CORS_HEADERS });
+      }
+      const target = `${url.pathname.slice(1)}${url.search}`;
+      let targetUrl;
+      try {
+        targetUrl = new URL(target);
+      } catch {
+        return new Response("bad target", { status: 400, headers: CORS_HEADERS });
+      }
+      if (targetUrl.hostname !== ATLAS_MIRROR_HOST) {
+        return new Response("forbidden host", { status: 403, headers: CORS_HEADERS });
+      }
+      const upstreamHeaders = new Headers({
+        Accept: "text/html,*/*",
+        "Accept-Language": "en",
+        "User-Agent": request.headers.get("user-agent") || "rbxscout-atlas-mirror",
+      });
+      const upstream = await fetch(targetUrl, {
+        headers: upstreamHeaders,
+        cf: { cacheTtl: 0 },
+        redirect: "follow",
+      });
+      const body = await upstream.arrayBuffer();
+      const out = new Headers(CORS_HEADERS);
+      out.set("Content-Type", upstream.headers.get("content-type") || "text/html; charset=utf-8");
+      out.set("X-Rbxscout-Proxy", "cf-worker-atlas");
+      out.set("X-Rbxscout-Upstream-Status", String(upstream.status));
+      return new Response(body, { status: upstream.status, headers: out });
     }
     if (url.pathname !== "/search-api/omni-search") {
       return new Response("not found", { status: 404, headers: CORS_HEADERS });

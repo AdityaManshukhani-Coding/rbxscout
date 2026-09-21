@@ -2206,35 +2206,43 @@ class RobloxPlatformScout:
             return None
 
     def _atlas_fetch(self, url: str, delay: float) -> Optional[requests.Response]:
-        """One polite Atlas fetch: honest UA, optional proxy pool, backoff.
+        """One polite Atlas fetch: honest UA, optional mirror pool, backoff.
 
-        On 429/5xx the module backs off twice and then signals bail-out by
-        returning None (the caller aborts the sweep without advancing any
-        pointer, so the next run retries the same range). Response bodies
-        are never trusted for stats — callers extract IDs or meta prose.
+        Pool entries are ``direct`` or a path-mirror service: a request to
+        ``<mirror>/<target-url>`` must return the target's body (the shape
+        the rbxscout Cloudflare Worker serves). Any single-entry failure —
+        403/404, network error, or repeated 429/5xx — falls through to the
+        next entry; ``direct`` is always the terminal fallback so a broken
+        mirror can never abort a sweep. Only when every entry fails does
+        the caller receive None (abort, pointers untouched, next run
+        retries the same range).
         """
+        last_status: Optional[int] = None
         for attempt, entry in enumerate(self._atlas_proxy_pool()):
+            target = url if entry == "direct" else f"{entry}/{url}"
             try:
-                proxies = None
-                if entry != "direct":
-                    proxies = {"http": entry, "https": entry}
                 resp = requests.get(
-                    url,
+                    target,
                     headers={"User-Agent": ATLAS_USER_AGENT, "Accept-Language": "en"},
                     timeout=30,
-                    proxies=proxies,
                 )
                 if resp.status_code in (429, 500, 502, 503, 504):
+                    last_status = resp.status_code
                     time.sleep(2.0 * (attempt + 1))
                     continue
                 if resp.status_code == 200:
                     time.sleep(delay)
                     return resp
-                log.warning("Atlas fetch %s -> HTTP %s", url, resp.status_code)
-                return None
+                last_status = resp.status_code
+                log.warning(
+                    "Atlas fetch %s via %s -> HTTP %s", url, entry, resp.status_code
+                )
             except requests.RequestException as exc:
-                log.warning("Atlas fetch failed (%s): %s", url, exc)
+                last_status = -1
+                log.warning("Atlas fetch failed via %s: %s", entry, exc)
                 time.sleep(1.0)
+        if last_status is not None and last_status > 0:
+            log.warning("Atlas pool exhausted (last HTTP %s): %s", last_status, url)
         return None
 
     def _atlas_pointer(self, pointer_id: str) -> Optional[float]:

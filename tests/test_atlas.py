@@ -272,10 +272,32 @@ def test_proxy_flip_routes_through_pool(scout, monkeypatch):
     calls = []
     _patch_http(monkeypatch, pages={"*": INDEX_HTML}, calls=calls)
     scout.harvest_atlas_seeds(pages=1, stat_pages=0, throttle_hours=0)
-    assert calls[0]["proxies"] == {
-        "http": "http://p1.example",
-        "https": "http://p1.example",
-    }
+    # Pool entries are path-mirrors: the fetch URL is <mirror>/<target-url>.
+    assert calls[0]["url"].startswith("http://p1.example/https://atlasdev.gg/")
+    assert calls[0]["proxies"] is None
+
+
+def test_pool_failover_reaches_direct_after_mirror_error(scout, monkeypatch):
+    """A mirror answering 403 must never abort a sweep: direct is tried next."""
+    monkeypatch.setenv("RBXSCOUT_SEARCH_PROXY_URLS", "http://p1.example, direct")
+    calls = []
+
+    real_get = scout_core.requests.get
+
+    def fake_get(url, timeout=30, **kwargs):
+        calls.append(url)
+        if url.startswith("http://p1.example/"):
+            return FakeResponse("forbidden", status_code=403)
+        if "/analyze?" in url:
+            return FakeResponse(INDEX_HTML)
+        return FakeResponse("", status_code=404)
+
+    monkeypatch.setattr(scout_core.requests, "get", fake_get)
+    assert real_get is not None  # keep linters quiet about the unused capture
+    scout.harvest_atlas_seeds(pages=1, stat_pages=0, throttle_hours=0)
+    assert calls[0].startswith("http://p1.example/")
+    assert any(call.startswith("https://atlasdev.gg/") for call in calls)
+    assert scout._atlas_pointer("atlas_last_run") is not None
 
 
 # --------------------------------------------------------------------------- #
