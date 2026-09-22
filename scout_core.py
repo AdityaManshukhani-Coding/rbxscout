@@ -207,7 +207,7 @@ EXPANSION_QUEUE_MAX_ROWS = 2_000_000     # dedup-memory ceiling (trim oldest)
 ATLAS_BASE_URL = "https://atlasdev.gg/analyze"
 ATLAS_QUERY = "sort=totalVisits&dir=asc&totalVisitsMin=20000&ccuMin=25"
 ATLAS_PRIORITY_DEFAULT = 2          # queue tier (drain processes lowest first)
-ATLAS_HOURS_DEFAULT = 24            # self-throttle: at most one harvest per day
+ATLAS_HOURS_DEFAULT = 23            # self-throttle: one harvest per day (23h so a fixed daily slot never slips)
 ATLAS_SWEEP_PAGES_DEFAULT = 3       # steady-state pages per daily harvest
 ATLAS_DEEP_PAGES_DEFAULT = 275      # one-off catch-up sweep ceiling (full index)
 ATLAS_DEEP_EVERY_DAYS_DEFAULT = 30  # re-run the deep sweep this often (0 = never)
@@ -625,6 +625,41 @@ class RobloxPlatformScout:
                 )
             if "blowup_at" not in columns:
                 conn.execute("ALTER TABLE game_analytics ADD COLUMN blowup_at TIMESTAMP")
+            # Rating + first-seen stamp. upvotes/downvotes come from
+            # games.roblox.com/v1/games/votes (fetched by the same pipeline
+            # passes that fetch icons); first_seen is the catalog insertion
+            # time. The dashboard no longer shows a Created column (Roblox
+            # exposes no cookieless creation date), but the stamp still
+            # accumulates for future use.
+            if "upvotes" not in columns:
+                conn.execute("ALTER TABLE game_analytics ADD COLUMN upvotes INTEGER")
+            if "downvotes" not in columns:
+                conn.execute("ALTER TABLE game_analytics ADD COLUMN downvotes INTEGER")
+            if "first_seen" not in columns:
+                # Backfilled from the earliest ccu_history snapshot where one
+                # exists (older games), CURRENT_TIMESTAMP otherwise (new rows).
+                conn.execute("ALTER TABLE game_analytics ADD COLUMN first_seen TIMESTAMP")
+                try:
+                    conn.execute(
+                        """
+                        UPDATE game_analytics SET first_seen = (
+                            SELECT MIN(h.ts) FROM ccu_history h
+                            WHERE h.universe_id = game_analytics.universe_id
+                        )
+                        """
+                    )
+                except sqlite3.Error:
+                    # Fresh database: ccu_history is created a few statements
+                    # below and holds no rows yet — nothing to backfill.
+                    pass
+                conn.execute(
+                    "UPDATE game_analytics SET first_seen = CURRENT_TIMESTAMP "
+                    "WHERE first_seen IS NULL"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_ga_first_seen "
+                    "ON game_analytics(first_seen)"
+                )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS scan_runs (
@@ -873,12 +908,27 @@ class RobloxPlatformScout:
         uid = record.get("universe_id")
         if uid is not None and record.get("tier") is None:
             record = {**record, **self._tier_stamp_for(int(uid), record)}
-        # 24 bind values + a strike update + CURRENT_TIMESTAMP.
+        # First-seen stamp: set only on brand-new rows; upserts of existing
+        # games can never rewrite it (first_seen backfill lives in _init_sqlite).
+        try:
+            with self._connect() as conn:
+                if conn.execute(
+                    "SELECT 1 FROM game_analytics WHERE universe_id = ?", (int(uid),)
+                ).fetchone():
+                    record = {**record, "first_seen": None}
+                else:
+                    record = {
+                        **record,
+                        "first_seen": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+        except (sqlite3.Error, TypeError, ValueError):
+            pass
+        # 25 bind values + a strike update + CURRENT_TIMESTAMP.
         # zero_ccu_strikes counts CONSECUTIVE observed 0-CCU visits: reset to 0
         # whenever the game has players, +1 when it is seen empty. This is what
         # makes prune_catalog work under the fast T8 rotation — a game dies from
         # being OBSERVED dead repeatedly, not from being ignored.
-        placeholders = ",".join("?" for _ in range(24))
+        placeholders = ",".join("?" for _ in range(25))
         with self._connect() as conn:
             conn.execute(
                 f"""
@@ -887,7 +937,7 @@ class RobloxPlatformScout:
                     genre, creator_name, creator_type, creator_id, description, icon_url,
                     has_discord, discord_url, status, found_via,
                     has_social_links, contacts_checked_at, tier, prev_tier,
-                    tier_since, blowup_flag, blowup_at, last_updated
+                    tier_since, blowup_flag, blowup_at, first_seen, last_updated
                 ) VALUES ({placeholders}, CURRENT_TIMESTAMP)
                 ON CONFLICT(universe_id) DO UPDATE SET
                     root_place_id   = excluded.root_place_id,
@@ -915,6 +965,7 @@ class RobloxPlatformScout:
                     blowup_flag    = CASE WHEN COALESCE(excluded.blowup_flag, 0) = 1
                                           THEN 1 ELSE COALESCE(game_analytics.blowup_flag, 0) END,
                     blowup_at      = COALESCE(excluded.blowup_at, game_analytics.blowup_at),
+                    first_seen     = COALESCE(game_analytics.first_seen, excluded.first_seen),
                     zero_ccu_strikes = CASE WHEN COALESCE(excluded.ccu, 0) = 0
                                             THEN COALESCE(game_analytics.zero_ccu_strikes, 0) + 1
                                             ELSE 0 END,
@@ -945,6 +996,7 @@ class RobloxPlatformScout:
                     record.get("tier_since"),
                     record.get("blowup_flag", 0),
                     record.get("blowup_at"),
+                    record.get("first_seen"),
                 ),
             )
             if record.get("ccu") is not None and record_ccu_history:
@@ -1099,7 +1151,8 @@ class RobloxPlatformScout:
                 return pd.read_sql_query(
                     "SELECT * FROM game_analytics "
                     f"WHERE {' AND '.join(where)} "
-                    "ORDER BY COALESCE(visits, 0) ASC, COALESCE(ccu, 0) ASC"
+                    "ORDER BY COALESCE(visits, 0) ASC, COALESCE(ccu, 0) ASC, "
+                    "COALESCE(first_seen, '2999-01-01') ASC"
                     + (f" LIMIT {int(limit)}" if limit else ""),
                     conn,
                     params=tuple(params),
@@ -1145,13 +1198,25 @@ class RobloxPlatformScout:
                 grp = grp.sort_values("ts")
                 win = grp[grp["ts"] >= day_ago]
                 avg_1d = win["ccu"].mean() if len(win) >= 2 else None
+                win_3d = grp[grp["ts"] >= now - pd.Timedelta(days=3)]
+                # Mirrors the 1d rule: needs ≥2 snapshots in the window, so a
+                # game discovered within the last 3 days shows "-" instead of
+                # a one-sample average pretending to be a trend.
+                avg_3d = win_3d["ccu"].mean() if len(win_3d) >= 2 else None
                 ref = None
                 if len(grp) >= 2:
                     base = grp[grp["ts"] < now - pd.Timedelta(hours=18)]
                     ref = float(base.iloc[-1]["ccu"]) if not base.empty else None
-                stats[int(uid)] = {"avg_ccu_1d": avg_1d, "ccu_ref": ref}
+                stats[int(uid)] = {
+                    "avg_ccu_1d": avg_1d,
+                    "avg_ccu_3d": avg_3d,
+                    "ccu_ref": ref,
+                }
             df["avg_ccu_1d"] = df["universe_id"].map(
                 lambda u: stats.get(int(u), {}).get("avg_ccu_1d")
+            )
+            df["avg_ccu_3d"] = df["universe_id"].map(
+                lambda u: stats.get(int(u), {}).get("avg_ccu_3d")
             )
             df["momentum_1d"] = df.apply(
                 lambda r: (
@@ -1164,6 +1229,7 @@ class RobloxPlatformScout:
             )
         else:
             df["avg_ccu_1d"] = None
+            df["avg_ccu_3d"] = None
             df["momentum_1d"] = None
         return df
 
@@ -1610,6 +1676,71 @@ class RobloxPlatformScout:
             "records": len(out),
         }
         return out
+
+    # ------------------------------------------------------------------ #
+
+    def fetch_vote_totals(self, universe_ids: List[int]) -> Dict[int, Dict[str, int]]:
+        """Batched up/down votes (50 per call, cookieless — verified live).
+
+        Backs the dashboard's Rating column (up / (up + down)). Missing or
+        failed batches simply yield no entry: the UI shows "-" and the next
+        refresh retries. Never raises.
+        """
+        out: Dict[int, Dict[str, int]] = {}
+        if not universe_ids:
+            return out
+        if getattr(self, "session", None) is None:
+            return out  # unit-test mocks carry no HTTP session
+        for i in range(0, len(universe_ids), 50):
+            chunk = universe_ids[i : i + 50]
+            q = ",".join(str(u) for u in chunk)
+            status, data = self._get_json(
+                f"https://games.roblox.com/v1/games/votes?universeIds={q}"
+            )
+            if status != 200 or not data:
+                continue
+            for item in data.get("data") or []:
+                try:
+                    out[int(item["id"])] = {
+                        "up": int(item.get("upVotes") or 0),
+                        "down": int(item.get("downVotes") or 0),
+                    }
+                except (KeyError, TypeError, ValueError):
+                    continue
+        return out
+
+    def upsert_icons(self, icons: Dict[int, str]) -> None:
+        """Persist icon URLs without touching the game rows' metrics.
+
+        One indexed UPDATE per URL-bearing id — far cheaper than a full
+        upsert_game (which would restamp tiers and rewrite every column).
+        """
+        if not icons:
+            return
+        try:
+            with self._connect() as conn:
+                for uid, url in icons.items():
+                    conn.execute(
+                        "UPDATE game_analytics SET icon_url = ? WHERE universe_id = ?",
+                        (url, int(uid)),
+                    )
+        except sqlite3.Error as exc:
+            log.warning("icon upsert failed: %s", exc)
+
+    def upsert_votes(self, votes: Dict[int, Dict[str, int]]) -> None:
+        """Persist like/dislike totals without touching the game rows' metrics."""
+        if not votes:
+            return
+        try:
+            with self._connect() as conn:
+                for uid, totals in votes.items():
+                    conn.execute(
+                        "UPDATE game_analytics SET upvotes = ?, downvotes = ? "
+                        "WHERE universe_id = ?",
+                        (int(totals.get("up") or 0), int(totals.get("down") or 0), int(uid)),
+                    )
+        except sqlite3.Error as exc:
+            log.warning("vote upsert failed: %s", exc)
 
     # ------------------------------------------------------------------ #
 
@@ -2107,6 +2238,13 @@ class RobloxPlatformScout:
                 self._mark_discovery_outcome(
                     uid, "below_gate" if uid in all_metas else "metrics_failed"
                 )
+        if qualified:
+            # Thumbnails for the new qualifiers: the drain used to store rows
+            # without icons, so every Atlas-discovered game rendered the
+            # placeholder tile until a much later hydrator pass happened to
+            # fill it (this is why recent Atlas games showed no thumbnail).
+            report(0.93, f"Fetching icons for {len(qualified)} new games…")
+            self.upsert_icons(self.fetch_game_icons(list(qualified)))
         report(
             0.9,
             f"Queue drained: {stats['qualified']} qualified · "

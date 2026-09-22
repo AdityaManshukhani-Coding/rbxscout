@@ -18,6 +18,14 @@ __pycache__/
 # --- dev scratch ---
 *.log
 /tmp/
+logs/
+
+# --- home harvester artifacts (atlas_home.py) ---
+rbx_scout.db.harvest
+rbx_scout.db.remote_merge
+rbx_scout.db.pull
+*.out
+*.err
 
 # --- cloudflare worker (tooling only; source + wrangler.toml stay committed) ---
 cloudflare-worker/node_modules/

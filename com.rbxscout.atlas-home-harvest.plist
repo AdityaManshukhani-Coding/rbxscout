@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  RbxScout daily home-IP Atlas harvest.
+
+  Fires once a day at 19:00 LOCAL time (17:00 UTC on this CEST machine) —
+  evening in the Netherlands, chosen so the harvest lands while the owner is
+  awake and the laptop is open (a missed day = no new games that day; Atlas
+  discovers nothing on its own). The throttle inside atlas_home.py is 23h so
+  a fixed daily slot can never silently skip a day.
+
+  Install (one time):
+    mkdir -p ~/Library/LaunchAgents
+    cp com.rbxscout.atlas-home-harvest.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.rbxscout.atlas-home-harvest.plist
+
+  Check / run manually:
+    launchctl print gui/$(id -u)/com.rbxscout.atlas-home-harvest
+    launchctl kickstart gui/$(id -u)/com.rbxscout.atlas-home-harvest
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rbxscout.atlas-home-harvest</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/adityamanshukhani/Downloads/Open-Cowork-main/Discord Website/.venv/bin/python</string>
+        <string>/Users/adityamanshukhani/Downloads/Open-Cowork-main/Discord Website/atlas_home.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/adityamanshukhani/Downloads/Open-Cowork-main/Discord Website</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>19</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/adityamanshukhani/Downloads/Open-Cowork-main/Discord Website/logs/atlas_home_run.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/adityamanshukhani/Downloads/Open-Cowork-main/Discord Website/logs/atlas_home_run.err</string>
+
+    <key>Nice</key>
+    <integer>10</integer>
+</dict>
+</plist>

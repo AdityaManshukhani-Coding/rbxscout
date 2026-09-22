@@ -217,12 +217,56 @@ first, then direct Roblox. A proxy that fails three consecutive keywords is
 benched for five minutes. This is independent of the Worker's scheduler;
 the same deployment provides both capabilities.
 
+## Daily home-IP discovery run (this laptop)
+
+atlasdev.gg 403s every GitHub Actions runner IP and the Cloudflare Worker
+relay, but allows residential IPs — so **discovery runs here**, once a day:
+
+```bash
+.venv/bin/python atlas_home.py            # pull → harvest → push (discovery ONLY)
+.venv/bin/python atlas_home.py --force    # ignore the 24h Atlas throttle
+```
+
+It is scheduled by a macOS LaunchAgent (`com.rbxscout.atlas-home-harvest.plist`
+in this folder, installed in `~/Library/LaunchAgents/`):
+
+- **Fires 19:00 local time daily** (17:00 UTC on a CEST machine) — evening in
+  the Netherlands, so the laptop is awake and open (a missed day = no new games
+  that day; the 23h throttle keeps a fixed slot from ever skipping). Seeds are
+  drained by the Actions expander on its next `:15`/`:45` tick, at most 30
+  minutes later.
+- Laptop asleep at 06:15? launchd runs it at wake. Lid closed all day = no run
+  that day; Atlas just picks up the next day (its cursor only advances on
+  success, nothing is lost).
+- `EXPAND_QUEUE_BATCHES=0` inside the runner: the laptop **discovers and
+  enqueues only** — the always-on Actions expander drains the seeds through the
+  strict 20k/25 gate and the hydrator owns all refresh traffic.
+- **Thumbnail backfill rides along**: atlasdev.gg 403s runner IPs, and the
+  thumbnail/vote endpoints follow the same pattern — so after each harvest the
+  laptop fetches icons + like/dislike votes for up to 200 icon-less catalog
+  rows (oldest first, 24h-throttled). This is what keeps every game's
+  thumbnail and Rating column filled without spending any Actions traffic.
+- Merges are union-by-primary-key and push uses a merge-retry, so the laptop
+  can never clobber games Actions discovered meanwhile (db_sync's stale-push
+  guard is the backstop).
+- A source-level tripwire fails the run if any legacy finder ever reappears in
+  `scout_core.py` — Atlas Dev stays the sole discovery engine.
+
+Logs: `logs/atlas_home.log` (the run) and `logs/atlas_home_run.out` (launchd).
+
 ## Dashboard
 
 `streamlit run app.py` gives you the full dashboard: filterable catalog,
 per-page Discord contact checks, per-tier diagnostics, and the **New and
 Upcoming** tab (the blow-up watch). It reads the same SQLite catalog this
-repo keeps fresh.
+repo keeps fresh. The results table mirrors atlasdev.gg's analyze layout —
+Game · Genre · Total visits · CCU · Avg CCU (1d) · Avg CCU (3d) · Momentum
+(1d) · Rating · Discord · Message — with Favorites, Peak CCU and Created
+dropped (they duplicate visits / current CCU, and Roblox exposes no
+cookieless creation date to show anyway). Averages and momentum derive from
+the row's first-seen stamp; Rating comes from
+`games.roblox.com/v1/games/votes` (cookieless, batched 50/call, fetched by
+the same passes that fetch icons).
 
 ### Hosted dashboard (Streamlit Community Cloud, free)
 

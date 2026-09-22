@@ -12,6 +12,7 @@ import sqlite3
 
 import pytest
 
+import atlas_home
 import scout_core
 from scout_core import RobloxPlatformScout
 
@@ -65,6 +66,53 @@ def _patch_http(monkeypatch, pages=None, games=None, calls=None):
         return FakeResponse("", status_code=404)
 
     monkeypatch.setattr(scout_core.requests, "get", fake_get)
+
+
+# --------------------------------------------------------------------------- #
+# Merge: harvest-side columns must survive the union merge
+# --------------------------------------------------------------------------- #
+
+
+def test_merge_carries_new_catalog_columns(tmp_path):
+    """Harvest-side columns added after 2026-09-21 (upvotes, downvotes,
+    first_seen) must survive the union merge into the pulled store."""
+    db = tmp_path / "t.db"
+    harvest = tmp_path / "h.db"
+    for target in (db, harvest):
+        with sqlite3.connect(str(target)) as conn:
+            conn.execute(
+                "CREATE TABLE game_analytics (universe_id INTEGER PRIMARY KEY, "
+                "title TEXT, upvotes INTEGER, downvotes INTEGER, first_seen TIMESTAMP)"
+            )
+            conn.execute(
+                "CREATE TABLE ccu_history (universe_id INTEGER, ts TIMESTAMP, "
+                "ccu INTEGER, PRIMARY KEY (universe_id, ts))"
+            )
+            conn.execute(
+                "CREATE TABLE discovery_queue (universe_id INTEGER PRIMARY KEY, "
+                "source TEXT, priority INTEGER DEFAULT 1, status TEXT DEFAULT 'pending')"
+            )
+            conn.execute("CREATE TABLE place_map (place_id INTEGER PRIMARY KEY, universe_id INTEGER)")
+            conn.execute(
+                "CREATE TABLE scan_pointers (id TEXT PRIMARY KEY, "
+                "last_universe_id INTEGER, updated_at TIMESTAMP)"
+            )
+    with sqlite3.connect(str(harvest)) as conn:
+        conn.execute(
+            "INSERT INTO game_analytics VALUES (900, 'Fresh', 500, 20, '2026-09-21 10:00:00')"
+        )
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            "INSERT INTO game_analytics VALUES (800, 'Old', 100, 5, '2026-09-02 10:00:00')"
+        )
+    merged = atlas_home.merge_harvest_into(db, harvest)
+    assert merged["game_analytics"] == 1
+    with sqlite3.connect(str(db)) as conn:
+        row = conn.execute(
+            "SELECT title, upvotes, downvotes, first_seen FROM game_analytics "
+            "WHERE universe_id = 900"
+        ).fetchone()
+    assert row == ("Fresh", 500, 20, "2026-09-21 10:00:00")
 
 
 # --------------------------------------------------------------------------- #

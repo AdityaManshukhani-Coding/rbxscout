@@ -126,9 +126,9 @@ DEFAULT_MIN_VISITS = 20_000
 DEFAULT_MIN_CCU = 25
 EMPTY_DATA_COLUMNS = [
     "universe_id", "root_place_id", "title", "ccu", "peak_ccu", "visits", "favorites",
-    "genre", "creator_name", "creator_type", "creator_id", "description", "icon_url",
-    "has_discord", "discord_url", "status", "found_via", "has_social_links",
-    "avg_ccu_1d", "momentum_1d", "contacts_checked_at",
+    "genre", "creator_name", "creator_type", "creator_id", "description", "icon_url",            "has_discord", "discord_url", "status", "found_via", "has_social_links",
+    "avg_ccu_1d", "avg_ccu_3d", "momentum_1d", "upvotes", "downvotes",
+    "contacts_checked_at",
 ]
 # Columns kept in st.session_state.data. ``description`` is dropped on purpose:
 # the catalog's average description is ~0.5 KB per game, so a default result
@@ -136,11 +136,14 @@ EMPTY_DATA_COLUMNS = [
 # hundreds of users that text alone pushed the container toward its RAM
 # ceiling (an OOM kill takes every user down at once). Everything still
 # renders: no dashboard widget reads the description column.
+# ``favorites``/``peak_ccu`` ride along (filter engine + other views may read
+# them) but the results table no longer renders them.
 SESSION_KEEP_COLUMNS = [
     "universe_id", "root_place_id", "title", "ccu", "peak_ccu", "visits", "favorites",
     "genre", "creator_name", "creator_type", "creator_id", "icon_url",
     "has_discord", "discord_url", "status", "found_via", "has_social_links",
-    "avg_ccu_1d", "momentum_1d", "contacts_checked_at",
+    "avg_ccu_1d", "avg_ccu_3d", "momentum_1d", "upvotes", "downvotes",
+    "contacts_checked_at",
 ]
 
 
@@ -243,7 +246,10 @@ def demo_dataframe() -> pd.DataFrame:
             "found_via": game["found_via"],
             "has_social_links": bool(game["discord_url"]),
             "avg_ccu_1d": game["ccu"] * 0.93,
+            "avg_ccu_3d": game["ccu"] * 0.91,
             "momentum_1d": int(game["ccu"] * 0.07),
+            "upvotes": int(game["favorites"] * 0.9),
+            "downvotes": int(game["favorites"] * 0.1),
             "contacts_checked_at": None,
         }
         for game in DEMO_GAMES
@@ -259,8 +265,7 @@ def demo_dataframe() -> pd.DataFrame:
 # Device profile: remembers you across refreshes and back-navigation.
 # --------------------------------------------------------------------------- #
 
-_PROFILE_FIELDS = (
-    "discord_name",
+_PROFILE_FIELDS = (        "discord_name",
     "discord_user_id",
     "message_template",
     "target_min_visits",
@@ -934,15 +939,13 @@ st.sidebar.caption("Roblox game scouting and Discord contact finder")
 # Workspace switch: the New and Upcoming view reuses the exact same paging,
 # Discord-check and table pipeline as the main view — only the data source
 # (blow-up watchlist) and the absence of filters differ.
-def render_live_counter(compact: bool = True) -> None:
+def render_live_counter() -> None:
     """The live catalog counter — the app's subscriber-count moment.
 
     A big tabular-numeral number that grows as the 24/7 pipeline discovers
     games, read from the cached catalog copy only (no network, no per-user
-    cost, never triggers a download). ``compact=True`` is the small band
-    under the results heading; the full-size centered version is the
-    dedicated 📡 Live catalog section, where a fragment re-renders it every
-    60 s so the count ticks up live like a YouTube subscriber counter.
+    cost, never triggers a download). Rendered compactly in the sidebar on
+    the main view.
     """
     _tracker = (
         catalog_fetch.catalog_counts_cached(DB_PATH)
@@ -971,8 +974,6 @@ def render_live_counter(compact: bool = True) -> None:
         '<div class="ss-tracker-badges">' + " · ".join(_badges) + "</div>"
         if _badges else ""
     )
-    _wrap = "ss-tracker" if compact else "ss-tracker ss-tracker-full"
-    _num = "ss-tracker-num" if compact else "ss-tracker-num ss-tracker-big"
     _digits = "".join(
         f'<span class="ss-digit" style="animation-delay:{i * 45}ms">{ch}</span>'
         for i, ch in enumerate(_games_fmt)
@@ -981,18 +982,14 @@ def render_live_counter(compact: bool = True) -> None:
         """
 <style>
 .ss-tracker {
-  display: inline-block; padding: 14px 26px; margin-bottom: 6px;
+  display: inline-block; padding: 12px 20px; margin-bottom: 6px;
   border: 1px solid rgba(128,128,128,0.35); border-radius: 12px;
   background: linear-gradient(180deg, rgba(88,101,242,0.10), rgba(88,101,242,0.03));
 }
-.ss-tracker-full {
-  display: block; text-align: center; padding: 30px 34px; margin: 6px auto 10px auto;
-}
 .ss-tracker-num {
-  font-size: 3.1rem; font-weight: 800; line-height: 1.1; letter-spacing: 0.5px;
+  font-size: 2.2rem; font-weight: 800; line-height: 1.1; letter-spacing: 0.5px;
   font-variant-numeric: tabular-nums; color: #e6edf3;
 }
-.ss-tracker-big { font-size: 5rem; letter-spacing: 1px; }
 .ss-digit {
   display: inline-block;
   animation: ss-pop 600ms cubic-bezier(0.2, 0.9, 0.25, 1.2) backwards;
@@ -1004,13 +1001,12 @@ def render_live_counter(compact: bool = True) -> None:
 @media (prefers-reduced-motion: reduce) {
   .ss-digit { animation: none; }
 }
-.ss-tracker-sub { font-size: 0.92rem; color: rgba(230,237,243,0.65); margin-top: 2px; }
-.ss-tracker-full .ss-tracker-sub { font-size: 1.05rem; margin-top: 6px; }
-.ss-tracker-badges { font-size: 0.82rem; color: rgba(230,237,243,0.8); margin-top: 8px; }
+.ss-tracker-sub { font-size: 0.88rem; color: rgba(230,237,243,0.65); margin-top: 2px; }
+.ss-tracker-badges { font-size: 0.8rem; color: rgba(230,237,243,0.8); margin-top: 8px; }
 </style>
 """
-        + f'<div class="{_wrap}">'
-        + f'<div class="{_num}">{_digits}</div>'
+        + f'<div class="ss-tracker">'
+        + f'<div class="ss-tracker-num">{_digits}</div>'
         + '<div class="ss-tracker-sub">games in the catalog &amp; growing</div>'
         + _badges_html
         + "</div>",
@@ -1020,11 +1016,10 @@ def render_live_counter(compact: bool = True) -> None:
 
 view = st.sidebar.radio(
     "Workspace",
-    options=["🎮 Main scout", "🚀 New and Upcoming", "📡 Live catalog"],
+    options=["🎮 Main scout", "🚀 New and Upcoming"],
     key="workspace_view",
 )
 is_watch_view = str(view).startswith("🚀")
-is_live_view = str(view).startswith("📡")
 # Switching workspaces lands you on page 1 of the new view; contact state
 # stays per-view so neither side loses its checked pages.
 if st.session_state.get("last_workspace_view") != view:
@@ -1128,30 +1123,6 @@ with st.sidebar.expander("✉️ Outreach message", expanded=False):
         "Keep the [Your Name] and [Game Name] tags — they auto-fill when you "
         "copy a message from the results table."
     )
-
-if is_live_view:
-    # Dedicated live section: the counter is the whole page. A fragment
-    # re-renders just this block every 60 s so the number ticks up in place —
-    # no full-page rerun, no scroll jump, no spinner over the rest of the UI.
-    # Stops before the sync/data machinery — this view needs none of it.
-    st.title("📡 Live catalog")
-    st.caption(
-        "Every game the 24/7 pipeline has discovered so far. Leave this tab open "
-        "and watch the count grow — it updates itself."
-    )
-
-    @st.fragment(run_every=60)
-    def _live_catalog_fragment() -> None:
-        render_live_counter(compact=False)
-
-    if _CATALOG_UNAVAILABLE:
-        st.warning(
-            "⚠️ The catalog store is unreachable right now — the counter returns "
-            "automatically once the next pipeline sync succeeds."
-        )
-    _live_catalog_fragment()
-    st.caption("Auto-refreshes every 60 seconds. No filters here — this is the whole catalog, raw.")
-    st.stop()
 
 sync = st.sidebar.button("🔄 Sync live data", type="primary", width="stretch", key="sync_live_data")
 check_contacts = st.sidebar.button(
@@ -1414,82 +1385,13 @@ visible = apply_filters(
     genres=selected_genres,
 )
 
-# Diagnostics are rendered after the page request completes so the current
-# Streamlit run displays the newly collected endpoint results immediately.
-st.sidebar.divider()
-st.sidebar.header("🔍 Scan diagnostics")
-st.sidebar.caption(f"Cookie configured: {'yes' if scout.has_cookie else 'no'}")
-st.sidebar.caption(f"Database: `{Path(scout.db_path)}`")
-if scout.last_scan:
-    scan_status = scout.last_scan.get("status", "unknown")
-    scan_time = scout.last_scan.get("finished_at") or scout.last_scan.get("started_at") or "-"
-    st.sidebar.caption(f"Last scan: {scan_status} · {scan_time}")
-    st.sidebar.caption(
-        f"Candidates {scout.last_scan.get('candidate_count', 0)} · "
-        f"Matches {scout.last_scan.get('matched_count', scout.last_scan.get('metrics_count', 0))} · "
-        f"Contacts {scout.last_scan.get('contacts_completed', 0)}/"
-        f"{scout.last_scan.get('contacts_attempted', 0)} · "
-        f"Errors {scout.last_scan.get('contact_errors', 0)}"
-    )
-    if scout.last_scan.get("error"):
-        st.sidebar.error(f"Scan error: {scout.last_scan['error']}")
-    tier_schedule = scout.last_scan.get("tier_schedule") or {}
-    if tier_schedule:
-        st.sidebar.caption(
-            f"Refresh queue: T1–2 {tier_schedule.get('t1_t2', 0):,} · "
-            f"T3 {tier_schedule.get('t3', 0):,} · T4 {tier_schedule.get('t4', 0):,} · "
-            f"weekly {tier_schedule.get('weekly', 0):,} · T8 {tier_schedule.get('t8', 0):,}"
-        )
-    hydration = scout.last_scan.get("hydration_budget") or {}
-    if hydration:
-        st.sidebar.caption(
-            f"Hydration: {hydration.get('hydrated', 0):,} hydrated · "
-            f"{hydration.get('deferred', 0):,} rolled to next sync · "
-            f"sync #{scout.last_scan.get('sync_number', 0)}"
-        )
-    if scout.last_scan.get("blowup_watch_count"):
-        st.sidebar.success(
-            f"🚀 {scout.last_scan['blowup_watch_count']} game(s) flagged for the "
-            "blow-up watch — see New and Upcoming."
-        )
-if scout.source_diagnostics:
-    place_details = scout.source_diagnostics.get("place_details", {})
-    if place_details:
-        st.sidebar.caption(
-            f"Place batches {place_details.get('successful_batches', 0)}/"
-            f"{place_details.get('batches', 0)} · "
-            f"resolved {place_details.get('resolved', 0):,}"
-        )
+# Failures stay visible even without the diagnostics section: a failed sync
+# or a crashed scan is surfaced as a quiet error line, everything else
+# (cookie state, endpoint results, queue budgets) stays internal.
 if st.session_state.get("scan_error"):
     st.sidebar.error(f"Last sync error: {st.session_state.scan_error}")
-
-if scout.last_contact_diagnostics:
-    st.sidebar.caption("Latest endpoint results")
-    labels = {
-        "game_social_links": "Game social links",
-        "group_profile": "Community profile",
-        "group_social_links": "Community social links",
-        "owner_profile": "Owner profile",
-        "owner_social_links": "Owner social links",
-    }
-    for uid, diagnostic in list(scout.last_contact_diagnostics.items())[-5:]:
-        with st.sidebar.expander(f"Game {uid}", expanded=False):
-            for key, value in diagnostic.items():
-                if key in ("selected_source", "cached", "checked_at"):
-                    continue
-                label = labels.get(key, key.replace("_", " ").title())
-                meaning = (
-                    "OK" if value == 200
-                    else "Sign-in required (check the cookie)" if value in (401, 403)
-                    else "No links configured" if value == 404
-                    else "Request failed"
-                )
-                st.write(f"**{label}:** {value} - {meaning}")
-            st.write(f"**Selected source:** {diagnostic.get('selected_source') or 'None'}")
-            if diagnostic.get("cached"):
-                st.caption("This result came from the contact cache.")
-else:
-    st.sidebar.info("No contact checks yet. Page one will be checked after the metric scan.")
+elif scout.last_scan and scout.last_scan.get("error"):
+    st.sidebar.error(f"Scan error: {scout.last_scan['error']}")
 
 # --------------------------------------------------------------------------- #
 # Display helpers and table
@@ -1515,27 +1417,45 @@ def game_url(row: pd.Series) -> str:
 
 TABLE_STYLE = """
 <style>
+/* Results panel: atlasdev.gg-style card — near-black body, hairline border,
+   raised header strip, generous row padding. */
+.ss-panel {
+  border: 1px solid #23262e; border-radius: 14px; overflow: hidden;
+  background: #101218; margin-top: 4px;
+}
 .ss-wrap { overflow-x: auto; }
-.ss-table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+.ss-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
 .ss-table thead th {
-  text-align: left; padding: 9px 12px; white-space: nowrap;
-  border-bottom: 1px solid rgba(128, 128, 128, 0.45); font-weight: 700;
+  text-align: center; padding: 12px 14px; white-space: nowrap;
+  background: #16181f; color: #b6bcc7; font-weight: 600;
+  font-size: 0.76rem; letter-spacing: 0.05em; text-transform: uppercase;
+  border-bottom: 1px solid #23262e;
 }
+.ss-table thead th.ss-col-game { text-align: left; padding-left: 18px; }
 .ss-table tbody td {
-  padding: 7px 12px; vertical-align: middle;
-  border-bottom: 1px solid rgba(128, 128, 128, 0.18);
+  padding: 9px 14px; vertical-align: middle; text-align: center;
+  border-bottom: 1px solid #1b1e25; color: #d7dbe2;
 }
-.ss-table tbody tr:hover td { background: rgba(128, 128, 128, 0.08); }
-.ss-num { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.ss-table tbody tr:last-child td { border-bottom: none; }
+.ss-table tbody tr:hover td { background: rgba(255, 255, 255, 0.028); }
+.ss-cell-game { text-align: left !important; padding-left: 18px !important; }
+.ss-num { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.ss-genre {
+  display: inline-block; padding: 3px 11px; border-radius: 999px;
+  background: #1a1d25; border: 1px solid #262a33; color: #c3c8d1;
+  font-size: 0.78rem; white-space: nowrap;
+}
+.ss-up { color: #22c55e; white-space: nowrap; }
+.ss-down { color: #ef4444; white-space: nowrap; }
 .ss-game { display: inline-flex; align-items: center; gap: 9px; text-decoration: none; color: inherit; }
 .ss-game:hover .ss-name { text-decoration: underline; }
-.ss-thumb { width: 52px; height: 52px; min-width: 52px; border-radius: 10px; object-fit: cover; background: rgba(128, 128, 128, 0.15); }
+.ss-thumb { width: 44px; height: 44px; min-width: 44px; border-radius: 10px; object-fit: cover; background: rgba(128, 128, 128, 0.15); }
 .ss-fallback {
-  width: 52px; height: 52px; min-width: 52px; border-radius: 10px;
+  width: 44px; height: 44px; min-width: 44px; border-radius: 10px;
   display: inline-flex; align-items: center; justify-content: center;
   background: rgba(128, 128, 128, 0.15);
 }
-.ss-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+.ss-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; font-size: 0.98rem; }
 .ss-discord { display: inline-flex; align-items: center; gap: 7px; text-decoration: none; }
 .ss-discord img { width: 18px; height: 18px; }
 .ss-discord span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 240px; }
@@ -1633,8 +1553,8 @@ document.addEventListener('click', function (event) {
   // so a name or User ID typed just before clicking Copy may not be in
   // data-msg yet. Prefer the live sidebar input values when they differ.
   var sidebar = document.querySelector('[data-testid="stSidebar"], aside');
-  var nameInput = sidebar && sidebar.querySelector('input[aria-label*="Discord username"]');
-  var idInput = sidebar && sidebar.querySelector('input[aria-label*="Discord User ID"]');
+  var nameInput = sidebar && sidebar.querySelector('input[aria-label="Discord username"]');
+  var idInput = sidebar && sidebar.querySelector('input[aria-label="Discord User ID (optional)"]');
   var name = nameInput && nameInput.value.trim();
   var rawId = idInput && idInput.value.trim();
   var digits = rawId ? rawId.replace(/\D/g, '') : '';
@@ -1695,6 +1615,55 @@ def copy_cell_html(row: pd.Series) -> str:
     )
 
 
+def _ccu_cell(value) -> str:
+    """CCU-style cell: rounded integer when present, em dash otherwise."""
+    try:
+        if value is None or pd.isna(value):
+            return "—"
+    except (TypeError, ValueError):
+        pass
+    try:
+        return compact_num(int(float(value)))
+    except (TypeError, ValueError):
+        return _num_cell(value)
+
+
+def _momentum_cell(value) -> str:
+    """Momentum cell, atlasdev.gg style: arrow + signed CCU delta vs ~24h
+    ago, green rising / red falling; plain '-' when there is no baseline.
+    Returns HTML (safe: only fixed spans around escaped numbers)."""
+    try:
+        if value is None or pd.isna(value):
+            return "-"
+    except (TypeError, ValueError):
+        pass
+    try:
+        delta = int(float(value))
+    except (TypeError, ValueError):
+        return "-"
+    shown = compact_num(abs(delta)) if abs(delta) >= 1000 else abs(delta)
+    if delta > 0:
+        return f"<span class='ss-up'>↑ +{shown}</span>"
+    if delta < 0:
+        return f"<span class='ss-down'>↓ −{shown}</span>"
+    return "<span class='ss-none'>0</span>"
+
+
+def _rating_cell(row: pd.Series) -> str:
+    """Rating cell: like ratio as a whole percent; '-' when no votes yet."""
+    try:
+        up = row.get("upvotes")
+        down = row.get("downvotes")
+        if up is None or down is None or pd.isna(up) or pd.isna(down):
+            return "-"
+        total = int(up) + int(down)
+        if total <= 0:
+            return "-"
+        return f"{round(100.0 * int(up) / total):.0f}%"
+    except (TypeError, ValueError):
+        return "-"
+
+
 def render_table(frame: pd.DataFrame) -> None:
     """Render the visible page as an HTML table.
 
@@ -1702,21 +1671,31 @@ def render_table(frame: pd.DataFrame) -> None:
     cells render markdown as plain text, so thumbnails and the Discord logo
     could never display inline. HTML keeps the merged thumbnail+name and
     logo+invite cells working in every Streamlit version.
+
+    Column order mirrors atlasdev.gg's analyze table: identity → trend
+    (CCU, averages, momentum) → quality (rating) → age (created) → action
+    (Discord, Message). Favorites and Peak CCU were dropped at request —
+    lifetime favorites correlate with visits, and current CCU dominates
+    peak CCU for scouting decisions.
     """
-    head = ["Game", "Genre", "Total visits", "CCU", "Peak CCU", "Favorites", "Discord", "Message", "Creator"]
+    head = [
+        "Game", "Genre", "Total visits", "CCU", "Avg CCU (1d)", "Avg CCU (3d)",
+        "Momentum (1d)", "Rating", "Discord", "Message",
+    ]
     rows = []
     for _, row in frame.iterrows():
         rows.append(
             "<tr>"
-            f"<td>{game_cell_html(row)}</td>"
-            f"<td>{_esc(_text(row.get('genre'), 'Unknown'))}</td>"
+            f"<td class='ss-cell-game'>{game_cell_html(row)}</td>"
+            f"<td><span class='ss-genre'>{_esc(_text(row.get('genre'), 'Unknown'))}</span></td>"
             f"<td class='ss-num'>{_num_cell(row.get('visits'))}</td>"
-            f"<td class='ss-num'>{_num_cell(row.get('ccu'))}</td>"
-            f"<td class='ss-num'>{_num_cell(row.get('peak_ccu'))}</td>"
-            f"<td class='ss-num'>{_num_cell(row.get('favorites'))}</td>"
+            f"<td class='ss-num'>{_ccu_cell(row.get('ccu'))}</td>"
+            f"<td class='ss-num'>{_ccu_cell(row.get('avg_ccu_1d'))}</td>"
+            f"<td class='ss-num'>{_ccu_cell(row.get('avg_ccu_3d'))}</td>"
+            f"<td class='ss-num'>{_momentum_cell(row.get('momentum_1d'))}</td>"
+            f"<td class='ss-num'>{_rating_cell(row)}</td>"
             f"<td>{discord_cell_html(row.get('discord_url'))}</td>"
             f"<td>{copy_cell_html(row)}</td>"
-            f"<td>{_esc(_text(row.get('creator_name'), '-'))}</td>"
             "</tr>"
         )
     # st.html with unsafe_allow_javascript=True is required for the copy
@@ -1726,42 +1705,27 @@ def render_table(frame: pd.DataFrame) -> None:
     # in _COPY_SCRIPT.
     st.html(
         TABLE_STYLE
-        + '<div class="ss-wrap"><table class="ss-table"><thead><tr>'
-        + "".join(f"<th>{_esc(label)}</th>" for label in head)
+        + '<div class="ss-panel"><div class="ss-wrap"><table class="ss-table"><thead><tr>'
+        + f"<th class='ss-col-game'>{_esc(head[0])}</th>"
+        + "".join(f"<th>{_esc(label)}</th>" for label in head[1:])
         + "</tr></thead><tbody>"
         + "".join(rows)
-        + "</tbody></table></div>"
+        + "</tbody></table></div></div>"
         + _COPY_SCRIPT,
         unsafe_allow_javascript=True,
     )
 
 st.title("🚀 New and Upcoming" if is_watch_view else "Games matching your target")
 
-# Compact live counter band on the main view (the big auto-refreshing version
-# lives in the dedicated 📡 Live catalog section).
+# Compact header by request: title only above the table. The live catalog
+# numbers live in the sidebar on the main view (one glance away, zero
+# header clutter); the watch view stays counter-free by design.
 if not is_watch_view:
-    render_live_counter(compact=True)
-if is_watch_view:
-    st.caption(
-        "Games that climbed 2+ tiers or tripled their CCU between syncs. "
-        "Same table, same Discord checks — no filters by design."
-    )
-meta_bits = [
-    f"**{len(visible):,}** shown",
-    f"**{len(metric_filtered):,}** target matches",
-    f"Page **{int(page)}/{page_count}**",
-    f"Σ CCU **{compact_num(visible['ccu'].sum()) if not visible.empty else '0'}**",
-]
-badge = {"live": "🟢 live", "db": "💾 cached", "demo": "🛰️ demo", "watch": "🚀 watch"}.get(source, source)
-st.caption("  ·  ".join(meta_bits) + f"  ·  {badge}")
+    with st.sidebar:
+        render_live_counter()
 
 if source == "demo":
     st.warning("Live sources were unavailable, so demo data is shown. Run Sync live data to retry.")
-st.caption(
-    "Results come from the always-on catalog pipeline — discovery and metric "
-    "refreshes run around the clock; this button just reads them. "
-    "Discord lookups are requested only for the visible page."
-)
 if discord_filter != DISCORD_FILTER_ALL:
     st.info(
         "Filtering the whole catalog by known contact state. Games whose contacts "

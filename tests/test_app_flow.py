@@ -61,7 +61,9 @@ def _demo_frame() -> pd.DataFrame:
             "creator_id": None, "description": "", "icon_url": "",
             "has_discord": True, "discord_url": "https://discord.gg/test",
             "status": "OK", "found_via": "test", "has_social_links": True,
-            "avg_ccu_1d": 900.0, "momentum_1d": 100, "contacts_checked_at": None,
+            "avg_ccu_1d": 900.0, "avg_ccu_3d": 880.0, "momentum_1d": 100,
+            "upvotes": 90_000, "downvotes": 10_000, "first_seen": "2026-09-05 12:00:00",
+            "contacts_checked_at": None,
         }
     ])
 
@@ -426,8 +428,10 @@ def test_cookie_from_welcome_flow_reaches_the_scout():
     at.run()
 
     assert not at.exception
-    captions = [el.value for el in at.sidebar.caption]
-    assert any("Cookie configured: yes" in value for value in captions)
+    # The diagnostics section is gone; a good cookie is now silent. The
+    # scout still must receive it (lookups ran authenticated), so assert on
+    # the session object itself instead of sidebar captions.
+    assert at.session_state["scout"].has_cookie
 
 
 def test_discord_filter_reads_whole_catalog(monkeypatch):
