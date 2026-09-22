@@ -20,8 +20,6 @@ import scout_core
 from scout_core import (
     DEFAULT_MESSAGE_TEMPLATES,
     DEFAULT_MESSAGE_TEMPLATE,
-    DISCORD_FILTER_ALL,
-    DISCORD_FILTER_TRUE,
     normalize_discord_user_id,
     render_outreach_message,
 )
@@ -509,28 +507,6 @@ def test_cookie_from_welcome_flow_reaches_the_scout():
     assert at.session_state["scout"].has_cookie
 
 
-def test_discord_filter_reads_whole_catalog(monkeypatch):
-    """'Discord Available' must query the catalog-wide contact state in SQL,
-    not just the 20 in-memory rows — otherwise it always said 'No results'."""
-    at = _render_dashboard()
-    calls: list[dict] = []
-    discord_frame = _demo_frame()
-    discord_frame["has_discord"] = True
-    discord_frame["discord_url"] = "https://discord.gg/test"
-
-    def _fake(self, min_visits=0, min_ccu=0, discord=None):
-        calls.append({"min_visits": min_visits, "min_ccu": min_ccu, "discord": discord})
-        return discord_frame.copy() if discord else _demo_frame().drop(index=0)
-
-    monkeypatch.setattr(scout_core.RobloxPlatformScout, "load_catalog_matches", _fake)
-
-    at.sidebar.radio(key="discord_filter_radio").set_value(DISCORD_FILTER_TRUE).run()
-
-    assert not at.exception
-    assert calls and calls[-1]["discord"] is True
-    assert "Blox Fruits" in _table_html(at)
-
-
 def test_resolved_contacts_recorded_to_overlay(monkeypatch):
     """Contact verdicts resolved in the UI must be handed to the catalog_fetch
     overlay store, or the next pipeline asset swap erases them and the
@@ -554,71 +530,18 @@ def test_resolved_contacts_recorded_to_overlay(monkeypatch):
     assert recorded[1]["discord_url"] == "https://discord.gg/test"
 
 
-def test_discord_filter_flip_resets_to_page_one(monkeypatch):
-    """Toggling the Discord filter deep into the unfiltered list used to drop
-    the user on the LAST page of the filtered set (clamped), which read as if
-    results were sorted highest-visits-first. A filter flip must restart at
-    page 1."""
+def test_sidebar_has_no_discord_filter_radio(monkeypatch):
+    """The Discord available/not-available filter was removed from the
+    sidebar at request: the Scout filters section offers search and genre
+    only, and no radio may remain anywhere in the sidebar."""
     at = _render_dashboard()
-
-    # 25 rows in session data and 25 filtered rows from the catalog read:
-    # both lists span 2 pages at 20 per page, so page 2 is reachable.
-    rows = []
-    for i in range(1, 26):
-        row = _demo_frame().iloc[0].copy()
-        row["universe_id"] = i
-        row["title"] = f"Game {i:02d}"
-        row["visits"] = 1000 * i  # ascending
-        rows.append(row)
-    big = pd.DataFrame(rows)
-    at.session_state["data"] = big.copy()
-
-    discord_rows = big.copy()
-    discord_rows["has_discord"] = True
-    discord_rows["discord_url"] = "https://discord.gg/x"
-
-    def _fake(self, min_visits=0, min_ccu=0, discord=None):
-        return discord_rows.copy() if discord else big.copy()
-
-    monkeypatch.setattr(scout_core.RobloxPlatformScout, "load_catalog_matches", _fake)
-
-    at.sidebar.radio(key="discord_filter_radio").set_value(DISCORD_FILTER_TRUE).run()
     assert not at.exception
-    at.sidebar.number_input(key="contact_page").set_value(2).run()
-    assert at.session_state["contact_page"] == 2
-
-    # Flipping the filter changes the result set entirely -> back to page 1.
-    at.sidebar.radio(key="discord_filter_radio").set_value(DISCORD_FILTER_ALL).run()
-    assert at.session_state["contact_page"] == 1
-
-
-def test_discord_filter_survives_stale_scout_core_signature(monkeypatch):
-    """Deploy skew self-heal: a running cloud process can hold the OLD
-    load_catalog_matches (no ``discord`` param) in sys.modules while the
-    freshly re-read app.py calls it with one — this used to crash with a
-    red TypeError on the Discord filter. Now the call is signature-checked
-    and the constraint is applied in memory instead."""
-    at = _render_dashboard()
-
-    stale = pd.concat([
-        _demo_frame(),  # has_discord=True, has an invite
-        _demo_frame().assign(
-            universe_id=2, title="No Invite Game", has_discord=False, discord_url=None
-        ),
-    ], ignore_index=True)
-
-    def _stale(self, min_visits=0, min_ccu=0):
-        # Old-world signature: accepts no ``discord`` argument at all.
-        return stale.copy()
-
-    monkeypatch.setattr(scout_core.RobloxPlatformScout, "load_catalog_matches", _stale)
-
-    at.sidebar.radio(key="discord_filter_radio").set_value(DISCORD_FILTER_TRUE).run()
-
-    assert not at.exception  # the TypeError crash is the regression
-    table = _table_html(at)
-    assert "Blox Fruits" in table
-    assert "No Invite Game" not in table
+    radios = [r.label for r in at.sidebar.radio]
+    assert all("Discord" not in (label or "") for label in radios), radios
+    assert not any((r.key or "") == "discord_filter_radio" for r in at.sidebar.radio)
+    # The filter banner never shows either.
+    infos = [w.value for w in at.info]
+    assert not any("known contact state" in v for v in infos)
 
 
 # --------------------------------------------------------------------------- #

@@ -22,9 +22,6 @@ import streamlit as st
 from scout_core import (
     DEFAULT_MESSAGE_TEMPLATES,
     DEFAULT_MESSAGE_TEMPLATE,
-    DISCORD_FILTER_ALL,
-    DISCORD_FILTER_FALSE,
-    DISCORD_FILTER_TRUE,
     DISCORD_LOGO_URL,
     THROTTLED_STATUS,
     RobloxPlatformScout,
@@ -1289,18 +1286,11 @@ if is_watch_view:
         "Filters live on the Main scout view."
     )
     search = ""
-    discord_filter = DISCORD_FILTER_ALL
     selected_genres = []
 else:
     st.sidebar.header("🎯 Scout filters")
     search = st.sidebar.text_input("🔎 Search game or creator", placeholder="e.g. blox, tycoon...")
 
-    discord_filter = st.sidebar.radio(
-        "Discord server",
-        options=[DISCORD_FILTER_ALL, DISCORD_FILTER_TRUE, DISCORD_FILTER_FALSE],
-        index=0,
-        key="discord_filter_radio",
-    )
     # Genre is a metric filter, so it is applied before contact requests.
     genres = sorted(g for g in df["genre"].dropna().unique() if g and g != "Unknown")
     selected_genres = st.sidebar.multiselect("Genre", options=genres)
@@ -1314,27 +1304,11 @@ metric_filtered = apply_filters(
     genres=selected_genres,
 )
 
-# Contact state spans the whole catalog, not just this session's rows: most
-# games were never contact-checked, so filtering the in-memory page would
-# empty the view ("No results"). When a Discord filter is active, re-read
-# the catalog with the constraint applied in SQL instead.
-if not is_watch_view and discord_filter != DISCORD_FILTER_ALL:
-    metric_filtered = apply_filters(
-        _read_catalog(
-            min_visits=eff_min_visits,
-            min_ccu=eff_min_ccu,
-            discord=(discord_filter == DISCORD_FILTER_TRUE),
-        ),
-        search=search,
-        genres=selected_genres,
-    )
-
 signature = "|".join([
     search,
     str(min_visits),
     str(min_ccu),
     ",".join(selected_genres),
-    str(discord_filter),  # filter changes reshuffle the whole list: restart at page 1
 ])
 if signature != st.session_state.contact_signature:
     st.session_state.contact_signature = signature
@@ -1411,22 +1385,6 @@ if deep and page_ids:
                         ascending=[True, True],
                         na_position="last",
                     ).reset_index(drop=True)
-                    if discord_filter != DISCORD_FILTER_ALL:
-                        # Fresh contact states just persisted — re-read the
-                        # catalog so newly resolved invites join the view.
-                        metric_filtered = apply_filters(
-                            _read_catalog(
-                                min_visits=eff_min_visits,
-                                min_ccu=eff_min_ccu,
-                                discord=(discord_filter == DISCORD_FILTER_TRUE),
-                            ),
-                            search=search,
-                            genres=selected_genres,
-                        ).sort_values(
-                            ["visits", "ccu"],
-                            ascending=[True, True],
-                            na_position="last",
-                        ).reset_index(drop=True)
                 page_rows = metric_filtered.iloc[page_start:page_start + int(page_size)]
             except Exception as exc:
                 scout.mark_scan_failed(exc)
@@ -1439,7 +1397,6 @@ visible = apply_filters(
     search="",
     min_visits=0,
     min_ccu=0,
-    discord_filter=discord_filter,
     genres=selected_genres,
 )
 
@@ -1824,12 +1781,6 @@ if not is_watch_view:
 
 if source == "demo":
     st.warning("Live sources were unavailable, so demo data is shown. Run Sync live data to retry.")
-if discord_filter != DISCORD_FILTER_ALL:
-    st.info(
-        "Filtering the whole catalog by known contact state. Games whose contacts "
-        "have not been checked yet count as no Discord — page through to check more, "
-        "then sync to refresh."
-    )
 
 if visible.empty:
     if is_watch_view:
