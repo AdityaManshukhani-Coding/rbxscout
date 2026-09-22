@@ -2,6 +2,7 @@
 RbxScout - Automated Roblox Scouting & Contact Identification Dashboard.
 
 Run: streamlit run app.py
+Deploy marker: 5 outreach starters + rotating copy + 100 access keys (fdfe96d).
 """
 
 from __future__ import annotations
