@@ -19,6 +19,7 @@ import pandas as pd
 import streamlit as st
 
 from scout_core import (
+    DEFAULT_MESSAGE_TEMPLATES,
     DEFAULT_MESSAGE_TEMPLATE,
     DISCORD_FILTER_ALL,
     DISCORD_FILTER_FALSE,
@@ -268,6 +269,7 @@ def demo_dataframe() -> pd.DataFrame:
 _PROFILE_FIELDS = (        "discord_name",
     "discord_user_id",
     "message_template",
+    "message_variant",
     "target_min_visits",
     "target_min_ccu",
     "onboarding_cookie",
@@ -426,11 +428,17 @@ def _render_gate() -> None:
     elif remaining <= 0:
         candidate = st.text_input("Password", type="password", key="gate_password")
         if st.button("Unlock", type="primary", width="stretch", key="gate_unlock"):
-            result = gate.check_password(candidate, ref)
+            result = gate.check_password(candidate, ref, gate._client_ip())
             if result == "ok":
                 st.session_state.gate_unlocked = True
                 gate.remember_unlock(ref)
                 st.rerun()
+            if result == "banned":
+                st.error(
+                    "⛔ **This access password has been disabled.** It was used "
+                    "from multiple devices and locations, which the owner treats "
+                    "as sharing. Ask them for your own password."
+                )
             if result == "wrong":
                 if gate.cooldown_remaining(ref) > 0:
                     st.rerun()  # a cooldown just started — show the timer now
@@ -473,6 +481,7 @@ def initialize_session() -> bool:
         "discord_name": "",  # asked in the welcome flow; auto-fills the outreach message
         "discord_user_id": "",  # optional; turns [Your Name] into a real <@ID> mention
         "message_template": DEFAULT_MESSAGE_TEMPLATE,
+        "message_variant": 0,  # which of the 5 starter templates is active
         "guide_step": 1,
         "pending_initial_scan": False,
     "welcome_scan_started": False,
@@ -514,6 +523,31 @@ def _save_onboarding_targets() -> None:
 
 def _save_profile_identity() -> None:
     """Snapshot identity fields (name / ID / template / cookie) on change."""
+    _profile_save()
+
+
+def _message_variant_options() -> list:
+    """Labels for the 5 starter templates ('Starter 1 — original default' …)."""
+    return [
+        ("Starter 1 — original" if i == 0 else f"Starter {i + 1} — variation")
+        for i in range(len(DEFAULT_MESSAGE_TEMPLATES))
+    ]
+
+
+def _apply_message_variant() -> None:
+    """Load the picked starter into the editable template and remember it.
+
+    The radio picks a starting point; the text_area stays the single source
+    of truth that the Copy button renders. The radio holds the selected
+    LABEL (Streamlit stores option values, not indices), so the label is
+    mapped back to its template; an unknown label falls back to Starter 1.
+    """
+    options = _message_variant_options()
+    try:
+        index = options.index(st.session_state.get("message_variant"))
+    except (ValueError, TypeError):
+        index = 0
+    st.session_state.message_template = DEFAULT_MESSAGE_TEMPLATES[index]
     _profile_save()
 
 
@@ -648,12 +682,27 @@ def render_onboarding() -> bool:
             "This is the message the Copy button prepares for each game. Edit it "
             "however you like, or continue with the default."
         )
+        st.radio(
+            "Starter message",
+            options=_message_variant_options(),
+            key="message_variant",
+            persist_state="session",
+            on_change=_apply_message_variant,
+        )
         st.text_area(
             "Message template",
             key="message_template",
             height=430,
             persist_state="session",
             on_change=_save_profile_identity,
+        )
+        st.caption(
+            "Every copy click picks one of the 5 starters at random and never "
+            "repeats the previous one, so two servers never get identical "
+            "messages back to back — that's what Discord's anti-spam filters "
+            "flag. Your customized template (if it differs from all starters) "
+            "joins the rotation as a sixth voice. Edit any starter above; "
+            "picking one just loads it here as your starting point."
         )
         st.caption(
             "Make sure you use the [Your Name] tag for your Discord username and the "
@@ -1093,6 +1142,13 @@ with st.sidebar.expander("⚙️ Scan settings", expanded=False):
             st.rerun()
 
 with st.sidebar.expander("✉️ Outreach message", expanded=False):
+    st.radio(
+        "Starter message",
+        options=_message_variant_options(),
+        key="message_variant",
+        persist_state="session",
+        on_change=_apply_message_variant,
+    )
     st.text_input(
         "Discord username",
         key="discord_name",
@@ -1120,8 +1176,9 @@ with st.sidebar.expander("✉️ Outreach message", expanded=False):
         on_change=_save_profile_identity,
     )
     st.caption(
-        "Keep the [Your Name] and [Game Name] tags — they auto-fill when you "
-        "copy a message from the results table."
+        "Each 📋 Copy click picks a random starter (never the same one twice "
+        "in a row) and auto-fills [Your Name] / [Game Name]. Edit the text "
+        "above to customize what gets rotated."
     )
 
 sync = st.sidebar.button("🔄 Sync live data", type="primary", width="stretch", key="sync_live_data")
@@ -1530,17 +1587,15 @@ def discord_cell_html(url) -> str:
     )
 
 
-# Inline copy handler for the Message column. It must live in the onclick
-# attribute (not a <script> tag) because Streamlit renders markdown HTML via
-# innerHTML, which never executes script elements. Tries the async clipboard
-# API first, then falls back to a hidden-textarea execCommand copy, and shows
-# one-shot "Copied" feedback on the button itself.
 # Copy handling for the Message column, injected as a <script> by
 # render_table. Inline onclick attributes are stripped by DOMPurify even
 # with unsafe_allow_javascript=True, so a delegated click listener is used
-# instead: it copies the JSON-encoded message from the button's data-msg,
-# tries the async clipboard API first and falls back to a hidden-textarea
-# execCommand copy, then shows one-shot "Copied" feedback on the button.
+# instead. Anti-spam rotation: every button carries ALL outreach variants
+# (data-alts); each click picks one at random, excluding the variant copied
+# on the previous click (tracked in localStorage), so two consecutive
+# copies are never the same starter regardless of which game they were for.
+# The handler tries the async clipboard API first and falls back to a
+# hidden-textarea execCommand copy, then shows "Copied" feedback.
 _COPY_SCRIPT = r"""
 <script>
 window.__ssCopyReady = true;
@@ -1549,6 +1604,18 @@ document.addEventListener('click', function (event) {
   if (!btn) { return; }
   var msg, label = btn.textContent, ok = false;
   try { msg = JSON.parse(btn.dataset.msg); } catch (err) { return; }
+  // --- variant rotation: pick a random starter, never the previous one ---
+  var pool = [];
+  try { pool = JSON.parse(btn.dataset.alts || '[]'); } catch (err) { pool = []; }
+  if (pool.length) {
+    var last = null;
+    try { last = window.localStorage.getItem('ss_last_variant'); } catch (e) {}
+    var candidates = pool.filter(function (a) { return a.v !== last; });
+    if (!candidates.length) { candidates = pool; }
+    var pick = candidates[Math.floor(Math.random() * candidates.length)];
+    msg = pick.t;
+    try { window.localStorage.setItem('ss_last_variant', pick.v); } catch (e) {}
+  }
   // Freshness override: Streamlit text_inputs only commit on blur/rerun,
   // so a name or User ID typed just before clicking Copy may not be in
   // data-msg yet. Prefer the live sidebar input values when they differ.
@@ -1594,12 +1661,38 @@ document.addEventListener('click', function (event) {
 """
 
 
+def _copy_pool(row: pd.Series) -> list:
+    """All outreach variants for this row, as [(variant_key, message), …].
+
+    The pool is the 5 starters plus — when the scout customized their
+    template into something none of the starters say — their own text as a
+    sixth voice. Entries are rendered with THIS row's game title but keep
+    the [Your Name] tag: the click script fills name/ID from the live
+    sidebar inputs at copy time (so a name typed seconds earlier wins over
+    the saved one, exactly like the single-message path). Keys ("s0"…"s5")
+    let the client script avoid repeating the same variant back to back.
+    """
+    templates = list(DEFAULT_MESSAGE_TEMPLATES)
+    current = str(st.session_state.get("message_template") or "").strip()
+    if current and current not in {t.strip() for t in DEFAULT_MESSAGE_TEMPLATES}:
+        templates.append(current)  # a customized template joins the rotation
+    return [
+        (
+            f"s{index}",
+            render_outreach_message(tmpl, "", _text(row.get("title"), "this game")),
+        )
+        for index, tmpl in enumerate(templates)
+    ]
+
+
 def copy_cell_html(row: pd.Series) -> str:
     """One cell: a button that copies the outreach message for this game.
 
     The message is rendered from the user's editable template with their
     Discord name (welcome flow) and this row's game title, JSON-encoded into
     a data attribute so quotes and newlines survive the HTML round-trip.
+    data-alts carries every rotation variant; the click script picks one at
+    random (never the previous one) at copy time.
     """
     message = render_outreach_message(
         st.session_state.get("message_template", DEFAULT_MESSAGE_TEMPLATE),
@@ -1608,9 +1701,13 @@ def copy_cell_html(row: pd.Series) -> str:
         discord_user_id=st.session_state.get("discord_user_id", ""),
     )
     payload = html.escape(json.dumps(message), quote=True)
+    alts = html.escape(
+        json.dumps([{"v": key, "t": text} for key, text in _copy_pool(row)]),
+        quote=True,
+    )
     return (
         '<button type="button" class="ss-copy" '
-        f'data-msg="{payload}">'
+        f'data-msg="{payload}" data-alts="{alts}">'
         "📋 Copy message</button>"
     )
 

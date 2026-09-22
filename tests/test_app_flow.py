@@ -18,6 +18,7 @@ import catalog_fetch
 import profile_store
 import scout_core
 from scout_core import (
+    DEFAULT_MESSAGE_TEMPLATES,
     DEFAULT_MESSAGE_TEMPLATE,
     DISCORD_FILTER_ALL,
     DISCORD_FILTER_TRUE,
@@ -204,6 +205,47 @@ def test_onboarding_asks_discord_name_then_template():
     captions = [element.value for element in at.caption]
     assert any("[Your Name]" in value and "[Game Name]" in value for value in captions)
 
+    # Five starter templates are offered; each loads into the editable area.
+    radio = at.radio(key="message_variant")
+    assert len(radio.options) == 5
+    assert radio.value == radio.options[0]
+    radio.set_value(radio.options[2]).run()
+    assert not at.exception
+    assert at.text_area(key="message_template").value == DEFAULT_MESSAGE_TEMPLATES[2]
+    # Switching back restores Starter 1 (the original default).
+    radio.set_value(radio.options[0]).run()
+    assert at.text_area(key="message_template").value == DEFAULT_MESSAGE_TEMPLATE
+
+
+def test_sidebar_variant_switcher_swaps_template(monkeypatch, tmp_path):
+    """The sidebar expander offers the same 5 starters after onboarding."""
+    monkeypatch.setenv("SS_PROFILE_DIR", str(tmp_path / "profiles"))
+    profile_store.save_profile(
+        "variant-ref-1",
+        {
+            "discord_name": "Var Scout",
+            "discord_user_id": "",
+            "message_template": DEFAULT_MESSAGE_TEMPLATE,
+            "target_min_visits": 20_000,
+            "target_min_ccu": 25,
+            "onboarding_cookie": "",
+            "onboarding_step": 4,
+            "guide_step": 4,
+            "onboarding_complete": True,
+        },
+    )
+    _patch_catalog_reader(monkeypatch, _demo_frame())
+    at = _fresh_app()
+    at.session_state["_device_ref"] = "variant-ref-1"
+    at.run()
+    assert not at.exception
+
+    radio = at.sidebar.radio(key="message_variant")
+    assert len(radio.options) == 5
+    radio.set_value(radio.options[4]).run()
+    assert not at.exception
+    assert at.sidebar.text_area(key="message_template").value == DEFAULT_MESSAGE_TEMPLATES[4]
+
 
 def test_user_id_optional_field_flows_into_copied_message(monkeypatch):
     """Step 3 shows the optional User ID field with helper captions; a saved
@@ -299,6 +341,39 @@ def test_results_table_has_copy_message_column():
     assert "Blox Fruits" in message
     assert "[Your Name]" not in message
     assert "[Game Name]" not in message
+
+
+def test_copy_button_rotates_all_variants_never_repeating():
+    """Every copy button carries all 5 starters (plus a customized template)
+    in data-alts, and the click script picks one at random, excluding the
+    previously copied variant — so two consecutive copies can never be the
+    same starter, regardless of which game each copy was for."""
+    at = _render_dashboard()
+    assert not at.exception
+
+    table_html = _table_html(at)
+    match = re.search(r'data-alts="([^"]+)"', table_html)
+    assert match, "copy button should embed the rotation pool"
+    pool = json.loads(html_module.unescape(match.group(1)))
+
+    # 5 starters are in the pool, each keyed so repeats can be excluded.
+    keys = [entry["v"] for entry in pool]
+    assert keys == [f"s{i}" for i in range(5)], "one pool entry per starter"
+    texts = [entry["t"] for entry in pool]
+    assert len(set(texts)) == 5, "all starters differ"
+    # Every pool entry is rendered for this row's game but keeps [Your Name]
+    # for the click-time identity fill.
+    for text in texts:
+        assert "Blox Fruits" in text
+        assert "[Game Name]" not in text
+        assert "[Your Name]" in text
+
+    # The client script does the no-repeat pick in localStorage.
+    scripts = re.findall(r"<script>(.*?)</script>", table_html, re.S)
+    js = next((s for s in scripts if "ss-copy" in s and "ss_last_variant" in s), "")
+    assert js, "rotation logic ships with the table script"
+    assert "dataset.alts" in js, "the pool is read from the button"
+    assert "filter" in js, "previous variant is excluded from the pick"
 
 
 def test_copy_script_rewrites_identity_from_live_sidebar_inputs():

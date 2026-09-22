@@ -300,6 +300,36 @@ subscriber-counter-style number: total cataloged games, how many meet the
 in `ccu_history`), and the last pipeline sync time. It reads the cached
 catalog copy, so it costs nothing per visitor.
 
+### Access passwords (master + 100 user keys)
+
+Sign-in accepts two kinds of passwords, checked in this order:
+
+1. **Master** — `APP_PASSWORD` in the Streamlit secrets (or env var). Yours
+   alone; never subject to the sharing ban.
+2. **User keys** — 100 generated friend passwords, hashed into the committed
+   `access_passwords.json` (SHA-256 + fixed salt; `gate.py` reads it at
+   sign-in). The plaintext list lives in `access_passwords.txt`, which is
+   **gitignored** — paste it into a private Google Doc and write each
+   classmate's name next to their key so a banned key is traceable.
+
+Anti-sharing: every sign-in with a user key records its client IP and device
+id. The moment one key shows **two separate IPs AND two separate device
+ids**, it is banned for everyone — both users are dropped back to the
+password screen and their remembered unlocks are revoked. (Same IP on many
+devices, e.g. classmates on one wifi, and one device across networks, e.g. a
+phone on the move, do NOT trigger the ban. One person using two devices on
+two different networks WILL — the owner's rule is one key = one person = one
+device.) Wrong-password cooldowns work exactly as before; a banned key
+returns a clear "disabled" error, not the wrong-password message.
+
+Regenerate the set any time (this invalidates every old key):
+
+    python generate_access_passwords.py
+
+Local development never trips the ban (unknown/localhost IPs are ignored by
+the tracker). The master password also still works when the manifest file is
+missing, so deployments without user keys behave exactly as before.
+
 ### Never-sleep keep-alive (Cloudflare Worker)
 
 Community Cloud hibernates apps after 12 h without traffic; the scheduler

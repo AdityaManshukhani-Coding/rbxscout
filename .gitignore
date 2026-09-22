@@ -27,6 +27,9 @@ rbx_scout.db.pull
 *.out
 *.err
 
+# --- user access keys: plaintext list NEVER enters git (hashes do) ---
+access_passwords.txt
+
 # --- cloudflare worker (tooling only; source + wrangler.toml stay committed) ---
 cloudflare-worker/node_modules/
 cloudflare-worker/.wrangler/

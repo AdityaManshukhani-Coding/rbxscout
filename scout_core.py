@@ -141,6 +141,109 @@ Best regards,
 
 Studio Scouts"""
 
+# Four more phrasings of the same outreach, so a scout can rotate between
+# copies and Discord's anti-spam heuristics see varied text instead of one
+# identical message pasted at 20 servers. Every variant keeps the [Your Name]
+# and [Game Name] tags (render_outreach_message fills them) and the same
+# portfolio links; openings, closings and sentence structures differ.
+DEFAULT_MESSAGE_TEMPLATES = (
+    DEFAULT_MESSAGE_TEMPLATE,
+    """\
+Hi there,
+
+[Your Name] here, reaching out on behalf of Studio Scouts. We connect Roblox developers with industry partners who help their games grow and earn more.
+
+Your work on **[Game Name]** caught our team's eye — the momentum around it is hard to miss. I wanted to ask whether you'd be interested in a conversation about where the game could go next: a partial sale, outside investment, or hands-on publishing, LiveOps and marketing support.
+
+The studios and investors I work with directly include Jae Studio, Khalid Games, Ascend Studios and others — a few portfolio references:
+
+* https://jaeceo.com/
+* https://spong.pro/
+* https://www.vexedinteractive.com/
+* https://summitinteractive.co.uk/
+* https://playastudios.org/
+* https://games.worldent.online/
+
+If any of that sounds worth a chat, I'm happy to walk you through the details and see what fits your project.
+
+Hope to hear from you,
+
+**[Your Name]**
+
+Studio Scouts""",
+    """\
+Hello!
+
+My name is [Your Name] and I scout for Studio Scouts, a team that helps Roblox developers scale their games, secure funding and unlock new revenue by matching them with leading industry partners.
+
+We've had our eye on **[Game Name]** for a while — genuinely impressive growth. The reason I'm writing: would you be open to exploring growth opportunities? That could mean selling a percentage of the game, bringing in investment, or plugging into publishing, LiveOps and marketing support.
+
+On our side, I represent studios and investors such as Jae Studio, Khalid Games, Ascend Studios and several more (a few portfolio links below):
+
+* https://jaeceo.com/
+* https://spong.pro/
+* https://www.vexedinteractive.com/
+* https://summitinteractive.co.uk/
+* https://playastudios.org/
+* https://games.worldent.online/
+
+Open to a quick conversation? I'd love to share the details and find what makes sense for your game.
+
+Best,
+
+**[Your Name]**
+
+Studio Scouts""",
+    """\
+Hey [Game Name] team,
+
+I'm [Your Name] with Studio Scouts. We partner with Roblox developers to help their games scale, raise funding and monetize better — by connecting them with leading industry partners.
+
+**[Game Name]** has been on our radar and the progress stands out. I'd love to hear whether you'd consider discussing what's next: a percentage sale, investment or funding, or support across LiveOps, publishing and marketing.
+
+I work directly with studios and investors — Jae Studio, Khalid Games, Ascend Studios among them (portfolio references below):
+
+* https://jaeceo.com/
+* https://spong.pro/
+* https://www.vexedinteractive.com/
+* https://summitinteractive.co.uk/
+* https://playastudios.org/
+* https://games.worldent.online/
+
+If you're open to it, I'll share a few details and we can see what makes the most sense for the project.
+
+Talk soon,
+
+**[Your Name]**
+
+Studio Scouts""",
+    """\
+Hi,
+
+This is [Your Name] from Studio Scouts — we help Roblox developers grow, fund and monetize their games by introducing them to leading industry partners.
+
+Congrats on what you've built with **[Game Name]**; it hasn't gone unnoticed. I'm getting in touch to see if you'd be up for a conversation about growth options: selling a stake, securing investment or funding, or tapping LiveOps, publishing and marketing support.
+
+Among the studios and investors I represent directly: Jae Studio, Khalid Games, Ascend Studios and several others (portfolio references below):
+
+* https://jaeceo.com/
+* https://spong.pro/
+* https://www.vexedinteractive.com/
+* https://summitinteractive.co.uk/
+* https://playastudios.org/
+* https://games.worldent.online/
+
+Would love to swap a few details and figure out what works best for your project, if you're interested.
+
+Cheers,
+
+**[Your Name]**
+
+Studio Scouts""",
+)
+# Backwards-compatible alias: the first variant IS the original default.
+DEFAULT_MESSAGE_TEMPLATE = DEFAULT_MESSAGE_TEMPLATES[0]
+
 NAME_TAG_REGEX = re.compile(r"\[(?:your name|name)\]", re.IGNORECASE)
 GAME_TAG_REGEX = re.compile(r"\[(?:game name|game)\]", re.IGNORECASE)
 

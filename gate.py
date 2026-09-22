@@ -16,6 +16,24 @@ environment variable (or Streamlit secret) — there is deliberately NO
 hardcoded fallback password in this repo: anyone who can read the source
 could otherwise unlock every deployment. Set ``APP_PASSWORD`` as a Streamlit
 secret (or env var) before deploying.
+
+
+User access passwords (friend keys)
+-----------------------------------
+
+Besides the master password, the deployment can honour a set of per-user
+access passwords (``access_passwords.json`` next to this module: SHA-256
+hashes of the 100 generated keys; the plaintext list lives only with the
+owner, e.g. pasted into a private Google Doc next to each friend's name).
+
+Anti-sharing rule: each user password records the (client IP, device id)
+pairs it is used from. The moment one password shows up from **two
+different IPs AND two different device ids**, it is assumed shared between
+two people: the password is banned and both users are locked out (their
+remembered unlocks are revoked too, so a refresh sends them back to the
+password screen). Same-IP multi-device use (one friend on laptop + phone
+at home) never triggers the ban — the two conditions must hold together.
+The master password is exempt from all of this by design.
 """
 
 from __future__ import annotations
@@ -61,6 +79,148 @@ def _expected_password() -> str:
     """
     value = os.environ.get("APP_PASSWORD") or _streamlit_secret() or ""
     return value
+
+
+# --- user access passwords (friend keys) ----------------------------------- #
+
+# Fixed application-side salt: domain-separates these hashes from other
+# sha256 uses and makes off-the-shelf rainbow tables useless. The generated
+# keys are long random strings, so hash lookup is not a realistic attack.
+_USER_HASH_SALT = "rbxscout-access-v1:"
+# Per-password history bounds (last-seen wins; sharing needs only 2 entries).
+_MAX_TRACKED = 8
+
+
+def _user_hashes_path() -> Path:
+    """Where the committed user-password hash manifest lives (env-overridable)."""
+    override = os.environ.get("SS_USER_HASHES_FILE")
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parent / "access_passwords.json"
+
+
+def _user_state_path() -> Path:
+    return _state_dir() / ".access_users.json"
+
+
+def _user_hash(candidate: str) -> str:
+    return hashlib.sha256((_USER_HASH_SALT + candidate).encode("utf-8")).hexdigest()
+
+
+def _load_user_hashes() -> set:
+    try:
+        data = json.loads(_user_hashes_path().read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    if isinstance(data, dict):
+        data = data.get("passwords") or []
+    if not isinstance(data, list):
+        return set()
+    return {str(item).strip().lower() for item in data if str(item).strip()}
+
+
+def _load_user_state() -> dict:
+    try:
+        data = json.loads(_user_state_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_user_state(state: dict) -> None:
+    try:
+        target = _user_state_path()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(state, handle)
+        os.replace(tmp_name, target)
+    except Exception:
+        pass  # access bookkeeping must never take the app down
+
+
+def user_password_status(candidate: str) -> str:
+    """Classify a candidate against the user-key manifest: ``user``/``none``."""
+    return "user" if _user_hash(candidate) in _load_user_hashes() else "none"
+
+
+def check_user_password(candidate: str, ref: str | None, ip: str | None) -> str:
+    """Validate one user-key attempt; returns ``ok``/``banned``/``wrong``.
+
+    On ``ok`` the IP and the device id are recorded for that key. When the
+    history shows TWO separate IPs AND TWO separate device ids, the key is
+    being shared between two people: it is banned for everyone and its
+    remembered unlocks are revoked, so both users hit the password screen
+    again and are refused from there. Owner's rule: one password = one
+    person = one device. (Edge case accepted by the owner: one person using
+    two devices on two networks also trips the ban — stick to one device.)
+
+    Lenient corners: an "unknown" IP (bare tests, localhost) never counts
+    toward the two-IP condition, so local development is never banned.
+    """
+    key = _user_hash(candidate)
+    if key not in _load_user_hashes():
+        return "wrong"
+    device = _ref_key(ref)
+    banned_now = False
+    with _STATE_LOCK:
+        state = _load_user_state()
+        entry = state.get(key) if isinstance(state.get(key), dict) else {}
+        if entry.get("banned"):
+            return "banned"
+        ips = [str(x) for x in entry.get("ips", []) if x]
+        refs = [str(x) for x in entry.get("refs", []) if x]
+        if ip and ip != "unknown" and ip not in ips:
+            ips = (ips + [ip])[-_MAX_TRACKED:]
+        if device and device not in refs:
+            refs = (refs + [device])[-_MAX_TRACKED:]
+        now = time.time()
+        entry.update(
+            {
+                "ips": ips,
+                "refs": refs,
+                "first_seen": entry.get("first_seen") or now,
+                "last_seen": now,
+            }
+        )
+        # The sharing tripwire, exactly as specified: two separate IPs AND
+        # two separate device ids on the same key = shared password = ban.
+        if len(ips) >= 2 and len(refs) >= 2:
+            entry["banned"] = True
+            entry["banned_at"] = now
+            entry["banned_reason"] = (
+                f"used from {len(ips)} IPs and {len(refs)} devices "
+                f"({', '.join(ips)} / {', '.join(refs)})"
+            )
+            banned_now = True
+        state[key] = entry
+        _save_user_state(state)
+    # Unlock revocation happens OUTSIDE _STATE_LOCK: it acquires the same
+    # non-reentrant lock, and calling it under the lock deadlocked the ban
+    # path (the original bug — every banned login hung its request forever).
+    if banned_now:
+        _revoke_unlocks_for(refs)
+        return "banned"
+    return "ok"
+
+
+def _revoke_unlocks_for(refs: list) -> None:
+    """Drop remembered unlocks for every device that used a banned key."""
+    try:
+        with _STATE_LOCK:
+            state = _load_unlocks()
+            hits = {r for r in refs if r in state}
+            if not hits:
+                return
+            for r in hits:
+                state.pop(r, None)
+            target = _unlock_path()
+            fd, tmp_name = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(state, handle)
+            os.replace(tmp_name, target)
+    except Exception:
+        pass
 
 
 def _streamlit_secret() -> str | None:
@@ -116,6 +276,31 @@ def _ref_key(ref: str | None) -> str:
     except Exception:
         ua = "unknown"
     return "ua:" + _hash(ua)
+
+
+def _client_ip() -> str:
+    """Best-effort visitor IP for the user-key sharing tracker.
+
+    On Streamlit Community Cloud the app sits behind a proxy, so the real
+    client address arrives in X-Forwarded-For (first hop); st.context.ip_address
+    is used as a fallback. Returns "unknown" when neither is available
+    (bare tests, localhost) — unknown IPs never count toward the ban.
+    """
+    try:
+        import streamlit as st
+
+        headers = dict(getattr(st.context, "headers", None) or {})
+        forwarded = str(
+            headers.get("X-Forwarded-For") or headers.get("x-forwarded-for") or ""
+        ).strip()
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+        ip = getattr(st.context, "ip_address", None)
+        if ip:
+            return str(ip)
+    except Exception:
+        pass
+    return "unknown"
 
 
 def cooldown_remaining(ref: str | None) -> float:
@@ -174,11 +359,16 @@ def reset_attempts(ref: str | None) -> None:
             _save_state(state)
 
 
-def check_password(candidate: str, ref: str | None) -> str:
-    """Evaluate one unlock attempt; returns ``ok``/``cooldown``/``wrong``/``unconfigured``.
+def check_password(candidate: str, ref: str | None, ip: str | None = None) -> str:
+    """Evaluate one unlock attempt; returns ``ok``/``banned``/``cooldown``/``wrong``/``unconfigured``.
 
     Like iOS: while cooling down, even the correct password cannot skip the
     timer — but entering it does not add another failure either.
+
+    Order matters: the master password (APP_PASSWORD) is checked first and is
+    exempt from the user-key sharing ban; user keys from access_passwords.json
+    go through check_user_password (which enforces the IP+device anti-sharing
+    rule). Anything else is a wrong password.
 
     The device ref is NOT part of the password decision: the ref only keys
     the lockout bookkeeping. Requiring it here too meant that visitors with
@@ -191,15 +381,25 @@ def check_password(candidate: str, ref: str | None) -> str:
     if cooldown_remaining(ref) > 0:
         return "cooldown"
     expected = _expected_password()
+    if expected and _hash(candidate) == _hash(expected):
+        reset_attempts(ref)
+        return "ok"
+    if user_password_status(candidate) == "user":
+        result = check_user_password(candidate, ref, ip)
+        if result == "ok":
+            reset_attempts(ref)
+        elif result == "banned":
+            return "banned"  # no failure counting: the key itself is dead
+        else:
+            record_failure(ref)
+        return result
     if not expected:
-        # Fail closed: the owner has not configured APP_PASSWORD. Never treat
-        # this as a wrong password (no attempt burning) and never let it pass.
+        # Fail closed: the owner has not configured APP_PASSWORD and the
+        # candidate is not a user key either. Never treat this as a wrong
+        # password (no attempt burning) and never let it pass.
         return "unconfigured"
-    if _hash(candidate) != _hash(expected):
-        record_failure(ref)
-        return "wrong"
-    reset_attempts(ref)
-    return "ok"
+    record_failure(ref)
+    return "wrong"
 
 
 def lockdown() -> None:
