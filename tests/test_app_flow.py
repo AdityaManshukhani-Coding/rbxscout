@@ -323,6 +323,103 @@ def test_store_outage_shows_banner_instead_of_crashing(monkeypatch):
     assert any("Studio Scouts" in el.value for el in at.header) or at.title
 
 
+def test_table_column_order_discord_before_averages():
+    """Column order (user request 2026-09-23): Game, Genre, Total visits,
+    CCU, Discord, Message, Avg CCU (1d), Avg CCU (3d), Momentum, Rating."""
+    at = _render_dashboard()
+    assert not at.exception
+
+    table_html = _table_html(at)
+    header_match = re.search(r"<thead><tr>(.*?)</tr></thead>", table_html, re.S)
+    assert header_match, "results table header should render"
+    headers = re.findall(r"<th[^>]*>(.*?)</th>", header_match.group(1))
+    assert headers == [
+        "Game", "Genre", "Total visits", "CCU", "Discord", "Message",
+        "Avg CCU (1d)", "Avg CCU (3d)", "Momentum (1d)", "Rating",
+    ], headers
+
+
+def test_missing_discord_says_no_discord_server():
+    """Games without a resolved invite must read 'No Discord Server' —
+    a bare dash looked like a cell still loading."""
+    frame = _demo_frame()
+    frame.loc[0, "discord_url"] = None
+    frame.loc[0, "has_discord"] = False
+    at = _fresh_app()
+    at.run()
+    at.session_state["onboarding_complete"] = True
+    at.session_state["pending_initial_scan"] = False
+    at.session_state["welcome_scan_started"] = True
+    at.session_state["data"] = frame
+    at.session_state["source"] = "demo"
+    at.run()
+
+    assert not at.exception
+    table_html = _table_html(at)
+    assert "No Discord Server" in table_html
+
+
+def test_game_url_fallback_uses_discover_not_dead_search_route():
+    """roblox.com/search?keyword= 404s for EVERY keyword (verified live
+    2026-09-23) — emoji titles were never the problem. The keyword fallback
+    must use /discover, which serves search results. Rows with a place id
+    keep deep-linking to the game page."""
+    frame = _demo_frame()
+    no_place = frame.copy()
+    no_place["root_place_id"] = None
+
+    at = _fresh_app()
+    at.run()
+    at.session_state["onboarding_complete"] = True
+    at.session_state["pending_initial_scan"] = False
+    at.session_state["welcome_scan_started"] = True
+    at.session_state["data"] = no_place
+    at.session_state["source"] = "demo"
+    at.run()
+
+    assert not at.exception
+    table_html = _table_html(at)
+    assert "https://www.roblox.com/discover/?Keyword=Blox%20Fruits" in table_html
+    assert "roblox.com/search?keyword=" not in table_html
+
+    # A row with a place id still deep-links to the game page.
+    at.session_state["data"] = frame
+    at.run()
+    assert not at.exception
+    assert "https://www.roblox.com/games/4924922222/" in _table_html(at)
+
+
+def test_genre_x_click_degrades_gracefully_not_grey_screen(monkeypatch):
+    """Removing a picked genre whose options vanished with a data reload
+    (demo↔live swap, new sync) must NOT grey out the whole app: Streamlit
+    raises StreamlitAPIException for the stale label, which used to abort
+    the script run. The stale genre is dropped before the widget renders
+    and the dashboard comes back with the visits/CCU targets intact."""
+    frame = _demo_frame()
+    at = _fresh_app()
+    at.run()
+    at.session_state["onboarding_complete"] = True
+    at.session_state["pending_initial_scan"] = False
+    at.session_state["welcome_scan_started"] = True
+    at.session_state["data"] = frame
+    at.session_state["source"] = "demo"
+    at.session_state["genre_multiselect"] = ["Party"]  # not in demo genres
+    at.run()
+
+    assert not at.exception, "a stale genre must never crash the dashboard"
+    assert "Blox Fruits" in _table_html(at)
+
+    # The same protection covers a genre the frame genuinely had before a
+    # reload replaced it: the stale label is discarded, targets stay applied.
+    reloaded = frame.copy()
+    reloaded["genre"] = "Shooter"
+    at.session_state["genre_multiselect"] = ["RPG"]  # vanished in the reload
+    at.session_state["data"] = reloaded
+    at.run()
+    assert not at.exception, "a vanished genre must never crash the dashboard"
+    assert "Blox Fruits" in _table_html(at)
+
+
 def test_results_table_has_copy_message_column():
     at = _render_dashboard()
     assert not at.exception

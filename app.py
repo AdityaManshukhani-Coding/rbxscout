@@ -2,7 +2,7 @@
 RbxScout - Automated Roblox Scouting & Contact Identification Dashboard.
 
 Run: streamlit run app.py
-Deploy marker: 5 outreach starters + rotating copy + 100 access keys (fdfe96d).
+Deploy marker: table reorder + No-Discord label + literal search + genre-✕ fix (2026-09-23).
 """
 
 from __future__ import annotations
@@ -1217,8 +1217,24 @@ else:
     search = st.sidebar.text_input("🔎 Search game or creator", placeholder="e.g. blox, tycoon...")
 
     # Genre is a metric filter, so it is applied before contact requests.
-    genres = sorted(g for g in df["genre"].dropna().unique() if g and g != "Unknown")
-    selected_genres = st.sidebar.multiselect("Genre", options=genres)
+    genres = sorted(
+        str(g) for g in df["genre"].dropna().unique() if g and str(g) != "Unknown"
+    )
+    # The genre multiselect carries an explicit key so its selections can be
+    # sanitized BEFORE the widget renders. Streamlit raises
+    # StreamlitAPIException the instant a multiselect's session value names
+    # an option missing from the current options list — which happens when
+    # the picked genre no longer exists in the freshly loaded data (sync
+    # with different targets, demo/live data swap). That exception aborts
+    # the whole script and the page goes grey and unclickable. Dropping
+    # stale labels first makes the ✕ click (and any stale selection) fall
+    # back to the remaining valid genres with the visits/CCU targets
+    # untouched.
+    GENRE_KEY = "genre_multiselect"
+    picked_genres = st.session_state.get(GENRE_KEY) or []
+    if picked_genres and not set(picked_genres).issubset(set(genres)):
+        st.session_state[GENRE_KEY] = [g for g in picked_genres if g in set(genres)]
+    selected_genres = st.sidebar.multiselect("Genre", options=genres, key=GENRE_KEY)
 
 # Apply only metric-known filters when deciding which contact page to fetch.
 metric_filtered = apply_filters(
@@ -1343,7 +1359,7 @@ def game_url(row: pd.Series) -> str:
     title = truncate(str(row.get("title") or "game").strip(), 26)
     # Schema allows NULL/NaN root_place_id (demo/pipeline inserts create rows
     # independently): int() on one must never take down the whole results
-    # table for the session — fall back to a keyword search link instead.
+    # table for the session — fall back to a keyword-search link instead.
     if place is not None and pd.notna(place):
         try:
             place_int = int(place)
@@ -1351,7 +1367,13 @@ def game_url(row: pd.Series) -> str:
             place_int = 0
         if place_int > 0:
             return f"https://www.roblox.com/games/{place_int}/{title}"
-    return f"https://www.roblox.com/search?keyword={quote(str(row.get('title') or ''))}"
+    # Keyword fallback goes to /discover — roblox.com/search?keyword= is a
+    # DEAD route that 404s for every keyword (verified live 2026-09-23; it
+    # 404s even for plain names, so emoji titles were never the problem).
+    # /discover/?Keyword= is the canonical search route that roblox.com's
+    # own nav uses. quote() encodes every character, so emoji titles arrive
+    # intact; games renamed since ingestion still resolve by name.
+    return f"https://www.roblox.com/discover/?Keyword={quote(str(row.get('title') or ''))}"
 
 
 
@@ -1457,10 +1479,14 @@ def game_cell_html(row: pd.Series) -> str:
 
 
 def discord_cell_html(url) -> str:
-    """One cell: Discord logo + clickable invite, or an em dash."""
+    """One cell: Discord logo + clickable invite, or "No Discord Server".
+
+    A bare dash read like a cell still loading, so a real label replaces it
+    (user request): games without a resolved invite say so in plain text.
+    """
     url_text = _text(url)
     if not url_text:
-        return '<span class="ss-none">—</span>'
+        return '<span class="ss-none">No Discord Server</span>'
     link = _esc(url_text)
     label = _esc(truncate(url_text, 44))
     return (
@@ -1652,15 +1678,15 @@ def render_table(frame: pd.DataFrame) -> None:
     could never display inline. HTML keeps the merged thumbnail+name and
     logo+invite cells working in every Streamlit version.
 
-    Column order mirrors atlasdev.gg's analyze table: identity → trend
-    (CCU, averages, momentum) → quality (rating) → age (created) → action
-    (Discord, Message). Favorites and Peak CCU were dropped at request —
-    lifetime favorites correlate with visits, and current CCU dominates
-    peak CCU for scouting decisions.
+    Column order (user request 2026-09-23): identity → volume (visits,
+    CCU) → action (Discord, Message) → trend (averages, momentum, rating).
+    Favorites and Peak CCU were dropped at request — lifetime favorites
+    correlate with visits, and current CCU dominates peak CCU for scouting
+    decisions.
     """
     head = [
-        "Game", "Genre", "Total visits", "CCU", "Avg CCU (1d)", "Avg CCU (3d)",
-        "Momentum (1d)", "Rating", "Discord", "Message",
+        "Game", "Genre", "Total visits", "CCU", "Discord", "Message",
+        "Avg CCU (1d)", "Avg CCU (3d)", "Momentum (1d)", "Rating",
     ]
     rows = []
     for _, row in frame.iterrows():
@@ -1670,12 +1696,12 @@ def render_table(frame: pd.DataFrame) -> None:
             f"<td><span class='ss-genre'>{_esc(_text(row.get('genre'), 'Unknown'))}</span></td>"
             f"<td class='ss-num'>{_num_cell(row.get('visits'))}</td>"
             f"<td class='ss-num'>{_ccu_cell(row.get('ccu'))}</td>"
+            f"<td>{discord_cell_html(row.get('discord_url'))}</td>"
+            f"<td>{copy_cell_html(row)}</td>"
             f"<td class='ss-num'>{_ccu_cell(row.get('avg_ccu_1d'))}</td>"
             f"<td class='ss-num'>{_ccu_cell(row.get('avg_ccu_3d'))}</td>"
             f"<td class='ss-num'>{_momentum_cell(row.get('momentum_1d'))}</td>"
             f"<td class='ss-num'>{_rating_cell(row)}</td>"
-            f"<td>{discord_cell_html(row.get('discord_url'))}</td>"
-            f"<td>{copy_cell_html(row)}</td>"
             "</tr>"
         )
     # st.html with unsafe_allow_javascript=True is required for the copy

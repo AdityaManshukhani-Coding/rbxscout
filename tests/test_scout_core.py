@@ -144,6 +144,30 @@ def test_filter_social_and_genre_and_search():
     assert apply_filters(df, search="zzz").empty
 
 
+def test_search_tolerates_regex_metacharacters():
+    """Search must match LITERALLY, never as a regular expression.
+
+    Roblox is full of titles like "+1 Every Second", "[🔴] …" and "100% ".
+    With pandas' Arrow-backed string columns an unescaped "+" compiled the
+    needle as a regex and the dashboard died with ArrowInvalid: Invalid
+    regular expression: no argument for repetition operator: +.
+    """
+    df = pd.DataFrame([
+        {"title": "+1 Every Second", "creator_name": "Speed", "genre": "Simulation"},
+        {"title": "[🔴] Closest Cut Wins!", "creator_name": "Blade", "genre": "Party"},
+        {"title": "100% Obby", "creator_name": "Parkour", "genre": "Obby"},
+    ])
+    # Every pattern below crashed the app before the regex=False fix.
+    assert set(apply_filters(df, search="+")["title"]) == {"+1 Every Second"}
+    assert set(apply_filters(df, search="+1")["title"]) == {"+1 Every Second"}
+    assert set(apply_filters(df, search="[🔴]")["title"]) == {"[🔴] Closest Cut Wins!"}
+    assert set(apply_filters(df, search="100%")["title"]) == {"100% Obby"}
+    assert set(apply_filters(df, search="cut wins")["title"]) == {"[🔴] Closest Cut Wins!"}
+    assert apply_filters(df, search="(").empty
+    assert apply_filters(df, search="*").empty
+    assert apply_filters(df, search="?").empty
+
+
 # --------------------------------------------------------------------------- #
 # SQLite persistence: peak CCU via MAX()
 # --------------------------------------------------------------------------- #
@@ -166,6 +190,48 @@ def test_upsert_grows_peak_ccu(tmp_path):
     with sqlite3.connect(scout.db_path) as conn:
         count = conn.execute("SELECT COUNT(*) FROM ccu_history WHERE universe_id=1").fetchone()[0]
     assert count == 3
+
+
+def test_upsert_metrics_only_updates_numbers_without_touching_identity(tmp_path):
+    """The metrics catch-up must fill ccu/visits (+ a history snapshot) but
+    never rewrite title/contacts or restamp the tier schedule."""
+    scout = RobloxPlatformScout(db_path=str(tmp_path / "m.db"))
+    scout.upsert_game({
+        "universe_id": 7, "title": "Original Name", "ccu": 10, "visits": 100,
+        "found_via": "atlas_dev",
+    })
+    with sqlite3.connect(scout.db_path) as conn:
+        before_updated = conn.execute(
+            "SELECT last_updated FROM game_analytics WHERE universe_id=7"
+        ).fetchone()[0]
+
+    updated = scout.upsert_metrics_only({
+        7: {"universe_id": 7, "title": "Renamed On Roblox", "ccu": 42, "visits": 5000,
+            "favorites": 900, "description": "should not land"},
+    })
+    assert updated == 1
+    row = scout.load_table().set_index("universe_id").loc[7]
+    assert int(row["ccu"]) == 42
+    assert int(row["visits"]) == 5000
+    assert int(row["favorites"]) == 900
+    assert row["title"] == "Original Name"
+    assert pd.isna(row["description"]) or row["description"] in (None, "")
+    assert row["found_via"] == "atlas_dev"
+    with sqlite3.connect(scout.db_path) as conn:
+        after_updated = conn.execute(
+            "SELECT last_updated FROM game_analytics WHERE universe_id=7"
+        ).fetchone()[0]
+        hist = conn.execute(
+            "SELECT COUNT(*) FROM ccu_history WHERE universe_id=7"
+        ).fetchone()[0]
+    assert hist == 2  # the original upsert + the metrics-only snapshot
+    assert after_updated == before_updated  # tier-due schedule untouched
+
+    # Rows missing from the catalog are skipped, never inserted.
+    assert scout.upsert_metrics_only({99999: {"universe_id": 99999, "ccu": 5}}) == 0
+    # Empty/None payloads are no-ops.
+    assert scout.upsert_metrics_only({}) == 0
+    assert scout.upsert_metrics_only({7: {"universe_id": 7}}) == 0
 
 
 # --------------------------------------------------------------------------- #

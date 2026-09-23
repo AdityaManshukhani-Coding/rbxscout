@@ -230,9 +230,10 @@ relay, but allows residential IPs — so **discovery runs here**, once a day:
 It is scheduled by a macOS LaunchAgent (`com.rbxscout.atlas-home-harvest.plist`
 in this folder, installed in `~/Library/LaunchAgents/`):
 
-- **Fires 19:00 local time daily** (17:00 UTC on a CEST machine) — evening in
-  the Netherlands, so the laptop is awake and open (a missed day = no new games
-  that day; the 23h throttle keeps a fixed slot from ever skipping). Seeds are
+- **Fires 20:00 local time daily** (moved from 19:00 on 2026-09-23 — the
+  19:00 run kept dying on DNS failures at that hour), so the laptop is awake
+  and open (a missed day = no new games that day; the 23h throttle keeps a
+  fixed slot from ever skipping). Seeds are
   drained by the Actions expander on its next `:15`/`:45` tick, at most 30
   minutes later.
 - Laptop asleep at 06:15? launchd runs it at wake. Lid closed all day = no run
@@ -246,6 +247,18 @@ in this folder, installed in `~/Library/LaunchAgents/`):
   laptop fetches icons + like/dislike votes for up to 200 icon-less catalog
   rows (oldest first, 24h-throttled). This is what keeps every game's
   thumbnail and Rating column filled without spending any Actions traffic.
+- **Metrics catch-up** (`catchup_metrics.py`, run manually from home when the
+  trend columns go stale): fills Avg CCU (1d/3d) + Momentum by writing fresh
+  ccu_history samples for every game meeting the 20k/25 target, and fills
+  Rating by fetching the missing up/down vote totals. Uses the same cookieless
+  games.roblox.com endpoints as the hydrator; metric-only upserts never bump
+  `last_updated`, so tier-due hydration schedules stay untouched. Pulls before
+  and pushes after (with atlas_home's merge-retry), so the hosted dashboard
+  picks the data up.
+  ```bash
+  .venv/bin/python catchup_metrics.py            # full qualified catalog
+  .venv/bin/python catchup_metrics.py --limit 2500 --no-push
+  ```
 - Merges are union-by-primary-key and push uses a merge-retry, so the laptop
   can never clobber games Actions discovered meanwhile (db_sync's stale-push
   guard is the backstop).

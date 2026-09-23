@@ -1685,6 +1685,63 @@ class RobloxPlatformScout:
             "sync_number": n,
         }
 
+    def upsert_metrics_only(self, metrics: Dict[int, Dict[str, Any]]) -> int:
+        """Merge ONLY live metrics (ccu/visits + a ccu_history snapshot) into
+        existing rows, never touching identity or contact columns.
+
+        Built for the metrics catch-up: ``fetch_game_metrics`` returns rows
+        with identity fields (title/creator/description) that may be fresher
+        or emptier than what the catalog already holds, and ``upsert_game``
+        would also bump ``last_updated`` — which would push every touched
+        game's tier-due hydration out for weeks. The targeted UPDATE keeps
+        the row's schedule intact.
+
+        Returns the number of rows updated. Rows missing from the catalog are
+        skipped (insertion stays the queue drain's job). Never raises.
+        """
+        if not metrics:
+            return 0
+        updated = 0
+        try:
+            with self._connect() as conn:
+                for uid, record in metrics.items():
+                    try:
+                        ccu = record.get("ccu")
+                        visits = record.get("visits")
+                        favorites = record.get("favorites")
+                        if ccu is None and visits is None and favorites is None:
+                            continue
+                        cursor = conn.execute(
+                            "UPDATE game_analytics SET "
+                            "ccu       = COALESCE(?, game_analytics.ccu), "
+                            "visits    = COALESCE(?, game_analytics.visits), "
+                            "favorites = COALESCE(?, game_analytics.favorites) "
+                            "WHERE universe_id = ?",
+                            (
+                                int(ccu) if ccu is not None else None,
+                                int(visits) if visits is not None else None,
+                                int(favorites) if favorites is not None else None,
+                                int(uid),
+                            ),
+                        )
+                        updated += cursor.rowcount if cursor.rowcount > 0 else 0
+                        if ccu is not None:
+                            conn.execute(
+                                "INSERT OR IGNORE INTO ccu_history (universe_id, ts, ccu) "
+                                "VALUES (?, ?, ?)",
+                                (
+                                    int(uid),
+                                    datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
+                                    int(ccu),
+                                ),
+                            )
+                    except (TypeError, ValueError, sqlite3.Error) as exc:
+                        log.debug("metrics-only upsert skipped %s: %s", uid, exc)
+        except sqlite3.Error as exc:
+            log.warning("metrics-only upsert failed: %s", exc)
+            return 0
+        return updated
+
     def fetch_game_metrics(self, universe_ids: List[int]) -> Dict[int, Dict[str, Any]]:
         """Threaded batched metrics (50 universes per call — verified cap: 50→200, 100→400).
 
@@ -3143,12 +3200,17 @@ def apply_filters(
     out = df
     if search:
         needle = search.strip().lower()
+        # regex=False: the needle must be matched LITERALLY. Roblox games are
+        # full of regex metacharacters ("+1 Every Second", "[🔴] …", "100%"
+        # …) and pandas' Arrow-backed strings compile the pattern via
+        # pyarrow, so an unescaped "+" blew up the whole dashboard with
+        # ArrowInvalid: Invalid regular expression.
         out = out[
-            out["title"].str.lower().str.contains(needle, na=False)
+            out["title"].str.lower().str.contains(needle, na=False, regex=False)
             | out.get("creator_name", pd.Series("", index=out.index))
             .astype(str)
             .str.lower()
-            .str.contains(needle, na=False)
+            .str.contains(needle, na=False, regex=False)
         ]
     if min_visits:
         out = out[out["visits"] >= min_visits]
