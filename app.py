@@ -986,81 +986,6 @@ st.sidebar.caption("Roblox game scouting and Discord contact finder")
 # Workspace switch: the New and Upcoming view reuses the exact same paging,
 # Discord-check and table pipeline as the main view — only the data source
 # (blow-up watchlist) and the absence of filters differ.
-def render_live_counter() -> None:
-    """The live catalog counter — the app's subscriber-count moment.
-
-    A big tabular-numeral number that grows as the 24/7 pipeline discovers
-    games, read from the cached catalog copy only (no network, no per-user
-    cost, never triggers a download). Rendered compactly in the sidebar on
-    the main view.
-    """
-    _tracker = (
-        catalog_fetch.catalog_counts_cached(DB_PATH)
-        if not _CATALOG_UNAVAILABLE
-        else {"games": None, "target": None, "found_today": None, "last_sync": None}
-    )
-    if _tracker["games"] is None:
-        st.info("Catalog counters unavailable — the catalog did not load this session.")
-        return
-    _target, _found, _last = (
-        _tracker.get("target"),
-        _tracker.get("found_today") or 0,
-        _tracker.get("last_sync"),
-    )
-    _games_fmt = f"{_tracker['games']:,}"
-    _badges = []
-    if _target is not None:
-        _badges.append(f"🎯 {_target:,} meet the 20k visits / 25 CCU target")
-    if _found:
-        _badges.append(f"✨ +{_found:,} discovered today (UTC)")
-    if _last:
-        _badges.append(f"🕒 last pipeline sync {_last} UTC")
-    if _USING_STALE_CATALOG:
-        _badges.append("⚠️ showing the last cached catalog — refresh failed")
-    _badges_html = (
-        '<div class="ss-tracker-badges">' + " · ".join(_badges) + "</div>"
-        if _badges else ""
-    )
-    _digits = "".join(
-        f'<span class="ss-digit" style="animation-delay:{i * 45}ms">{ch}</span>'
-        for i, ch in enumerate(_games_fmt)
-    )
-    st.markdown(
-        """
-<style>
-.ss-tracker {
-  display: inline-block; padding: 12px 20px; margin-bottom: 6px;
-  border: 1px solid rgba(128,128,128,0.35); border-radius: 12px;
-  background: linear-gradient(180deg, rgba(88,101,242,0.10), rgba(88,101,242,0.03));
-}
-.ss-tracker-num {
-  font-size: 2.2rem; font-weight: 800; line-height: 1.1; letter-spacing: 0.5px;
-  font-variant-numeric: tabular-nums; color: #e6edf3;
-}
-.ss-digit {
-  display: inline-block;
-  animation: ss-pop 600ms cubic-bezier(0.2, 0.9, 0.25, 1.2) backwards;
-}
-@keyframes ss-pop {
-  from { opacity: 0; transform: translateY(0.45em) scale(0.92); }
-  to   { opacity: 1; transform: none; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .ss-digit { animation: none; }
-}
-.ss-tracker-sub { font-size: 0.88rem; color: rgba(230,237,243,0.65); margin-top: 2px; }
-.ss-tracker-badges { font-size: 0.8rem; color: rgba(230,237,243,0.8); margin-top: 8px; }
-</style>
-"""
-        + f'<div class="ss-tracker">'
-        + f'<div class="ss-tracker-num">{_digits}</div>'
-        + '<div class="ss-tracker-sub">games in the catalog &amp; growing</div>'
-        + _badges_html
-        + "</div>",
-        unsafe_allow_html=True,
-    )
-
-
 view = st.sidebar.radio(
     "Workspace",
     options=["🎮 Main scout", "🚀 New and Upcoming"],
@@ -1772,13 +1697,6 @@ def render_table(frame: pd.DataFrame) -> None:
 
 st.title("🚀 New and Upcoming" if is_watch_view else "Games matching your target")
 
-# Compact header by request: title only above the table. The live catalog
-# numbers live in the sidebar on the main view (one glance away, zero
-# header clutter); the watch view stays counter-free by design.
-if not is_watch_view:
-    with st.sidebar:
-        render_live_counter()
-
 if source == "demo":
     st.warning("Live sources were unavailable, so demo data is shown. Run Sync live data to retry.")
 
@@ -1814,7 +1732,7 @@ with nav_left:
         width="stretch",
     )
 with nav_center:
-    st.caption(f"Page {int(page)} of {page_count} · {len(metric_filtered):,} matching games")
+    st.caption(f"Page {int(page)} of {page_count}")
 with nav_right:
     st.button(
         "Next page →",

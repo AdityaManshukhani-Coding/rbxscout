@@ -1,8 +1,7 @@
-"""Tests for the compact live-counter band in the main-view sidebar.
+"""Tests for the removed live-counter band.
 
-The dedicated 📡 Live catalog workspace section was removed (the band in the
-sidebar is the only remaining surface), so these tests now pin that band's
-presence on the main view and its absence on the watch view.
+The sidebar catalog counter (and the older 📡 Live catalog workspace before
+it) was removed; these tests pin its absence on every workspace view.
 """
 
 import re
@@ -16,19 +15,18 @@ from test_app_flow import APP_PATH
 
 
 def _visible_text(at) -> str:
-    """All markdown-rendered text, tags stripped (the counter splits digits
-    into per-digit spans, so the raw HTML never contains '21,303')."""
+    """All markdown-rendered text, tags stripped (a leftover counter would
+    split digits into per-digit spans, so the raw HTML never contains
+    '21,303')."""
     html = " ".join(m.value for m in at.markdown)
     return re.sub(r"<[^>]+>", "", html)
 
 
 @pytest.fixture()
 def counts(monkeypatch):
-    """Deterministic catalog counters, recorded on every call."""
-    calls = []
-
+    """Deterministic catalog counters — the app must not need the DB either
+    way now that the counter is gone."""
     def fake_counts(db_path):
-        calls.append(db_path)
         return {
             "games": 21303,
             "target": 4321,
@@ -37,10 +35,9 @@ def counts(monkeypatch):
         }
 
     monkeypatch.setattr(catalog_fetch, "catalog_counts", fake_counts)
-    # Bypass the new process-wide 60 s counter cache (an earlier test in the
+    # Bypass the process-wide 60 s counter cache (an earlier test in the
     # run may have warmed it with real DB values).
     monkeypatch.setattr(catalog_fetch, "catalog_counts_cached", catalog_fetch.catalog_counts)
-    return calls
 
 
 def _app_with_view(view: str) -> AppTest:
@@ -63,38 +60,20 @@ def test_workspace_radio_has_no_live_catalog_entry(counts):
     assert set(radio.options) == {"🎮 Main scout", "🚀 New and Upcoming"}
 
 
-def test_counter_band_on_main_view(counts):
-    """The compact band lives in the sidebar of the main view only."""
+def test_no_counter_on_main_view(counts):
+    """The sidebar catalog counter was removed; the main view renders no
+    tracker band even though the catalog copy is available."""
     at = _app_with_view("🎮 Main scout")
     assert not at.exception
     html = " ".join(m.value for m in at.markdown)
-    assert "21,303" in _visible_text(at), "compact band still shows the total"
-    assert "games in the catalog" in _visible_text(at)
-    assert 'class="ss-tracker"' in html, "compact band is present"
-    # The full-size centered variant was part of the removed Live section.
-    assert "ss-tracker-full" not in html
+    assert "21,303" not in _visible_text(at), "counter must stay removed"
+    assert 'class="ss-tracker"' not in html, "counter must stay removed"
     assert "Games matching your target" in " ".join(t.value for t in at.title)
 
 
-def test_upcoming_view_has_no_counter(counts):
+def test_no_counter_on_watch_view(counts):
     at = _app_with_view("🚀 New and Upcoming")
     assert not at.exception
     html = " ".join(m.value for m in at.markdown)
     assert 'class="ss-tracker"' not in html, "watch view stays counter-free"
     assert "21,303" not in _visible_text(at), "watch view stays counter-free"
-
-
-def test_counter_counts_calls_stay_local(counts):
-    """The counter reads the cached catalog copy — cheap enough to re-render."""
-    import scout_core
-
-    def _boom(self, *args, **kwargs):
-        raise AssertionError("live view must never trigger a network scan")
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(scout_core.RobloxPlatformScout, "scan", _boom)
-        mp.setattr(scout_core.RobloxPlatformScout, "scan_contacts", _boom)
-        at = _app_with_view("🎮 Main scout")
-    assert not at.exception
-    assert counts, "counter read the catalog copy at least once"
-    assert all(str(c).endswith(".db") for c in counts), "reads only the local catalog file"
