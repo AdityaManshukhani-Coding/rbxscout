@@ -22,8 +22,19 @@ name: Hydrator (5 min)
 
 on:
 # Automatic dispatching is owned by the Cloudflare Worker in
-# cloudflare-worker/wrangler.toml. Keep only workflow_dispatch here.
+# cloudflare-worker/wrangler.toml. The hourly GitHub schedule is a BACKSTOP,
+# not redundancy for its own sake: on 2026-09-21 the worker was redeployed
+# without its cron triggers and the whole 24/7 pipeline silently stalled for
+# 3 days — every run was green precisely because none were being started.
+# A schedule lives in the workflow file itself and survives worker redeploys,
+# so a lost Cloudflare cron now degrades freshness to ~1 h instead of
+# "forever". The rbxscout-sync concurrency group serializes backstop runs
+# with the 5-min dispatches (extra queued events just no-op through). Note:
+# GitHub's schedule trigger is best-effort (~5-30 min jitter) — fine here,
+# Cloudflare stays the precision clock.
   workflow_dispatch:
+  schedule:
+    - cron: "0 * * * *"   # hourly safety net
 
 permissions:
   contents: write   # create/update the catalog-latest release assets

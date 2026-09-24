@@ -2,6 +2,7 @@ import re
 import sqlite3
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -190,6 +191,66 @@ def test_upsert_grows_peak_ccu(tmp_path):
     with sqlite3.connect(scout.db_path) as conn:
         count = conn.execute("SELECT COUNT(*) FROM ccu_history WHERE universe_id=1").fetchone()[0]
     assert count == 3
+
+
+def test_load_catalog_matches_attaches_trend_columns(tmp_path):
+    """The dashboard's ONLY catalog read is load_catalog_matches — the trend
+    columns (Avg CCU 1d/3d, Momentum) must ride along or every result page
+    renders "-". Regression: hosted dashboard showed all trend cells as
+    "-"/"Unknown" because only load_table computed the trends.
+    """
+    scout = RobloxPlatformScout(db_path=str(tmp_path / "trend.db"))
+    scout.upsert_game({"universe_id": 1, "title": "Trendy", "ccu": 100, "visits": 50000})
+    scout.upsert_game({"universe_id": 1, "title": "Trendy", "ccu": 140, "visits": 50000})
+    scout.upsert_game({"universe_id": 2, "title": "One Sample", "ccu": 50, "visits": 40000})
+    # Momentum needs a reference snapshot older than 18 h (by design a game
+    # seen only in the last hour has no measurable daily climb).
+    old_ts = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S.%f")
+    with sqlite3.connect(scout.db_path) as conn:
+        conn.execute("INSERT INTO ccu_history (universe_id, ts, ccu) VALUES (1, ?, 100)", (old_ts,))
+
+    df = scout.load_catalog_matches()
+    row1 = df[df["universe_id"] == 1].iloc[0]
+    row2 = df[df["universe_id"] == 2].iloc[0]
+    # Two snapshots inside 24 h -> a real 1d average, and momentum vs the
+    # 18h+ old reference.
+    assert pd.notna(row1["avg_ccu_1d"]) and float(row1["avg_ccu_1d"]) == 120.0
+    assert pd.notna(row1["avg_ccu_3d"])
+    assert pd.notna(row1["momentum_1d"]) and float(row1["momentum_1d"]) == 40.0
+    # One snapshot only -> averages/momentum stay None ("-" in the UI),
+    # never a fake one-sample "trend".
+    assert pd.isna(row2["avg_ccu_1d"])
+    assert pd.isna(row2["momentum_1d"])
+
+
+def test_load_catalog_matches_trends_survive_large_id_sets(tmp_path):
+    """The trend query chunks IN-lists (SQLite host-parameter ceiling): a
+    full-catalog read (~12k+ qualified games) must not hit it."""
+    scout = RobloxPlatformScout(db_path=str(tmp_path / "chunk.db"))
+    for uid in range(1, 31):
+        scout.upsert_game({"universe_id": uid, "title": f"G{uid}", "ccu": 30 + uid, "visits": 40000 + uid})
+        scout.upsert_game({"universe_id": uid, "title": f"G{uid}", "ccu": 60 + uid, "visits": 40000 + uid})
+    df = scout.load_catalog_matches()
+    assert len(df) == 30
+    # Every game has 2 samples -> every game gets a non-null 3d average.
+    assert df["avg_ccu_3d"].notna().all()
+    assert df["avg_ccu_1d"].notna().all()
+
+
+def test_load_blowup_watch_attaches_trend_columns(tmp_path):
+    """The watchlist view renders the same trend columns as the main table."""
+    scout = RobloxPlatformScout(db_path=str(tmp_path / "watch.db"))
+    scout.upsert_game({"universe_id": 3, "title": "Blower", "ccu": 100, "visits": 90000})
+    scout.upsert_game({"universe_id": 3, "title": "Blower", "ccu": 300, "visits": 90000})
+    old_ts = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d %H:%M:%S.%f")
+    with sqlite3.connect(scout.db_path) as conn:
+        conn.execute("INSERT INTO ccu_history (universe_id, ts, ccu) VALUES (3, ?, 100)", (old_ts,))
+        conn.execute("UPDATE game_analytics SET blowup_flag=1 WHERE universe_id=3")
+    df = scout.load_blowup_watch()
+    assert not df.empty
+    row = df[df["universe_id"] == 3].iloc[0]
+    assert pd.notna(row["avg_ccu_1d"])
+    assert pd.notna(row["momentum_1d"])
 
 
 def test_upsert_metrics_only_updates_numbers_without_touching_identity(tmp_path):

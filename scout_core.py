@@ -1197,13 +1197,15 @@ class RobloxPlatformScout:
         """The New and Upcoming watchlist: games flagged for tier/CCU blowups."""
         try:
             with self._connect() as conn:
-                return pd.read_sql_query(
+                out = pd.read_sql_query(
                     "SELECT * FROM game_analytics WHERE COALESCE(blowup_flag, 0) = 1 "
                     "ORDER BY COALESCE(blowup_at, last_updated) DESC",
                     conn,
                 )
         except (pd.errors.DatabaseError, sqlite3.Error):
             return pd.DataFrame()
+        # The watchlist renders the same trend columns as the main table.
+        return self._attach_trend_columns(out)
 
 
     def load_catalog_matches(
@@ -1251,7 +1253,7 @@ class RobloxPlatformScout:
             )
         try:
             with self._connect() as conn:
-                return pd.read_sql_query(
+                out = pd.read_sql_query(
                     "SELECT * FROM game_analytics "
                     f"WHERE {' AND '.join(where)} "
                     "ORDER BY COALESCE(visits, 0) ASC, COALESCE(ccu, 0) ASC, "
@@ -1263,6 +1265,120 @@ class RobloxPlatformScout:
         except (pd.errors.DatabaseError, sqlite3.Error) as exc:
             log.warning("load_catalog_matches failed: %s", exc)
             return pd.DataFrame()
+        # The dashboard reads ONLY this method for its main table — the trend
+        # columns (Avg CCU 1d/3d, Momentum) must be attached here, not just
+        # in load_table, or every result page renders "-" forever.
+        return self._attach_trend_columns(out)
+
+    def _ccu_trend_stats(self, universe_ids: Iterable[int]) -> Dict[int, Dict[str, Optional[float]]]:
+        """Per-game trend stats over ccu_history: {uid: {avg_ccu_1d, avg_ccu_3d, ccu_ref}}.
+
+        Single source of truth for the dashboard's Avg CCU (1d) / (3d) and
+        Momentum columns — every catalog-reading loader attaches these via
+        _attach_trend_columns. Windows mirror load_table's original rules:
+        an average needs ≥2 snapshots inside its window (a one-sample average
+        is not a trend), and the momentum reference is the last snapshot
+        older than 18 h so a climb over the day is measurable.
+        """
+        ids: List[int] = []
+        for u in universe_ids:
+            try:
+                if u is not None and pd.notna(u):
+                    ids.append(int(u))
+            except (TypeError, ValueError):
+                continue
+        stats: Dict[int, Dict[str, Optional[float]]] = {}
+        if not ids:
+            return stats
+        now = pd.Timestamp.now("UTC").tz_localize(None)
+        cutoff_1d = (now - pd.Timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff_3d = (now - pd.Timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
+        cutoff_ref = (now - pd.Timedelta(hours=18)).strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with self._connect() as conn:
+                # Aggregate INSIDE SQLite — pulling every history row into
+                # pandas (10k games x dozens of samples) made each catalog
+                # read seconds slower; these grouped queries return one row
+                # per game. ts is TEXT 'YYYY-MM-DD HH:MM:SS[.ffffff]', so
+                # lexicographic comparisons against the same format are exact.
+                avg_rows: List[Dict[str, object]] = []
+                ref_rows: List[Dict[str, object]] = []
+                # Chunked IN-lists: the qualified set can pass >10k IDs and
+                # SQLite's host-parameter ceiling is finite (the codebase
+                # already chunks at 900 elsewhere for the same reason).
+                for i in range(0, len(ids), 900):
+                    chunk = ids[i : i + 900]
+                    placeholders = ",".join("?" for _ in chunk)
+                    avg_rows.extend(
+                        conn.execute(
+                            f"SELECT universe_id,"
+                            f" AVG(CASE WHEN ts >= ? THEN ccu END) AS avg_1d,"
+                            f" COUNT(CASE WHEN ts >= ? THEN 1 END) AS n_1d,"
+                            f" AVG(CASE WHEN ts >= ? THEN ccu END) AS avg_3d,"
+                            f" COUNT(CASE WHEN ts >= ? THEN 1 END) AS n_3d "
+                            f"FROM ccu_history WHERE universe_id IN ({placeholders}) "
+                            f"GROUP BY universe_id",
+                            (cutoff_1d, cutoff_1d, cutoff_3d, cutoff_3d, *chunk),
+                        ).fetchall()
+                    )
+                    # Bare 'ccu' with MAX(ts) GROUP BY: SQLite guarantees the
+                    # bare column comes from the max row — exactly the "last
+                    # snapshot before the 18 h cutoff" momentum reference.
+                    ref_rows.extend(
+                        conn.execute(
+                            f"SELECT universe_id, ccu FROM ccu_history "
+                            f"WHERE ts < ? AND universe_id IN ({placeholders}) "
+                            f"GROUP BY universe_id HAVING MAX(ts)",
+                            (cutoff_ref, *chunk),
+                        ).fetchall()
+                    )
+        except (pd.errors.DatabaseError, sqlite3.Error):
+            return stats
+        refs = {int(r[0]): r[1] for r in ref_rows}
+        for uid, avg_1d, n_1d, avg_3d, n_3d in avg_rows:
+            stats[int(uid)] = {
+                # An average needs >=2 snapshots in its window (a one-sample
+                # average is not a trend) — same rule the pandas version used.
+                "avg_ccu_1d": float(avg_1d) if (n_1d or 0) >= 2 else None,
+                "avg_ccu_3d": float(avg_3d) if (n_3d or 0) >= 2 else None,
+                "ccu_ref": float(refs[uid]) if uid in refs else None,
+            }
+        return stats
+
+    def _attach_trend_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add avg_ccu_1d / avg_ccu_3d / momentum_1d to a game frame (copy).
+
+        Games with fewer than two snapshots in a window keep None — the UI
+        renders "-". Never raises: a missing ccu_history table degrades to
+        all-None columns.
+        """
+        if df.empty or "universe_id" not in df.columns:
+            return df
+        out = df.copy()
+        stats = self._ccu_trend_stats(out["universe_id"].tolist())
+
+        def _trend_of(uid, key):
+            try:
+                if uid is None or pd.isna(uid):
+                    return None
+                return stats.get(int(uid), {}).get(key)
+            except (TypeError, ValueError):
+                return None
+
+        out["avg_ccu_1d"] = out["universe_id"].map(lambda u: _trend_of(u, "avg_ccu_1d"))
+        out["avg_ccu_3d"] = out["universe_id"].map(lambda u: _trend_of(u, "avg_ccu_3d"))
+        out["momentum_1d"] = out.apply(
+            lambda r: (
+                r["ccu"] - stats[int(r["universe_id"])]["ccu_ref"]
+                if pd.notna(r["universe_id"])
+                and int(r["universe_id"]) in stats
+                and stats[int(r["universe_id"])]["ccu_ref"] is not None
+                and pd.notna(r.get("ccu"))
+                else None
+            ),
+            axis=1,
+        )
+        return out
 
     def load_table(self, universe_ids: Optional[Iterable[int]] = None) -> pd.DataFrame:
         """Load tracked games, optionally restricted to a set of universe IDs."""
@@ -1278,63 +1394,11 @@ class RobloxPlatformScout:
                     query += f" WHERE universe_id IN ({placeholders})"
                     params = tuple(ids)
                 df = pd.read_sql_query(query, conn, params=params)
-                hist_query = "SELECT universe_id, ts, ccu FROM ccu_history"
-                hist_params: Tuple[int, ...] = ()
-                if universe_ids is not None:
-                    placeholders = ",".join("?" for _ in ids)
-                    hist_query += f" WHERE universe_id IN ({placeholders})"
-                    hist_params = tuple(ids)
-                hist = pd.read_sql_query(hist_query, conn, params=hist_params)
             except (pd.errors.DatabaseError, sqlite3.Error):
                 return pd.DataFrame()
         if df.empty:
             return df
-
-        df["ts"] = pd.to_datetime(df["last_updated"], errors="coerce")
-        if not hist.empty:
-            hist["ts"] = pd.to_datetime(hist["ts"], errors="coerce")
-            now = pd.Timestamp.now("UTC").tz_localize(None)
-            day_ago = now - pd.Timedelta(hours=24)
-
-            stats: Dict[int, Dict[str, float]] = {}
-            for uid, grp in hist.groupby("universe_id"):
-                grp = grp.sort_values("ts")
-                win = grp[grp["ts"] >= day_ago]
-                avg_1d = win["ccu"].mean() if len(win) >= 2 else None
-                win_3d = grp[grp["ts"] >= now - pd.Timedelta(days=3)]
-                # Mirrors the 1d rule: needs ≥2 snapshots in the window, so a
-                # game discovered within the last 3 days shows "-" instead of
-                # a one-sample average pretending to be a trend.
-                avg_3d = win_3d["ccu"].mean() if len(win_3d) >= 2 else None
-                ref = None
-                if len(grp) >= 2:
-                    base = grp[grp["ts"] < now - pd.Timedelta(hours=18)]
-                    ref = float(base.iloc[-1]["ccu"]) if not base.empty else None
-                stats[int(uid)] = {
-                    "avg_ccu_1d": avg_1d,
-                    "avg_ccu_3d": avg_3d,
-                    "ccu_ref": ref,
-                }
-            df["avg_ccu_1d"] = df["universe_id"].map(
-                lambda u: stats.get(int(u), {}).get("avg_ccu_1d")
-            )
-            df["avg_ccu_3d"] = df["universe_id"].map(
-                lambda u: stats.get(int(u), {}).get("avg_ccu_3d")
-            )
-            df["momentum_1d"] = df.apply(
-                lambda r: (
-                    r["ccu"] - stats[int(r["universe_id"])]["ccu_ref"]
-                    if int(r["universe_id"]) in stats
-                    and stats[int(r["universe_id"])]["ccu_ref"] is not None
-                    else None
-                ),
-                axis=1,
-            )
-        else:
-            df["avg_ccu_1d"] = None
-            df["avg_ccu_3d"] = None
-            df["momentum_1d"] = None
-        return df
+        return self._attach_trend_columns(df)
 
     # ------------------------------------------------------------------ #
     # Place resolution (contact/scan support)

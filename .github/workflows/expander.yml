@@ -28,8 +28,14 @@ name: Expander — Atlas Dev harvest + drain (30 min)
 
 on:
 # Automatic dispatching is owned by the Cloudflare Worker in
-# cloudflare-worker/wrangler.toml. Keep only workflow_dispatch here.
+# cloudflare-worker/wrangler.toml (:15/:45 every 30 min). The 3-hour GitHub
+# schedule is a backstop added after the 2026-09-21 worker redeploy dropped
+# the Cloudflare crons and silently stalled the whole pipeline for 3 days
+# (see hydrator.yml). Discovery tolerates a 3 h gap — the queue drains a
+# bounded slice each run anyway; freshness of stats is the hydrator's job.
   workflow_dispatch:
+  schedule:
+    - cron: "0 */3 * * *"   # safety net: every 3 hours
 
 permissions:
   contents: write   # create/update the catalog-latest release assets

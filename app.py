@@ -829,6 +829,51 @@ if _CATALOG_UNAVAILABLE:
     )
 
 
+def _warn_stale_catalog() -> None:
+    """Announce a stalled pipeline instead of serving silently old stats.
+
+    The 2026-09-21 scheduler outage went unnoticed for 3 days because every
+    workflow run was green — none were being started at all. A dashboard that
+    says "stats last refreshed X hours ago" makes any future stall visible
+    to the user immediately. Reads MAX(ccu_history.ts): every hydrator/expander
+    run writes fresh samples, so that timestamp is the true data heartbeat
+    (last_updated moves for other reasons, e.g. tier restamps). Never raises.
+    """
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+        try:
+            row = conn.execute("SELECT MAX(ts) FROM ccu_history").fetchone()
+        finally:
+            conn.close()
+        latest = row[0] if row else None
+        if not latest:
+            return
+        import pandas as pd
+
+        age_hours = (
+            pd.Timestamp.now("UTC").tz_localize(None) - pd.to_datetime(latest, errors="coerce")
+        ).total_seconds() / 3600.0
+        if pd.isna(age_hours):
+            return
+        if age_hours >= 6:
+            st.warning(
+                f"⏳ **Stats are {age_hours:.0f} hours old.** The 24/7 pipeline "
+                "that refreshes CCU/visits appears to be stalled — this is not "
+                "your filters. It self-heals on the next successful sync; if it "
+                "persists, the scheduler (Cloudflare Worker cron / GitHub "
+                "Actions) needs attention."
+            )
+        elif age_hours >= 1:
+            st.caption(f"Stats refreshed {age_hours:.0f} h ago.")
+    except Exception:
+        pass  # a staleness probe must never block the dashboard
+
+
+_warn_stale_catalog()
+
+
 # --------------------------------------------------------------------------- #
 # Session and scan helpers
 # --------------------------------------------------------------------------- #

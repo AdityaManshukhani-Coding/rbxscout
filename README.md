@@ -52,9 +52,18 @@ runs every five minutes in UTC:
   documented in [EXPANSION_PILOT.md](EXPANSION_PILOT.md) and
   [ATLAS_PLAN_REVIEW.md](ATLAS_PLAN_REVIEW.md).
 
-The GitHub workflow files intentionally contain **no `schedule:` triggers**.
-They retain `workflow_dispatch` for Cloudflare and manual runs only, so an
-old GitHub cron cannot wake up later and fight the Cloudflare scheduler.
+**GitHub-schedule backstops (added 2026-09-24):** the hydrator also runs on
+an hourly GitHub `schedule:` cron and the expander every 3 hours. These are
+NOT the primary clock — Cloudflare owns precision timing — but when the
+worker was redeployed on 2026-09-21 its Cron Triggers were silently dropped
+and the whole pipeline stalled for 3 days (every Actions run stayed green
+because none were being started). A `schedule:` lives in the workflow file
+and survives worker redeploys, so a lost Cloudflare cron now degrades
+freshness to ~1 h (hydrate) with discovery continuing every 3 h instead of
+stopping outright. The `rbxscout-sync` concurrency group serializes backstop
+runs with the 5-min dispatches; queued duplicates simply no-op through.
+The dashboard also shows a warning banner when the newest CCU sample is
+6+ hours old, so a stalled pipeline is visible to users immediately.
 
 Each run: **pull the catalog from the `catalog-latest` release** → work →
 tier-stamp → blow-up-flag → prune → **push the catalog back to the release**.
