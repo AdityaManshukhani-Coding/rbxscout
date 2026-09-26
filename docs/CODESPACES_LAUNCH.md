@@ -66,6 +66,28 @@ burn extra.**
 - **Monthly rhythm**: the 120 core-hours reset on the 1st; check remaining
   quota at <https://github.com/settings/billing>
 
+## Saving hours: short idle timeout + keepalive
+
+Two dials decide how much of the 60 hours you actually burn:
+
+1. **Default idle timeout → 60 minutes** (github.com/settings/codespaces).
+   With no editor activity the machine stops after 1 h instead of 4 —
+   a forgotten tab costs 1 hour, not 4.
+2. **Keepalive during events** (on your Mac):
+
+   ```bash
+   brew install gh && gh auth login      # one-time
+   bash scripts/codespace_keepalive.sh   # or: ... 6  (auto-stop after 6 h)
+   ```
+
+   It touches the codespace every 25 min (counts as editor activity), so the
+   machine stays up exactly while your event runs, then idles out on its own
+   when you Ctrl-C. Zero leaked hours.
+
+   Restarting a stopped codespace keeps the URL; just re-run
+   `scripts/codespaces_bootstrap.sh` (the Streamlit process doesn't survive
+   a stop) and hand users the same link again.
+
 ## When you outgrow it
 
 60 h/month free is a launch window. The ladder up, cheapest first:
