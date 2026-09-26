@@ -84,9 +84,27 @@ Two dials decide how much of the 60 hours you actually burn:
    machine stays up exactly while your event runs, then idles out on its own
    when you Ctrl-C. Zero leaked hours.
 
-   Restarting a stopped codespace keeps the URL; just re-run
-   `scripts/codespaces_bootstrap.sh` (the Streamlit process doesn't survive
-   a stop) and hand users the same link again.
+   Restarting a stopped codespace keeps the URL; one command from the Mac
+   wakes it and brings the dashboard back:
+
+   ```bash
+   bash scripts/codespace_resume.sh        # start machine + relaunch app
+   bash scripts/codespace_keepalive.sh 4   # keep alive for the event window
+   ```
+
+   Then share the SAME URL again — it never changed.
+
+## The corrected usage model (read this twice)
+
+- **Stopped = free.** The 60-hour meter only runs while the machine is up.
+  Hours do not tick away while it sleeps.
+- **Stopped ≠ auto-wake.** A user opening the URL of a stopped codespace
+  gets a connection error — visitors CANNOT wake it. Only you can, via
+  github.com/codespaces or `scripts/codespace_resume.sh`.
+- **Therefore:** treat it like a shop. You open (resume + keepalive) when
+  your users are expected, close (Ctrl-C, 1 h later it sleeps) when not.
+  Used 3 h/evening, the free quota covers ~10 evenings a month; used 2 full
+  weekend days, ~4 weekends. Used carelessly (left running 24/7), 5 days.
 
 ## When you outgrow it
 
