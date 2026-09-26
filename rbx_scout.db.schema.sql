@@ -1,4 +1,4 @@
--- RbxScout catalog schema reference.
+-- Studio Scouts catalog schema reference.
 -- The catalog itself (rbx_scout.db) is the `rbx_scout.db` asset of the
 -- rolling Release tag `catalog-latest` in this repo — pull it with:
 --   python db_sync.py pull
@@ -75,6 +75,23 @@ CREATE TABLE scan_runs (
                     contact_errors INTEGER DEFAULT 0,
                     error TEXT
                 , candidate_count INTEGER DEFAULT 0, matched_count INTEGER DEFAULT 0, candidate_limit INTEGER DEFAULT 0, min_visits INTEGER DEFAULT 0, min_ccu INTEGER DEFAULT 0);;
+
+-- Revival memory (2026-09-24): contact verdicts land here on every write
+-- (single, batch, and page transactions) and prune_catalog copies rows here
+-- before DELETE, so a revived game re-qualifies with its paid-for Discord
+-- contact restored instead of re-resolving.
+CREATE TABLE IF NOT EXISTS contact_archive (
+                    universe_id          INTEGER PRIMARY KEY,
+                    has_discord          BOOLEAN,
+                    discord_url          TEXT,
+                    status               TEXT,
+                    found_via            TEXT,
+                    has_social_links     BOOLEAN,
+                    contacts_checked_at  TIMESTAMP,
+                    contact_schema_version INTEGER DEFAULT 0,
+                    title TEXT,
+                    archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );;
 
 CREATE INDEX idx_ga_blowup ON game_analytics(blowup_flag);;
 

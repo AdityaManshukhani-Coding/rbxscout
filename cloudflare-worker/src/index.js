@@ -1,5 +1,5 @@
 /**
- * RbxScout Cloudflare Worker.
+ * Studio Scouts Cloudflare Worker.
  *
  * This Worker has two jobs:
  *
@@ -76,7 +76,7 @@ async function pingDashboard(env) {
   try {
     const response = await fetch(url, {
       method: "GET",
-      headers: { "User-Agent": "rbxscout-keepalive" },
+      headers: { "User-Agent": "studioscouts-keepalive" },
       // Streamlit's HTTP layer answers health checks without rendering a
       // session; a plain GET (no _stcore stream upgrade) is enough to count
       // as app traffic for hibernation purposes.
@@ -155,7 +155,7 @@ async function dispatchWorkflow(workflow, env) {
           Accept: "application/vnd.github+json",
           Authorization: `Bearer ${env.GITHUB_TOKEN}`,
           "Content-Type": "application/json",
-          "User-Agent": "rbxscout-cloudflare-scheduler",
+          "User-Agent": "studioscouts-cloudflare-scheduler",
           "X-GitHub-Api-Version": GITHUB_API_VERSION,
         },
         body: JSON.stringify({ ref: GITHUB_REF }),
@@ -277,7 +277,7 @@ export default {
       const upstreamHeaders = new Headers({
         Accept: "text/html,*/*",
         "Accept-Language": "en",
-        "User-Agent": request.headers.get("user-agent") || "rbxscout-atlas-mirror",
+        "User-Agent": request.headers.get("user-agent") || "studioscouts-atlas-mirror",
       });
       const upstream = await fetch(targetUrl, {
         headers: upstreamHeaders,
@@ -305,7 +305,7 @@ export default {
     const upstreamUrl = UPSTREAM + url.pathname + url.search;
 
     const headers = new Headers({ Accept: "application/json" });
-    headers.set("User-Agent", request.headers.get("user-agent") || "rbxscout-proxy");
+    headers.set("User-Agent", request.headers.get("user-agent") || "studioscouts-proxy");
     // Deliberately no cookies/auth forwarded — public endpoint only.
 
     let response;

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  RbxScout daily home-IP Atlas harvest.
+  Studio Scouts daily home-IP Atlas harvest.
 
   Fires once a day at 20:00 LOCAL time — evening for the owner, chosen so the
   harvest lands while the laptop is open (a missed day = no new games that

@@ -1,9 +1,12 @@
 [theme]
 base = "dark"
-primaryColor = "#5865F2"
-backgroundColor = "#0d1117"
-secondaryBackgroundColor = "#161b22"
-textColor = "#e6edf3"
+# Studio Scouts palette — tokens documented in BRAND.md; keep in sync with
+# generate_brand_assets.py. Scout Green (#2BD98A) is the brand primary;
+# Discord blurple is retired everywhere except Discord's own logo glyph.
+primaryColor = "#2BD98A"
+backgroundColor = "#0B0E14"
+secondaryBackgroundColor = "#12161E"
+textColor = "#E7ECF3"
 font = "sans serif"
 
 [server]

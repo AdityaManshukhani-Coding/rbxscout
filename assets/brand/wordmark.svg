@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 460 84" fill="none">
+  <!-- Studio Scouts lockup: badge mark + name treatment.
+       "Studio" set regular in text color, "Scouts" set bold in Scout Green. -->
+  <g transform="translate(10,10) scale(1.0)">
+    <rect width="64" height="64" rx="14.5" fill="#0B0E14"/>
+    <rect x="1.5" y="1.5" width="61" height="61" rx="13" stroke="#262A33" stroke-width="1"/>
+    <g stroke="#2BD98A">
+      <circle cx="32" cy="32" r="19" stroke-opacity="0.35" stroke-width="1.6"/>
+      <path d="M32 32 L32 13 A19 19 0 0 1 47.63 22.75 Z" fill="#2BD98A" fill-opacity="0.14" stroke="none"/>
+      <path d="M32 13 A19 19 0 0 1 47.63 22.75" stroke-width="3.2" stroke-linecap="round"/>
+    </g>
+    <circle cx="44.5" cy="20.2" r="3.4" fill="#2BD98A"/>
+    <circle cx="32" cy="32" r="1.7" fill="#2BD98A" fill-opacity="0.55"/>
+  </g>
+  <text x="92" y="40" font-family="'Avenir Next','Segoe UI',Helvetica,Arial,sans-serif"
+        font-size="30" font-weight="500" letter-spacing="1" fill="#E7ECF3">Studio</text>
+  <text x="92" y="72" font-family="'Avenir Next','Segoe UI',Helvetica,Arial,sans-serif"
+        font-size="30" font-weight="700" letter-spacing="1" fill="#2BD98A">SCOUTS</text>
+  <text x="196" y="72" font-family="'Avenir Next','Segoe UI',Helvetica,Arial,sans-serif"
+        font-size="11" font-weight="500" letter-spacing="2.6" fill="#9AA4B2">ROBLOX GAME SCOUTING</text>
+</svg>

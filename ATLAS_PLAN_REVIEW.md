@@ -253,7 +253,7 @@ depth instead of zero-yield discovery.
   `found_via='atlas_dev'`, **never** written to `ccu_history` (`upsert_game`
   gained `record_ccu_history=False`). The hydrator overwrites with fresh
   Roblox stats on first refresh.
-- Polite fetching: honest UA (`RbxScout/1.0 …`), ~1 req/3 s
+- Polite fetching: honest UA (`StudioScouts/1.0 …`), ~1 req/3 s
   (`ATLAS_REQUEST_DELAY`), 429/5xx back-off then bail-out, proxy flip via the
   existing `RBXSCOUT_SEARCH_PROXY_URLS` (direct by default).
 - `run_expansion()` order: Atlas → spiderweb → recs → **drain** → frontier;

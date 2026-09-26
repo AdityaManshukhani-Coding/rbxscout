@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <!-- Studio Scouts mark: the radar. Ring = the watch, wedge = the daily
+       sweep, dot = the contact found. Strokes use currentColor so the mark
+       recolors with context; the badge version is logo-mark-badge.svg. -->
+  <circle cx="32" cy="32" r="19" stroke="currentColor" stroke-opacity="0.35" stroke-width="1.6"/>
+  <path d="M32 32 L32 13 A19 19 0 0 1 47.63 22.75 Z" fill="currentColor" fill-opacity="0.14"/>
+  <path d="M32 13 A19 19 0 0 1 47.63 22.75" stroke="currentColor" stroke-width="3.2" stroke-linecap="round"/>
+  <circle cx="44.5" cy="20.2" r="3.4" fill="currentColor"/>
+  <circle cx="32" cy="32" r="1.7" fill="currentColor" fill-opacity="0.55"/>
+</svg>

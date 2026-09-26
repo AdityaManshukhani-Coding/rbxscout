@@ -1,5 +1,5 @@
 """
-RbxScout - Automated Roblox Scouting & Contact Identification Dashboard.
+Studio Scouts - Roblox Game Scouting & Contact Dashboard.
 
 Run: streamlit run app.py
 Deploy marker: table reorder + No-Discord label + literal search + genre-✕ fix (2026-09-23).
@@ -11,6 +11,7 @@ import html
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -22,8 +23,10 @@ import streamlit as st
 from scout_core import (
     DEFAULT_MESSAGE_TEMPLATES,
     DEFAULT_MESSAGE_TEMPLATE,
+    DISCORD_FILTER_ALL,
+    DISCORD_FILTER_TRUE,
+    DISCORD_FILTER_FALSE,
     DISCORD_LOGO_URL,
-    THROTTLED_STATUS,
     RobloxPlatformScout,
     apply_filters,
     compact_num,
@@ -38,6 +41,35 @@ import profile_store
 logging.basicConfig(level=logging.INFO)
 
 APP_DIR = Path(__file__).resolve().parent
+BRAND_DIR = APP_DIR / "assets" / "brand"
+
+# Brand tokens — the source of truth is BRAND.md; keep in sync with
+# generate_brand_assets.py. The palette leans quieter than Streamlit's
+# defaults so the Scout Green accent reads as THE brand color.
+BRAND_ACCENT = "#2BD98A"    # Scout Green: primary buttons, the sweep, positive deltas
+BRAND_NEGATIVE = "#EF4444"  # red is reserved for negative momentum only
+BRAND_INK = "#0B0E14"
+BRAND_PANEL = "#12161E"
+BRAND_HAIRLINE = "#262A33"
+BRAND_TEXT = "#E7ECF3"
+BRAND_MUTED = "#9AA4B2"
+
+
+def _brand_png(name: str) -> str:
+    """Read a raster brand asset as a base64 data URI (None when missing).
+
+    Streamlit has no first-class favicon/page-icon file API, so the browser
+    favicon is injected once per run as a data URI in the input-guard script
+    block below. A missing asset degrades to the default icon — never an
+    exception on the render path.
+    """
+    import base64
+
+    path = BRAND_DIR / name
+    try:
+        return "data:image/png;base64," + base64.b64encode(path.read_bytes()).decode()
+    except OSError:
+        return ""
 
 
 def _resolve_catalog() -> tuple[str, bool]:
@@ -120,6 +152,31 @@ _INPUT_GUARD_SCRIPT = r"""
 })();
 </script>
 """
+# Browser favicon: Streamlit's page_icon only covers the fallback emoji, so
+# the real radar favicon is injected once per run as data URIs. Runs on the
+# gate screen too — the lock is the first thing a visitor sees.
+_FAVICON_SCRIPT = r"""
+<script>
+(function () {
+  var set = function (href) {
+    if (!href) { return; }
+    var link = document.querySelector("link[rel*='icon']");
+    if (!link) {
+      link = document.createElement('link');
+      link.rel = 'icon';
+      document.head.appendChild(link);
+    }
+    link.href = href;
+  };
+  set('%FAVICON32%');
+  var apple = document.createElement('link');
+  apple.rel = 'apple-touch-icon';
+  if ('%APPLEICON%'.length > 2) { apple.href = '%APPLEICON%'; document.head.appendChild(apple); }
+})();
+</script>
+""".replace("%FAVICON32%", _brand_png("favicon/favicon-32.png")) \
+     .replace("%APPLEICON%", _brand_png("favicon/apple-touch-icon.png"))
+
 PAGE_SIZE = 20
 DEFAULT_MIN_VISITS = 20_000
 DEFAULT_MIN_CCU = 25
@@ -161,19 +218,13 @@ def slim_result_frame(data: pd.DataFrame) -> pd.DataFrame:
         return data[keep] if keep else data
     except Exception:
         return data
-DESKTOP_DIR = Path.home() / "Desktop"
-GUIDE_IMAGE_CANDIDATES = {
-    number: [
-        APP_DIR / "assets" / f"Step {number} SS.png",
-        APP_DIR / f"Step {number} SS.png",
-        DESKTOP_DIR / f"Step {number} SS.png",
-    ]
-    for number in range(1, 5)
-}
 
 st.set_page_config(
-    page_title="Studio Scouts - Roblox Scouting Dashboard",
-    page_icon="🕹️",
+    page_title="Studio Scouts — Roblox Game Scouting",
+    # The radar badge (assets/brand/favicon/favicon-32.png) is also injected
+    # as the real browser favicon below; this emoji is only the fallback
+    # page icon for contexts that cannot load the data URI.
+    page_icon=str(BRAND_DIR / "favicon" / "favicon-32.png"),
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -270,9 +321,7 @@ _PROFILE_FIELDS = (        "discord_name",
     "message_variant",
     "target_min_visits",
     "target_min_ccu",
-    "onboarding_cookie",
     "onboarding_step",
-    "guide_step",
     "onboarding_complete",
 )
 
@@ -394,23 +443,39 @@ def _render_gate() -> None:
         return
 
     st.markdown("<style>section[data-testid='stSidebar']{display:none}</style>", unsafe_allow_html=True)
+    gate_icon = _brand_png("logo-mark-192.png")
+    gate_icon_html = (
+        f'<img src="{gate_icon}" alt="" width="84" height="84" '
+        'style="border-radius:20px;margin-bottom:1rem">'
+        if gate_icon else '<div class="gate-lock">🔐</div>'
+    )
     st.markdown(
         """
         <style>
            .gate-card {
-                max-width: 420px; margin: 9vh auto 0 auto; padding: 2.2rem 2.4rem;
+                max-width: 420px; margin: 9vh auto 0 auto; padding: 2.4rem 2.4rem;
                 border: 1px solid rgba(250, 250, 250, 0.12); border-radius: 18px;
                 background: rgba(250, 250, 250, 0.04); text-align: center;
             }
             .gate-lock { font-size: 2.6rem; }
+            .gate-brand {
+                font-size: 1.6rem; font-weight: 700; letter-spacing: 0.04em;
+                margin-bottom: 0.2rem;
+            }
+            .gate-brand .ss-accent { color: #2BD98A; }
+            .gate-tag {
+                font-size: 0.72rem; font-weight: 600; letter-spacing: 0.22em;
+                text-transform: uppercase; color: #9AA4B2; margin-top: 0;
+            }
         </style>
         """,
         unsafe_allow_html=True,
     )
     st.markdown(
-        '<div class="gate-card"><div class="gate-lock">🔒</div>'
-        '<h2 style="margin-bottom:0.2rem">Studio Scouts</h2>'
-        '<p style="opacity:0.75;margin-top:0">This site is private. Enter the access password to continue.</p>',
+        f'<div class="gate-card">{gate_icon_html}'
+        '<div class="gate-brand">Studio <span class="ss-accent">Scouts</span></div>'
+        '<p class="gate-tag">Roblox game scouting</p>'
+        '<p style="opacity:0.75;margin-top:0.8rem">This site is private. Enter the access password to continue.</p>',
         unsafe_allow_html=True,
     )
 
@@ -463,7 +528,7 @@ def _render_gate() -> None:
         )
 
     st.markdown("</div>", unsafe_allow_html=True)
-    st.html(_INPUT_GUARD_SCRIPT, unsafe_allow_javascript=True)  # no save-password prompt here either
+    st.html(_INPUT_GUARD_SCRIPT + _FAVICON_SCRIPT, unsafe_allow_javascript=True)  # no save-password prompt here either
     st.stop()
 
 
@@ -475,23 +540,16 @@ def initialize_session() -> bool:
         "onboarding_complete": False,
         "target_min_visits": DEFAULT_MIN_VISITS,
         "target_min_ccu": DEFAULT_MIN_CCU,
-        "onboarding_cookie": "",
         "discord_name": "",  # asked in the welcome flow; auto-fills the outreach message
         "discord_user_id": "",  # optional; turns [Your Name] into a real <@ID> mention
         "message_template": DEFAULT_MESSAGE_TEMPLATE,
         "message_variant": 0,  # which of the 5 starter templates is active
-        "guide_step": 1,
         "pending_initial_scan": False,
     "welcome_scan_started": False,
         "active_run_id": None,
-        "check_contacts_requested": False,
         "contact_page": 1,
-        "contact_page_size": PAGE_SIZE,
-        "contact_loaded": set(),
-        "contact_signature": "",
         "scan_error": "",
         "source": "demo",
-        "watch_contact_loaded": set(),
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -520,7 +578,7 @@ def _save_onboarding_targets() -> None:
 
 
 def _save_profile_identity() -> None:
-    """Snapshot identity fields (name / ID / template / cookie) on change."""
+    """Snapshot identity fields (name / ID / template) on change."""
     _profile_save()
 
 
@@ -547,13 +605,6 @@ def _apply_message_variant() -> None:
         index = 0
     st.session_state.message_template = DEFAULT_MESSAGE_TEMPLATES[index]
     _profile_save()
-
-
-def guide_image(step: int):
-    for path in GUIDE_IMAGE_CANDIDATES.get(step, []):
-        if path.exists():
-            return path
-    return None
 
 
 def render_onboarding() -> bool:
@@ -616,8 +667,7 @@ def render_onboarding() -> bool:
             st.warning("Set at least one target before continuing.")
         if st.button("Next", type="primary", width="stretch", key="onb1_next"):
             if int(st.session_state.target_min_visits) or int(st.session_state.target_min_ccu):
-                st.session_state.onboarding_step = 2
-                st.session_state.guide_step = 1
+                st.session_state.onboarding_step = 3
                 _profile_save()  # targets + step survive a refresh
                 st.rerun()
         return False
@@ -665,8 +715,7 @@ def render_onboarding() -> bool:
             )
         back, next_column = st.columns(2)
         if back.button("Back", width="stretch", key="onb3_back"):
-            st.session_state.onboarding_step = 2
-            st.session_state.guide_step = 4
+            st.session_state.onboarding_step = 1
             st.rerun()
         if next_column.button("Next", type="primary", width="stretch", key="onb3_next"):
             st.session_state.onboarding_step = 4
@@ -740,67 +789,10 @@ def render_onboarding() -> bool:
             # speed hardening in scout_core keeps that well under a minute.
             st.session_state.pending_initial_scan = True
             st.session_state.contact_page = 1
-            st.session_state.contact_loaded = set()
-            st.session_state.contact_signature = ""
             st.rerun()
         return False
 
-    st.title("Connect your Roblox session")
-    st.caption("Follow the steps below to copy the cookie used for Roblox social-link checks.")
-    st.warning(
-        "A .ROBLOSECURITY cookie is a live account credential. Never share it in chat, screenshots, "
-        "or source files. Use a test account and revoke it immediately if it is exposed."
-    )
 
-    guide_steps = [
-        (1, "Open Roblox in Chrome", "Log in to your Roblox account, open the Roblox home page, right-click the page, and choose Inspect."),
-        (2, "Open Application", "In DevTools, select the Application tab."),
-        (3, "Expand Cookies", "In the left panel, expand Cookies, then select the Roblox website entry."),
-        (4, "Copy .ROBLOSECURITY", "Select .ROBLOSECURITY in the table and copy the complete value from the lower panel. Do not copy any other cookie."),
-    ]
-    guide_step = max(1, min(4, int(st.session_state.guide_step)))
-    st.progress(guide_step / 4, text=f"Cookie guide: step {guide_step} of 4")
-    number, title, instructions = guide_steps[guide_step - 1]
-    st.subheader(f"Step {number}: {title}")
-    st.write(instructions)
-    image = guide_image(number)
-    if image:
-        st.image(image, use_container_width=True)
-    else:
-        st.caption("The step image is not available in this checkout; the written instructions still apply.")
-
-    if guide_step == 4:
-        st.text_input(
-            ".ROBLOSECURITY cookie",
-            type="password",
-            key="onboarding_cookie",
-            help="Stored in this Streamlit session only and never written to SQLite.",
-            persist_state="session",
-            on_change=_save_profile_identity,
-        )
-        st.caption("Cookie access can vary with Roblox account age, verification, privacy settings, region, and endpoint policy.")
-
-    back, next_column = st.columns(2)
-    if back.button("Back", width="stretch"):
-        if guide_step == 1:
-            st.session_state.onboarding_step = 1
-            st.session_state.guide_step = 1
-        else:
-            st.session_state.guide_step = guide_step - 1
-        st.rerun()
-    if next_column.button("Next", type="primary", width="stretch", key="onb2_next"):
-        if guide_step < 4:
-            st.session_state.guide_step = guide_step + 1
-        else:
-            st.session_state.onboarding_step = 3
-        _profile_save()  # cookie-guide progress + cookie survive refreshes
-        st.rerun()
-    if guide_step == 4 and not st.session_state.onboarding_cookie:
-        st.caption(
-            "You can continue without a cookie, but Roblox hides social links from "
-            "signed-out requests — Discord invites can only be resolved with one."
-        )
-    return False
 
 
 _restored = initialize_session()
@@ -879,6 +871,77 @@ _warn_stale_catalog()
 # --------------------------------------------------------------------------- #
 
 
+# Process-wide shared catalog cache.
+#
+# Before: every user's sync ran load_catalog_matches itself (full SQL scan +
+# trend-window GROUP BY over ccu_history) and stored its own private frame.
+# 100 users on one target preset = the same heavy query computed 100 times
+# and 100 copies of the same data. That per-user CPU spike is exactly what
+# killed the free container at scale.
+#
+# After: the FIRST user with a given (min_visits, min_ccu, discord) combo
+# computes the frame once; everyone else on the same targets reuses it
+# (a cheap copy-on-share). Catalog pushes change the DB, not the frame, so
+# entries carry a short TTL and users can always hit Refresh to force a
+# recompute. Ten presets ≈ ten frames — bounded, no matter how many users.
+
+CATALOG_CACHE_TTL = 300  # seconds a shared frame stays fresh
+_CATALOG_CACHE: dict = {}
+_CATALOG_CACHE_LOCK = threading.Lock()
+
+
+def _downcast_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    """Shrink numeric columns to the smallest safe dtype.
+
+    int64 → int32/int16 where values fit; float64 → float32. Visits, CCU,
+    favorites and vote counts all fit comfortably in int32; halving the
+    numeric bytes directly halves every session's resident copy. Labels and
+    strings are untouched. Never raises: a deprecation in pandas downcast
+    paths must degrade to returning the frame unchanged.
+    """
+    try:
+        out = frame.copy()
+        for column in out.columns:
+            series = out[column]
+            if pd.api.types.is_integer_dtype(series) and str(series.dtype) != "int32":
+                out[column] = pd.to_numeric(series, downcast="integer")
+            elif pd.api.types.is_float_dtype(series) and str(series.dtype) != "float32":
+                out[column] = pd.to_numeric(series, downcast="float")
+        return out
+    except Exception:
+        return frame
+
+
+def _shared_catalog_frame(min_visits: int, min_ccu: int, discord: bool | None, force: bool = False) -> pd.DataFrame:
+    """Return the shared, downcast frame for this target combo.
+
+    Cache key is (min_visits, min_ccu, discord). On a hit the caller gets a
+    shallow copy (session-owned edits like contact-cell state must never
+    leak between users); on a miss exactly one caller computes while the
+    rest wait on the lock and then reuse the result. ``force`` (Refresh
+    button) bypasses freshness and recomputes.
+    """
+    key = (int(min_visits or 0), int(min_ccu or 0), discord)
+    now = time.monotonic()
+    with _CATALOG_CACHE_LOCK:
+        entry = _CATALOG_CACHE.get(key)
+        if entry and not force and now - entry[0] < CATALOG_CACHE_TTL:
+            return entry[1].copy()
+    frame = _read_catalog(min_visits, min_ccu, discord)
+    if frame.empty:
+        # Do not cache empties: a half-finished pipeline push or an outage
+        # would otherwise pin a blank catalog for the whole TTL.
+        return frame
+    frame = _downcast_frame(frame)
+    with _CATALOG_CACHE_LOCK:
+        # Bound the cache: keep only the most recent 12 target combos.
+        if len(_CATALOG_CACHE) >= 12:
+            oldest = min(_CATALOG_CACHE.items(), key=lambda kv: kv[1][0])[0]
+            _CATALOG_CACHE.pop(oldest, None)
+        _CATALOG_CACHE[key] = (now, frame)
+    return frame.copy()
+
+
 def _read_catalog(min_visits: int, min_ccu: int, discord: bool | None = None) -> pd.DataFrame:
     """Read the catalog, tolerating a stale ``scout_core`` in the running process.
 
@@ -914,7 +977,6 @@ def get_scout() -> RobloxPlatformScout:
     if "scout" not in st.session_state:
         st.session_state.scout = RobloxPlatformScout(
             db_path=(DB_PATH or ""),
-            roblox_cookie=st.session_state.get("onboarding_cookie") or None,
             # Per-session worker pool: every session gets its own, so keep it
             # small — the process-wide ROBLOX_CALL_GATE (scout_core) is what
             # actually bounds total outbound Roblox concurrency across all
@@ -922,68 +984,6 @@ def get_scout() -> RobloxPlatformScout:
             max_workers=2,
         )
     return st.session_state.scout
-
-
-def run_contact_scan(
-    scout: RobloxPlatformScout,
-    page_ids: list[int],
-    force: bool,
-    run_id: int | None = None,
-) -> pd.DataFrame:
-    progress = st.progress(0.0, text="Checking Discord contacts...")
-    status = st.empty()
-
-    def callback(percent: float, message: str) -> None:
-        progress.progress(min(1.0, percent), text=message)
-        status.caption(message)
-
-    try:
-        refreshed = scout.scan_contacts(
-            page_ids,
-            force=force,
-            run_id=run_id,
-            progress_cb=callback,
-        )
-    finally:
-        progress.empty()
-        status.empty()
-    # Roblox was throttling during this check: pages of lookups were skipped
-    # (NOT stored as "No Contact Found"), so say so instead of letting users
-    # read a transient verdict as ground truth.
-    if scout.throttle_window_active() and not refreshed.empty:
-        if "status" in refreshed.columns and (refreshed["status"] == THROTTLED_STATUS).any():
-            st.warning(
-                "⚠️ Roblox briefly rate-limited us — some games on this page "
-                "could not be checked and show “Throttled”. Re-run the check "
-                "on this page in a few minutes."
-            )
-    # Protect the verdicts from catalog asset swaps: the hosted cache copy of
-    # the catalog is fully replaced on every pipeline sync, which would
-    # otherwise erase exactly the contact state the user just resolved. The
-    # overlay store is replayed onto every fresh download.
-    try:
-        if not refreshed.empty and "universe_id" in refreshed.columns:
-            records = {}
-            for rec in refreshed.to_dict("records"):
-                try:
-                    records[int(rec["universe_id"])] = rec
-                except (KeyError, TypeError, ValueError):
-                    continue
-            catalog_fetch.record_contacts(records)
-    except Exception:
-        pass  # overlay is best effort; the authoritative write already happened
-    return refreshed
-
-
-def update_contact_rows(base: pd.DataFrame, refreshed: pd.DataFrame) -> pd.DataFrame:
-    if refreshed.empty or "universe_id" not in refreshed.columns:
-        return base
-    merged = base.set_index("universe_id").copy()
-    replacement = refreshed.set_index("universe_id")
-    for column in ("has_discord", "discord_url", "status", "found_via", "has_social_links", "contacts_checked_at"):
-        if column in replacement.columns:
-            merged.loc[replacement.index, column] = replacement[column]
-    return merged.reset_index()
 
 
 def load_existing_or_demo(scout: RobloxPlatformScout) -> tuple[pd.DataFrame, str]:
@@ -1003,10 +1003,6 @@ def shift_contact_page(delta: int, page_count: int) -> None:
 
 def reset_contact_page() -> None:
     st.session_state.contact_page = 1
-    st.session_state.contact_loaded = set()
-    st.session_state.contact_signature = ""
-    # A stale run id from a previous page/targets would attribute the next
-    # check's diagnostics to the wrong run — start clean each time.
     st.session_state.active_run_id = None
 
 
@@ -1016,27 +1012,49 @@ def reset_contact_page() -> None:
 
 scout = get_scout()
 
-# The cookie widget can render before the scout exists (welcome flow) and its
-# value lives in session state; push the latest value into the live Roblox
-# session on every run so contact lookups never run unauthenticated by accident.
-_cookie_value = str(st.session_state.get("onboarding_cookie") or "").strip()
-if _cookie_value and not scout.has_cookie:
-    scout.set_cookie(_cookie_value)
-elif not _cookie_value and scout.has_cookie:
-    scout.set_cookie(None)
-
-st.sidebar.title("🕹️ Studio Scouts")
-st.sidebar.caption("Roblox game scouting and Discord contact finder")
+# Sidebar brand lockup: the radar badge + name treatment ("Scouts" in Scout
+# Green), replacing the emoji title. Rendered as one st.html block so the
+# mark and the type scale together.
+_sidebar_badge = _brand_png("logo-mark-192.png")
+_sidebar_badge_src = (
+    f'src="{_sidebar_badge}"' if _sidebar_badge else 'src="" style="display:none"'
+)
+st.sidebar.markdown(
+    f"""
+    <style>
+      .ss-brand {{ display: flex; align-items: center; gap: 12px; margin: 0.4rem 0 0.15rem; }}
+      .ss-brand img {{ width: 44px; height: 44px; border-radius: 12px; }}
+      .ss-brand-name {{
+        font-size: 1.18rem; font-weight: 700; letter-spacing: 0.03em;
+        line-height: 1.1; color: #E7ECF3;
+      }}
+      .ss-brand-name .ss-accent {{ color: #2BD98A; }}
+      .ss-brand-tag {{
+        font-size: 0.68rem; font-weight: 600; letter-spacing: 0.18em;
+        text-transform: uppercase; color: #9AA4B2; margin-top: 2px;
+      }}
+    </style>
+    <div class="ss-brand">
+      <img {_sidebar_badge_src} alt="Studio Scouts">
+      <div>
+        <div class="ss-brand-name">Studio <span class="ss-accent">Scouts</span></div>
+        <div class="ss-brand-tag">Roblox game scouting</div>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+st.sidebar.caption("Find games. Find owners. Make contact.")
 
 # Workspace switch: the New and Upcoming view reuses the exact same paging,
 # Discord-check and table pipeline as the main view — only the data source
 # (blow-up watchlist) and the absence of filters differ.
 view = st.sidebar.radio(
     "Workspace",
-    options=["🎮 Main scout", "🚀 New and Upcoming"],
+    options=["Main scout", "New & Upcoming"],
     key="workspace_view",
 )
-is_watch_view = str(view).startswith("🚀")
+is_watch_view = view == "New & Upcoming"
 # Switching workspaces lands you on page 1 of the new view; contact state
 # stays per-view so neither side loses its checked pages.
 if st.session_state.get("last_workspace_view") != view:
@@ -1045,9 +1063,9 @@ if st.session_state.get("last_workspace_view") != view:
 
 # Stop Chrome's "save your password?" bubble on the cookie / Discord fields.
 # Page-level flag inside the script makes repeated mounts harmless.
-st.html(_INPUT_GUARD_SCRIPT, unsafe_allow_javascript=True)
+st.html(_INPUT_GUARD_SCRIPT + _FAVICON_SCRIPT, unsafe_allow_javascript=True)
 
-with st.sidebar.expander("🎯 Current target", expanded=True):
+with st.sidebar.expander("Current target", expanded=True):
     min_visits = st.number_input(
         "Minimum visits",
         min_value=0,
@@ -1066,34 +1084,14 @@ with st.sidebar.expander("🎯 Current target", expanded=True):
     )
     st.caption("Targets filter your results the moment you sync. New games appear as the 24/7 pipeline discovers them.")
 
-with st.sidebar.expander("⚙️ Scan settings", expanded=False):
-    deep = st.toggle("Check Discord contacts", value=True, key="deep_contacts")
-    force = st.button(
-        "↻ Force re-check current page",
-        key="force_contacts_now",
-        width="stretch",
-        help="Run the contact lookup again for the page currently displayed. This is a one-time action.",
-    )
-    cookie = st.text_input(
-        ".ROBLOSECURITY cookie",
-        type="password",
-        key="onboarding_cookie",
-        persist_state="session",
-        on_change=_save_profile_identity,
-        help="Remembered on this device so refreshes keep you signed in. Never written to SQLite.",
-    )
-    apply_cookie = st.button("💾 Apply cookie", width="stretch", disabled=not cookie)
-    if apply_cookie:
-        scout.set_cookie(cookie)
-        _profile_save()
-        st.toast("Cookie applied — remembered on this device.")
+with st.sidebar.expander("Scan settings", expanded=False):
     with st.sidebar.expander("This device", expanded=False):
         st.caption(
-            "Your details (name, User ID, targets, template, cookie, progress) are "
+            "Your details (name, User ID, targets, template, progress) are "
             "remembered on this device, so refreshes and back-navigation keep you "
             "where you were."
         )
-        if st.button("🧠 Forget this device", width="stretch", key="forget_device"):
+        if st.button("Forget this device", width="stretch", key="forget_device"):
             ref = _device_ref()
             if ref:
                 profile_store.clear_profile(ref)
@@ -1109,7 +1107,7 @@ with st.sidebar.expander("⚙️ Scan settings", expanded=False):
             gate.lockdown()  # back to the password screen, signed out
             st.rerun()
 
-with st.sidebar.expander("✉️ Outreach message", expanded=False):
+with st.sidebar.expander("Outreach message", expanded=False):
     st.radio(
         "Starter message",
         options=_message_variant_options(),
@@ -1144,19 +1142,12 @@ with st.sidebar.expander("✉️ Outreach message", expanded=False):
         on_change=_save_profile_identity,
     )
     st.caption(
-        "Each 📋 Copy click picks a random starter (never the same one twice "
+        "Each Copy click picks a random starter (never the same one twice "
         "in a row) and auto-fills [Your Name] / [Game Name]. Edit the text "
         "above to customize what gets rotated."
     )
 
-sync = st.sidebar.button("🔄 Sync live data", type="primary", width="stretch", key="sync_live_data")
-check_contacts = st.sidebar.button(
-    "🔎 Check Discord servers",
-    width="stretch",
-    disabled=not deep,
-)
-if check_contacts:
-    st.session_state.check_contacts_requested = True
+sync = st.sidebar.button("Sync live data", type="primary", width="stretch", key="sync_live_data")
 
 if sync or st.session_state.pending_initial_scan:
     _profile_save()  # targets/identity snapshot rides along with the scan
@@ -1166,17 +1157,25 @@ if sync or st.session_state.pending_initial_scan:
     with st.spinner("Loading games that meet your targets..."):
         try:
             # Read-only catalog query — no discovery, no Roblox requests.
-            # The 24/7 pipeline (Cloudflare cron → hydrator and expander
-            # workflows) owns discovery and hydration; this
-            # button only pulls what it already stored. Results page one is
-            # ready instantly; contacts still load page by page below.
-            data = _read_catalog(
+            # Served from the process-wide shared cache: the first user on a
+            # target preset computes it, everyone else reuses it (see
+            # _shared_catalog_frame). force=True only on an explicit refresh
+            # click, never on the routine initial scan.
+            data = _shared_catalog_frame(
                 min_visits=int(min_visits),
                 min_ccu=int(min_ccu),
+                discord=None,
+                force=bool(sync),
             )
             # Keep only what the dashboard renders in session state (see
             # SESSION_KEEP_COLUMNS) — never the demo/DB fallback frame.
             st.session_state.data = slim_result_frame(data) if not data.empty else empty_dataframe()
+            # The filter pipeline runs on the freshly synced result set so a
+            # brand-new verdict becomes visible on the very next rerun.
+            df = st.session_state.data
+            if not df.empty and st.session_state.get("discord_filter_radio", DISCORD_FILTER_ALL) != DISCORD_FILTER_ALL:
+                df = apply_filters(df, discord_filter=st.session_state.discord_filter_radio)
+            st.session_state.data = df
             # Keep the exact onboarding targets attached to the result set so
             # the dashboard cannot accidentally present a previous cached scan.
             st.session_state.result_target_min_visits = int(min_visits)
@@ -1192,11 +1191,6 @@ if sync or st.session_state.pending_initial_scan:
             st.session_state.source = "live"
             st.session_state.active_run_id = None
             reset_contact_page()
-    # Defer the page-1 contact check to the NEXT rerun: running it inline
-    # kept the pre-dashboard frame (the welcome flow) visible behind the
-    # spinner for the whole slow lookup. Skipping this run lets the
-    # dashboard paint its rows first; the check then runs over it.
-    st.session_state.defer_contact_check = True
 
 if "data" not in st.session_state:
     # Fallback only: the first scan normally populates data on the
@@ -1250,7 +1244,7 @@ eff_min_ccu = 0 if is_watch_view else int(min_ccu)
 # --------------------------------------------------------------------------- #
 
 if is_watch_view:
-    st.sidebar.header("🚀 New and Upcoming")
+    st.sidebar.header("New & Upcoming")
     st.sidebar.caption(
         "No filters here by design — this is the raw blow-up watchlist. "
         "Filters live on the Main scout view."
@@ -1258,8 +1252,33 @@ if is_watch_view:
     search = ""
     selected_genres = []
 else:
-    st.sidebar.header("🎯 Scout filters")
-    search = st.sidebar.text_input("🔎 Search game or creator", placeholder="e.g. blox, tycoon...")
+    st.sidebar.header("Scout filters")
+    search = st.sidebar.text_input("Search game or creator", placeholder="e.g. blox, tycoon...")
+
+    # Discord contact filter (re-added 2026-09-24). Applies AFTER metric
+    # filtering so it never changes which pages get contact checks; it only
+    # narrows what is displayed.
+    st.sidebar.radio(
+        "Discord availability",
+        options=[DISCORD_FILTER_ALL, DISCORD_FILTER_TRUE, DISCORD_FILTER_FALSE],
+        key="discord_filter_radio",
+        help="'Discord available' keeps games with a resolved invite; "
+             "'No Discord' keeps games checked and found without one. "
+             "Unchecked games disappear from both narrowed views.",
+    )
+    # Coverage chip: how much of the qualified catalog carries a verdict.
+    # Grows nightly (backfill + Atlas frontier sweep) — visible proof the
+    # 'With Discord' view is filling in rather than honestly near-empty.
+    try:
+        _coverage = catalog_fetch.contact_coverage_cached(DB_PATH)
+        _cov_target = _coverage.get("target")
+        if _cov_target:
+            st.sidebar.caption(
+                f"🟣 {_coverage.get('hits', 0):,} games with Discord · "
+                f"{_coverage.get('checked', 0):,} of {_cov_target:,} checked"
+            )
+    except Exception:
+        pass  # a coverage read must never break the filter render
 
     # Genre is a metric filter, so it is applied before contact requests.
     genres = sorted(
@@ -1296,8 +1315,8 @@ signature = "|".join([
     str(min_ccu),
     ",".join(selected_genres),
 ])
-if signature != st.session_state.contact_signature:
-    st.session_state.contact_signature = signature
+if signature != st.session_state.get("filter_signature"):
+    st.session_state.filter_signature = signature
     st.session_state.contact_page = 1
 
 page_size = st.sidebar.selectbox("Games per page", options=[10, 20, 40], index=1, key="contact_page_size")
@@ -1322,60 +1341,6 @@ page = st.sidebar.number_input("Page", min_value=1, max_value=page_count, step=1
 page_start = (int(page) - 1) * int(page_size)
 page_rows = metric_filtered.iloc[page_start:page_start + int(page_size)]
 page_ids = [int(uid) for uid in page_rows["universe_id"].tolist()]
-requested_contact_check = bool(st.session_state.pop("check_contacts_requested", False))
-
-if deep and page_ids:
-    # The watchlist tracks its own checked-page set so main-view contact
-    # state never suppresses (or leaks into) watch-view lookups.
-    loaded_key = "watch_contact_loaded" if is_watch_view else "contact_loaded"
-    if st.session_state.pop("defer_contact_check", False) and not (force or requested_contact_check):
-        # Set by the sync above: let this run paint the results table now;
-        # the page-1 contact check runs on the next rerun instead.
-        needs_contact_check = False
-        if page_ids:
-            st.session_state.contact_check_scheduled = True
-    else:
-        needs_contact_check = (
-            requested_contact_check
-            or force
-            or not set(page_ids).issubset(st.session_state[loaded_key])
-        )
-    if needs_contact_check:
-        with st.spinner(f"Checking Discord contacts for page {page}..."):
-            try:
-                refreshed = run_contact_scan(
-                    scout,
-                    page_ids,
-                    force=force,
-                    run_id=st.session_state.get("active_run_id"),
-                )
-                st.session_state.active_run_id = scout.last_scan.get("run_id")
-                st.session_state[loaded_key].update(page_ids)
-                if is_watch_view:
-                    # The watchlist re-reads from the DB: contact results are
-                    # persisted there, and watch rows must not leak into the
-                    # main result set cached in session state.
-                    df = update_contact_rows(scout.load_blowup_watch(), refreshed)
-                    metric_filtered = df.reset_index(drop=True)
-                else:
-                    st.session_state.data = update_contact_rows(st.session_state.data, refreshed)
-                    df = st.session_state.data
-                    metric_filtered = apply_filters(
-                        df,
-                        search=search,
-                        min_visits=eff_min_visits,
-                        min_ccu=eff_min_ccu,
-                        genres=selected_genres,
-                    ).sort_values(
-                        ["visits", "ccu"],
-                        ascending=[True, True],
-                        na_position="last",
-                    ).reset_index(drop=True)
-                page_rows = metric_filtered.iloc[page_start:page_start + int(page_size)]
-            except Exception as exc:
-                scout.mark_scan_failed(exc)
-                st.session_state.scan_error = str(exc)
-                st.sidebar.error(f"Contact page failed: {exc}")
 
 # Apply contact filters only after the current page has had a chance to resolve.
 visible = apply_filters(
@@ -1384,6 +1349,7 @@ visible = apply_filters(
     min_visits=0,
     min_ccu=0,
     genres=selected_genres,
+    discord_filter=st.session_state.get("discord_filter_radio", DISCORD_FILTER_ALL),
 )
 
 # Failures stay visible even without the diagnostics section: a failed sync
@@ -1424,24 +1390,24 @@ def game_url(row: pd.Series) -> str:
 
 TABLE_STYLE = """
 <style>
-/* Results panel: atlasdev.gg-style card — near-black body, hairline border,
-   raised header strip, generous row padding. */
+/* Results panel — Studio Scouts brand tokens (BRAND.md): Ink background,
+   Hairline borders, Scout Green reserved for positive signal. */
 .ss-panel {
-  border: 1px solid #23262e; border-radius: 14px; overflow: hidden;
-  background: #101218; margin-top: 4px;
+  border: 1px solid #262A33; border-radius: 14px; overflow: hidden;
+  background: #12161E; margin-top: 4px;
 }
 .ss-wrap { overflow-x: auto; }
 .ss-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
 .ss-table thead th {
   text-align: center; padding: 12px 14px; white-space: nowrap;
-  background: #16181f; color: #b6bcc7; font-weight: 600;
-  font-size: 0.76rem; letter-spacing: 0.05em; text-transform: uppercase;
-  border-bottom: 1px solid #23262e;
+  background: #161B24; color: #9AA4B2; font-weight: 600;
+  font-size: 0.74rem; letter-spacing: 0.08em; text-transform: uppercase;
+  border-bottom: 1px solid #262A33;
 }
 .ss-table thead th.ss-col-game { text-align: left; padding-left: 18px; }
 .ss-table tbody td {
   padding: 9px 14px; vertical-align: middle; text-align: center;
-  border-bottom: 1px solid #1b1e25; color: #d7dbe2;
+  border-bottom: 1px solid #1B2029; color: #D7DCE4;
 }
 .ss-table tbody tr:last-child td { border-bottom: none; }
 .ss-table tbody tr:hover td { background: rgba(255, 255, 255, 0.028); }
@@ -1452,8 +1418,8 @@ TABLE_STYLE = """
   background: #1a1d25; border: 1px solid #262a33; color: #c3c8d1;
   font-size: 0.78rem; white-space: nowrap;
 }
-.ss-up { color: #22c55e; white-space: nowrap; }
-.ss-down { color: #ef4444; white-space: nowrap; }
+.ss-up { color: #2BD98A; white-space: nowrap; }
+.ss-down { color: #EF4444; white-space: nowrap; }
 .ss-game { display: inline-flex; align-items: center; gap: 9px; text-decoration: none; color: inherit; }
 .ss-game:hover .ss-name { text-decoration: underline; }
 .ss-thumb { width: 44px; height: 44px; min-width: 44px; border-radius: 10px; object-fit: cover; background: rgba(128, 128, 128, 0.15); }
@@ -1473,8 +1439,8 @@ TABLE_STYLE = """
   color: inherit; white-space: nowrap; font-family: inherit;
 }
 .ss-copy:hover { background: rgba(128, 128, 128, 0.15); }
-.ss-copied { color: #22c55e; border-color: #22c55e; }
-.ss-copyfail { color: #ef4444; border-color: #ef4444; }
+.ss-copied { color: #2BD98A; border-color: #2BD98A; }
+.ss-copyfail { color: #EF4444; border-color: #EF4444; }
 .ss-none { opacity: 0.55; }
 </style>
 """
@@ -1766,7 +1732,7 @@ def render_table(frame: pd.DataFrame) -> None:
         unsafe_allow_javascript=True,
     )
 
-st.title("🚀 New and Upcoming" if is_watch_view else "Games matching your target")
+st.title("New & Upcoming" if is_watch_view else "Games matching your target")
 
 if source == "demo":
     st.warning("Live sources were unavailable, so demo data is shown. Run Sync live data to retry.")
@@ -1780,13 +1746,21 @@ if visible.empty:
     elif source == "live" and metric_filtered.empty:
         st.success("The live scan finished, but no games met both target thresholds.")
     else:
-        st.info("No games on this page match the selected filters.")
+        discord_view = st.session_state.get("discord_filter_radio", DISCORD_FILTER_ALL)
+        if discord_view == DISCORD_FILTER_TRUE and not metric_filtered.empty:
+            st.info(
+                "No games with a resolved Discord invite on this page. The "
+                "overnight backfill is still working through the catalog — "
+                "check the coverage chip in the sidebar."
+            )
+        else:
+            st.info("No games on this page match the selected filters.")
 else:
     render_table(visible)
     st.download_button(
-        "⬇️ Export visible results (CSV)",
+        "Export visible results (CSV)",
         visible.to_csv(index=False).encode(),
-        file_name=f"studioscout_export_{time.strftime('%Y%m%d_%H%M')}.csv",
+        file_name=f"studio-scouts-export_{time.strftime('%Y%m%d_%H%M')}.csv",
         mime="text/csv",
         width="content",
     )
@@ -1815,12 +1789,6 @@ with nav_right:
     )
 
 st.caption(
-    "Targets are applied before contact lookup. Page navigation checks only the selected page, "
-    "so the first useful results arrive without waiting for the entire catalog."
+    "Targets are applied instantly — every game already carries its Discord "
+    "contact state from the shared catalog."
 )
-
-# The deferred page-1 contact check (scheduled by the sync above) reruns the
-# script now: the dashboard is already painted, so the slow lookup shows its
-# spinner over real results instead of the stale welcome-flow frame.
-if st.session_state.pop("contact_check_scheduled", False):
-    st.rerun()

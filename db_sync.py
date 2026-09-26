@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RbxScout catalog store — the SQLite catalog lives on a GitHub Release asset.
+"""Studio Scouts catalog store — the SQLite catalog lives on a GitHub Release asset.
 
 The repo used to carry rbx_scout.db as a committed blob (a fresh ~11 MB file
 in every sync commit). Now the catalog is the **first asset** of a GitHub
@@ -18,6 +18,14 @@ Why a Release asset instead of a commit?
     GITHUB_TOKEN; locally you use any PAT with repo contents access.
   * The old "repo as database" git history (a new 11 MB blob per 5 minutes)
     disappears; the code and the dashboard stay in git as normal.
+
+  * the DB is the catalog asset **with `discord_url` values stripped** —
+    anyone can still download it and filter by `has_discord`, but the
+    actual invite links live only in the encrypted `contacts.bundle`
+    sidecar asset (see contacts_privacy.py), readable only with the owner's
+    CONTACTS_KEY;
+  * pull restores the links into the local catalog from the bundle, so the
+    owner's copy is fully-featured while the public copy is not.
 
 Concurrency is unchanged: both workflows still share the ``rbxscout-sync``
 Actions concurrency group, so only one pull/push cycle runs at a time.
@@ -56,12 +64,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import contacts_privacy
+
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "rbx_scout.db"
 STATE_PATH = APP_DIR / "rbx_scout.db.sync_state"
 
 RELEASE_TAG = "catalog-latest"
-RELEASE_NAME = "RbxScout catalog (rolling)"
+RELEASE_NAME = "Studio Scouts catalog (rolling)"
 ASSET_DB = "rbx_scout.db"
 ASSET_STATE = "rbx_scout.db.sync_state"
 ASSET_STATS = "stats.json"
@@ -135,7 +145,7 @@ def _headers(token: str, accept: str = "application/vnd.github+json") -> dict:
         "Authorization": f"Bearer {token}",
         "Accept": accept,
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "rbxscout-db-sync",
+        "User-Agent": "studioscouts-db-sync",
     }
 
 
@@ -173,7 +183,7 @@ def get_release(token: str) -> dict | None:
 
 def release_body() -> str:
     return (
-        "Rolling catalog storage for RbxScout — written by the Hydrator/Finder "
+        "Rolling catalog storage for Studio Scouts — written by the Hydrator/Finder "
         "workflows, read by db_sync.py. The 'rbx_scout.db' asset is the current "
         "catalog and 'rbx_scout.db.sync_state' counts the syncs that wrote it. "
         "The 📊 line at the top shows the live catalog counts (stats.json is "
@@ -418,6 +428,42 @@ def local_state() -> str:
 # Commands
 # --------------------------------------------------------------------------
 
+def _restore_contacts_from_bundle(rel: dict, token: str) -> int:
+    """After a pull installs the (link-free) public catalog, decrypt the
+    contacts bundle and re-apply the owner's links. Best-effort: a missing
+    key or bundle leaves the public copy in place (the app still works —
+    it just shows no links until a key is present)."""
+    asset = next(
+        (a for a in rel.get("assets", [])
+         if a.get("name") == contacts_privacy.ASSET_BUNDLE),
+        None,
+    )
+    if not asset:
+        print("pull: no contacts.bundle asset yet — public (link-free) copy installed")
+        return 0
+    key = contacts_privacy.load_key()
+    if not key:
+        print("pull: WARNING — contacts.bundle present but no CONTACTS_KEY; "
+              "installed copy has no Discord links")
+        return 0
+    blob = _api("GET", asset["url"], token, expect_json=False,
+                accept="application/octet-stream")
+    if not blob:
+        print("pull: WARNING — contacts.bundle download failed; "
+              "installed copy has no Discord links")
+        return 0
+    try:
+        payload = contacts_privacy.decrypt_bundle(key, bytes(blob))
+        rows, archive_rows = contacts_privacy.apply_bundle(DB_PATH, payload)
+        print(f"pull: contacts restored — {rows:,} game links "
+              f"(+{archive_rows:,} archive rows) applied from contacts.bundle")
+        return 1
+    except Exception as exc:  # degraded-but-working beats a failed pull
+        print(f"pull: WARNING — contacts restore skipped ({exc}); "
+              "installed copy has no Discord links")
+        return 0
+
+
 def cmd_pull() -> int:
     token = gh_token()
     rel = get_release(token)
@@ -462,6 +508,7 @@ def cmd_pull() -> int:
         raise SyncError("downloaded asset is not a SQLite database — refusing to install it")
     _checkpoint_wal(DB_PATH)
     tmp.replace(DB_PATH)
+    _restore_contacts_from_bundle(rel, token)
     state = _asset_state(rel, token)
     if state:
         STATE_PATH.write_text(state + "\n")
@@ -483,10 +530,26 @@ def cmd_push(force: bool = False) -> int:
     token = gh_token()
     if not DB_PATH.exists():
         raise SyncError(f"{DB_PATH} does not exist — nothing to push")
-    blob = DB_PATH.read_bytes()
-    if not blob[:16].startswith(b"SQLite format 3\x00"):
+    if not DB_PATH.read_bytes()[:16].startswith(b"SQLite format 3\x00"):
         raise SyncError(f"{DB_PATH} is not a SQLite database — refusing to upload")
-    _checkpoint_wal(DB_PATH)
+    _checkpoint_wal(DB_PATH)  # consistent snapshot before building copies
+    key = contacts_privacy.load_key()
+    # Build the encrypted contacts bundle + the link-free public copy from
+    # the local catalog. The public asset is what the world downloads; the
+    # bundle is what the owner's deployments decrypt to re-join links.
+    # No key is NOT an error: push the stripped catalog and skip the bundle
+    # (stale-or-absent bundle beats a red pipeline AND never leaks links).
+    contacts_blob = None
+    if key:
+        contacts_blob = contacts_privacy.encrypt_bundle(
+            key, contacts_privacy.build_bundle_payload(DB_PATH)
+        )
+    public_path = DB_PATH.with_suffix(".db.public")
+    stripped = contacts_privacy.strip_public_copy(DB_PATH, public_path)
+    blob = public_path.read_bytes()
+    if not blob[:16].startswith(b"SQLite format 3\x00"):
+        public_path.unlink(missing_ok=True)
+        raise SyncError(f"stripped copy of {DB_PATH} is not a SQLite database — refusing to upload")
     state = local_state()
     rel = get_or_create_release(token)
     old_state = _asset_state(rel, token)
@@ -514,7 +577,12 @@ def cmd_push(force: bool = False) -> int:
             "to refresh your local copy first, or pass --force (or set "
             "RBXSCOUT_FORCE_PUSH=1) only if you really mean to overwrite."
         )
-    replace_catalog_asset(rel, token, ASSET_DB, blob)
+    try:
+        replace_catalog_asset(rel, token, ASSET_DB, blob)
+        if contacts_blob is not None:
+            replace_catalog_asset(rel, token, contacts_privacy.ASSET_BUNDLE, contacts_blob)
+    finally:
+        public_path.unlink(missing_ok=True)
     upload_asset(rel, token, ASSET_STATE, (state + "\n").encode())
     payloads = stats_payloads(DB_PATH)
     for name, payload in payloads.items():
@@ -523,6 +591,15 @@ def cmd_push(force: bool = False) -> int:
         _update_release_stats_line(rel, token, payloads)
     print(f"push: {DB_PATH.name}  {len(blob)/1e6:.1f} MB  sync #{state}"
           + (f"  (replaces sync #{old_state or 'none'})" if old_state and old_state != state else ""))
+    if contacts_blob is not None:
+        print(f"push: {contacts_privacy.ASSET_BUNDLE}  {len(contacts_blob)/1e6:.2f} MB (encrypted)"
+              f"  — public copy has {stripped:,} discord_url values stripped")
+    else:
+        print(f"push: WARNING — no CONTACTS_KEY: pushed the link-free catalog "
+              f"({stripped:,} links stripped) but skipped the contacts bundle "
+              "(stale bundle stays in place). Owner deployments will not see "
+              "links for games added since the last keyed push. Set the "
+              "CONTACTS_KEY secret (see contacts_privacy.py) to fix.")
     for name, payload in payloads.items():
         print(f"push: {name}  games={payload.get('games'):,}")
     return 0
@@ -535,8 +612,16 @@ def cmd_status() -> int:
         print(f"release {RELEASE_TAG}: does not exist yet")
         return 1
     asset = next((a for a in rel["assets"] if a.get("name") == ASSET_DB), None)
+    bundle = next(
+        (a for a in rel["assets"] if a.get("name") == contacts_privacy.ASSET_BUNDLE),
+        None,
+    )
+    have_key = contacts_privacy.load_key() is not None
     remote = f"{asset['size']/1e6:.1f} MB, sync #{_asset_state(rel, token) or '?'}" if asset else "missing"
     local = f"{DB_PATH.stat().st_size/1e6:.1f} MB, sync #{local_state()}" if DB_PATH.exists() else "missing"
+    if bundle:
+        print(f"  bundle : contacts.bundle {bundle['size']/1e6:.2f} MB "
+              f"(key {'available' if have_key else 'MISSING — links will not restore'})")
     print(f"release {RELEASE_TAG} ({rel['html_url']})")
     print(f"  remote : {remote}")
     print(f"  local  : {local}")

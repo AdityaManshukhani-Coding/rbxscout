@@ -183,11 +183,9 @@ def test_onboarding_asks_discord_name_then_template():
     assert not at.exception
 
     at.button(key="onb0_next").click().run()  # welcome -> targets
-    at.button(key="onb1_next").click().run()  # targets -> cookie guide
-    for _ in range(4):
-        at.button(key="onb2_next").click().run()  # guide steps 1..4 -> Discord
+    at.button(key="onb1_next").click().run()  # targets -> Discord name
 
-    # Discord username step is shown right after the cookie step.
+    # Discord username step comes right after the targets step.
     titles = [element.value for element in at.title]
     assert any("Discord username" in value for value in titles)
 
@@ -255,8 +253,6 @@ def test_user_id_optional_field_flows_into_copied_message(monkeypatch):
     at.run()
     at.button(key="onb0_next").click().run()
     at.button(key="onb1_next").click().run()
-    for _ in range(4):
-        at.button(key="onb2_next").click().run()
 
     # Step 3: the optional field + the 3-step "how to find your ID" helper.
     captions = [element.value for element in at.caption]
@@ -283,6 +279,45 @@ def _table_html(at: AppTest) -> str:
     joined = "".join(el.proto.body for el in html_blocks)
     assert "ss-table" in joined, "results table should render after onboarding"
     return joined
+
+
+# --------------------------------------------------------------------------- #
+# Brand identity (BRAND.md): the lockup, the favicon, the palette
+# --------------------------------------------------------------------------- #
+
+
+def test_sidebar_renders_brand_lockup():
+    """The sidebar shows the radar badge + name treatment (no emoji title):
+    the brand HTML carries the lockup classes and the Scout Green accent."""
+    at = _render_dashboard()
+    assert not at.exception
+    sidebar_html = " ".join(el.proto.body for el in at.sidebar.markdown)
+    assert "ss-brand" in sidebar_html
+    assert "Studio <span class=\"ss-accent\">Scouts</span>" in sidebar_html
+    assert "2BD98A" in sidebar_html
+
+
+def test_gate_screen_uses_brand_mark(monkeypatch):
+    """The lock screen is the first thing a visitor sees; it must render the
+    radar badge (or the emoji fallback when the asset is missing) and the
+    accent treatment — never the old plain-text title."""
+    monkeypatch.delenv("SS_TEST_BYPASS_GATE")  # render the real gate
+    at = _fresh_app()
+    at.run()
+    assert not at.exception
+    markdown_html = " ".join(el.proto.body for el in at.markdown)
+    assert "gate-brand" in markdown_html
+    assert "Studio <span class=\"ss-accent\">Scouts</span>" in markdown_html
+
+
+def test_browser_favicon_injected_as_data_uri():
+    """The radar favicon ships to the browser via the favicon script, so the
+    tab shows the brand mark instead of Streamlit's default emoji icon."""
+    at = _render_dashboard()
+    html_blocks = list(at.main.get("html")) + list(at.sidebar.markdown)
+    joined = "".join(el.proto.body for el in html_blocks)
+    assert "link[rel*='icon']" in joined, "favicon injection script must ship"
+    assert "data:image/png;base64," in joined, "favicon must be embedded as a data URI"
 
 
 # --------------------------------------------------------------------------- #
@@ -541,9 +576,7 @@ def _patch_catalog_reader(monkeypatch, frame: pd.DataFrame) -> list[dict]:
 
 def _walk_onboarding_to_template(at: AppTest) -> None:
     at.button(key="onb0_next").click().run()  # welcome -> targets
-    at.button(key="onb1_next").click().run()  # targets -> cookie guide
-    for _ in range(4):
-        at.button(key="onb2_next").click().run()  # guide steps 1..4
+    at.button(key="onb1_next").click().run()  # targets -> Discord name
     at.button(key="onb3_next").click().run()  # Discord -> message template
 
 
@@ -583,60 +616,80 @@ def test_sync_button_reads_catalog_instantly(monkeypatch):
     assert "Blox Fruits" in _table_html(at)
 
 
-def test_cookie_from_welcome_flow_reaches_the_scout():
-    """The .ROBLOSECURITY entered in onboarding must survive to the Roblox
-    session — Streamlit used to drop it when the widget unmounted, so every
-    contact lookup ran signed-out (401s, zero invites)."""
-    at = _fresh_app()
-    at.run()
-    at.session_state["onboarding_cookie"] = "test-cookie-value"
-    at.session_state["onboarding_complete"] = True
-    at.session_state["pending_initial_scan"] = False
-    at.session_state["welcome_scan_started"] = True
-    at.session_state["data"] = _demo_frame()
-    at.session_state["source"] = "demo"
-    at.run()
+def test_shared_catalog_cache_shares_and_isolates(monkeypatch):
+    """The process-wide catalog cache: same targets = one computation shared
+    by all sessions (each gets an independent copy); different targets or a
+    forced refresh = a real recompute; empty results are never cached."""
+    import app as app_module
 
-    assert not at.exception
-    # The diagnostics section is gone; a good cookie is now silent. The
-    # scout still must receive it (lookups ran authenticated), so assert on
-    # the session object itself instead of sidebar captions.
-    assert at.session_state["scout"].has_cookie
+    calls: list[tuple] = []
+    frame = _demo_frame()
+
+    def _fake_read(min_visits, min_ccu, discord=None):
+        calls.append((min_visits, min_ccu, discord))
+        return frame.copy()
+
+    monkeypatch.setattr(app_module, "_read_catalog", _fake_read)
+    monkeypatch.setattr(app_module, "_CATALOG_CACHE", {})
+
+    first = app_module._shared_catalog_frame(20000, 25, None)
+    second = app_module._shared_catalog_frame(20000, 25, None)
+    assert calls == [(20000, 25, None)], "second same-target call must reuse the cache"
+    assert len(first) == len(second) == len(frame)
+
+    # Session isolation: mutating one caller's copy must not leak into the
+    # shared frame (or the next caller's copy).
+    first.loc[first.index[0], "title"] = "MUTATED"
+    third = app_module._shared_catalog_frame(20000, 25, None)
+    assert not (third["title"] == "MUTATED").any()
+
+    # Different targets = a different cache entry = a real computation.
+    app_module._shared_catalog_frame(50000, 75, None)
+    assert calls[-1] == (50000, 75, None)
+
+    # Forced refresh recomputes even on a warm entry.
+    app_module._shared_catalog_frame(20000, 25, None, force=True)
+    assert calls.count((20000, 25, None)) == 2
+
+    # Empty results are never cached (a mid-push blank must not stick).
+    monkeypatch.setattr(app_module, "_read_catalog", lambda *a, **k: frame.iloc[:0].copy())
+    assert app_module._shared_catalog_frame(999, 999, None).empty
+    assert (999, 999, None) not in {k for k, _ in [(k, v) for k, v in app_module._CATALOG_CACHE.items()]}
 
 
-def test_resolved_contacts_recorded_to_overlay(monkeypatch):
-    """Contact verdicts resolved in the UI must be handed to the catalog_fetch
-    overlay store, or the next pipeline asset swap erases them and the
-    Discord filter 'loses' games the user already found."""
-    recorded: dict = {}
-    monkeypatch.setattr(catalog_fetch, "record_contacts", lambda records: recorded.update(records))
+def test_downcast_frame_shrinks_numerics_and_preserves_values():
+    import app as app_module
 
-    refreshed = _demo_frame().copy()
-    refreshed["contacts_checked_at"] = "2026-09-14 12:00:00"
+    fat = pd.DataFrame({
+        "universe_id": pd.array([1, 2, 3], dtype="int64"),
+        "visits": pd.array([50_000_000, 1, 2], dtype="int64"),
+        "ccu": pd.array([25, 1, 2], dtype="int64"),
+        "momentum_1d": pd.array([1.5, 2.5, 3.5], dtype="float64"),
+        "title": ["a", "b", "c"],
+    })
+    slim = app_module._downcast_frame(fat)
+    assert slim["visits"].dtype == pd.Int32Dtype() or str(slim["visits"].dtype) in ("int32", "int16")
+    assert str(slim["momentum_1d"].dtype) == "float32"
+    assert slim["visits"].tolist() == [50_000_000, 1, 2], "values unchanged"
+    assert slim["title"].tolist() == ["a", "b", "c"], "strings untouched"
 
-    def _fake_scan(self, ids, force=False, run_id=None, progress_cb=None):
-        return refreshed.copy()
 
-    monkeypatch.setattr(scout_core.RobloxPlatformScout, "scan_contacts", _fake_scan)
-
+def test_sidebar_has_discord_filter_radio_and_coverage_chip(monkeypatch):
+    """The Discord contact filter returned 2026-09-24 (user request): a
+    sidebar radio (All / Discord available / No Discord) plus a coverage
+    chip showing how much of the qualified catalog carries verdicts."""
     at = _render_dashboard()
-
     assert not at.exception
-    assert 1 in recorded, "page-1 contact check must feed the overlay store"
-    assert recorded[1]["has_discord"] == True  # noqa: E712
-    assert recorded[1]["discord_url"] == "https://discord.gg/test"
-
-
-def test_sidebar_has_no_discord_filter_radio(monkeypatch):
-    """The Discord available/not-available filter was removed from the
-    sidebar at request: the Scout filters section offers search and genre
-    only, and no radio may remain anywhere in the sidebar."""
-    at = _render_dashboard()
-    assert not at.exception
-    radios = [r.label for r in at.sidebar.radio]
-    assert all("Discord" not in (label or "") for label in radios), radios
-    assert not any((r.key or "") == "discord_filter_radio" for r in at.sidebar.radio)
-    # The filter banner never shows either.
+    radios = [r for r in at.sidebar.radio if (r.key or "") == "discord_filter_radio"]
+    assert len(radios) == 1, at.sidebar.radio
+    options = radios[0].options
+    assert len(options) == 3
+    assert any("Discord" in str(o) for o in options)
+    # Coverage chip sits in the sidebar.
+    assert any("checked" in (c.value or "") for c in at.sidebar.caption), [
+        c.value for c in at.sidebar.caption
+    ]
+    # The old removal-era banner must stay gone.
     infos = [w.value for w in at.info]
     assert not any("known contact state" in v for v in infos)
 
@@ -726,11 +779,11 @@ def test_onboarding_progress_is_saved_for_the_next_refresh(monkeypatch, tmp_path
     at.session_state["_device_ref"] = "test-ref-3"
     at.run()
     at.button(key="onb0_next").click().run()
-    at.button(key="onb1_next").click().run()  # targets -> cookie guide
+    at.button(key="onb1_next").click().run()  # targets -> Discord name
     at.run()
 
     saved = profile_store.load_profile("test-ref-3")
-    assert saved.get("onboarding_step") == 2  # cookie guide
+    assert saved.get("onboarding_step") == 3  # Discord name step (cookie guide removed)
     assert saved.get("target_min_visits")
 
 
@@ -765,20 +818,3 @@ def test_forget_this_device_clears_profile_and_returns_to_welcome(
     assert any("Welcome" in t for t in titles), "back to a fresh welcome flow"
 
 
-def test_cookie_guide_renders_step_screenshots():
-    """Every cookie-guide step shows a screenshot (assets/Step N SS.png).
-
-    AppTest serves file images under /mock/media/<hash>.png, so the original
-    filename is not visible in the element — one rendered image per step is
-    the contract (guide_image resolves the right file per step).
-    """
-    at = _fresh_app()
-    at.run()
-    at.button(key="onb0_next").click().run()
-    at.button(key="onb1_next").click().run()
-
-    for expected_step in range(1, 5):
-        assert not at.exception
-        assert len(at.image) >= 1, f"guide step {expected_step} must show a screenshot"
-        if expected_step < 4:
-            at.button(key="onb2_next").click().run()

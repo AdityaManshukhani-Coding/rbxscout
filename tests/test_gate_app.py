@@ -125,7 +125,7 @@ def test_gate_renders_before_anything_else(_gate_state):
     at.session_state["_device_ref"] = "gate-dev-4"
     at.run()
     body_text = " ".join(m.value for m in at.markdown)
-    assert "Studio Scouts" in body_text
+    assert "Studio <span class=\"ss-accent\">Scouts</span>" in body_text
     assert not _has_widget(at, "button", "onb0_next"), "welcome flow not reachable"
 
 

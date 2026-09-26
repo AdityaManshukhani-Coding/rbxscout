@@ -30,6 +30,16 @@ rbx_scout.db.pull
 # --- user access keys: plaintext list NEVER enters git (hashes do) ---
 access_passwords.txt
 
+# --- Roblox credential for the home-IP contact tools (catchup_contacts.py /
+# --- atlas_home.py contact sweep): NEVER enters git ---
+local_cookie.txt
+local_cookie2.txt
+
+# --- contacts bundle encryption key (split catalog: links never leave the
+# --- owner's deployments in plaintext) ---
+contacts.key
+rbx_scout.db.public
+
 # --- cloudflare worker (tooling only; source + wrangler.toml stay committed) ---
 cloudflare-worker/node_modules/
 cloudflare-worker/.wrangler/
@@ -59,3 +69,4 @@ FIXES.md
 # Git stays for code; the Release asset is the database.
 rbx_scout.db
 rbx_scout.db.sync_state
+contacts_backup.bundle

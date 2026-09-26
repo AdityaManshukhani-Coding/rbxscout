@@ -50,20 +50,24 @@ def _app_with_view(view: str) -> AppTest:
     return at
 
 
+VIEW_MAIN = "Main scout"
+VIEW_WATCH = "New & Upcoming"
+
+
 def test_workspace_radio_has_no_live_catalog_entry(counts):
     """The 📡 Live catalog workspace is removed; the radio offers exactly the
     two remaining views."""
-    at = _app_with_view("🎮 Main scout")
+    at = _app_with_view(VIEW_MAIN)
     assert not at.exception
     radio = at.sidebar.radio(key="workspace_view")
     assert "📡 Live catalog" not in radio.options
-    assert set(radio.options) == {"🎮 Main scout", "🚀 New and Upcoming"}
+    assert set(radio.options) == {VIEW_MAIN, VIEW_WATCH}
 
 
 def test_no_counter_on_main_view(counts):
     """The sidebar catalog counter was removed; the main view renders no
     tracker band even though the catalog copy is available."""
-    at = _app_with_view("🎮 Main scout")
+    at = _app_with_view(VIEW_MAIN)
     assert not at.exception
     html = " ".join(m.value for m in at.markdown)
     assert "21,303" not in _visible_text(at), "counter must stay removed"
@@ -72,7 +76,7 @@ def test_no_counter_on_main_view(counts):
 
 
 def test_no_counter_on_watch_view(counts):
-    at = _app_with_view("🚀 New and Upcoming")
+    at = _app_with_view(VIEW_WATCH)
     assert not at.exception
     html = " ".join(m.value for m in at.markdown)
     assert 'class="ss-tracker"' not in html, "watch view stays counter-free"

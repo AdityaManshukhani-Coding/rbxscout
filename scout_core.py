@@ -1,5 +1,5 @@
 """
-RbxScout — Automated Roblox Scouting & Contact Identification (core engine).
+Studio Scouts — Roblox Game Scouting & Contact Identification (core engine).
 
 Sourcing pipeline:
   1. Atlas Dev analyze index                   -> mid-tier universeIds (daily harvest)
@@ -26,17 +26,22 @@ import re
 import sqlite3
 import threading
 import time
+
+try:  # POSIX advisory locks (coordination between home jobs)
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None
 from datetime import datetime
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import IO, Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote
 from pathlib import Path
 
 import pandas as pd
 import requests
 
-log = logging.getLogger("rbxscout")
+log = logging.getLogger("studioscouts")
 
 # --------------------------------------------------------------------------- #
 # Process-wide outbound throttling (multi-user safety)
@@ -273,6 +278,23 @@ ROBLOX_UNIVERSES_URL = "https://apis.roblox.com/universes/v1/places/{pid}/univer
 # Bump whenever a contact source changes, so cached verdicts resolved by the
 # old pipeline are ignored instead of shadowing newly reachable sources.
 CONTACT_RESOLVER_VERSION = 2
+# Revival-memory table (2026-09-24): one DDL, shared by _init_sqlite and the
+# self-heal path — a db_sync pull can replace the catalog with a store copy
+# that predates this table, and contact writes must recover, not fail.
+CONTACT_ARCHIVE_DDL = """
+    CREATE TABLE IF NOT EXISTS contact_archive (
+        universe_id          INTEGER PRIMARY KEY,
+        has_discord          BOOLEAN,
+        discord_url          TEXT,
+        status               TEXT,
+        found_via            TEXT,
+        has_social_links     BOOLEAN,
+        contacts_checked_at  TIMESTAMP,
+        contact_schema_version INTEGER DEFAULT 0,
+        title TEXT,
+        archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+"""
 DEFAULT_CANDIDATE_LIMIT = 10_000  # safety ceiling after batch place resolution
 
 # Hydration request budget per sync: roughly 150 batched metric calls of 50
@@ -316,7 +338,7 @@ ATLAS_DEEP_PAGES_DEFAULT = 275      # one-off catch-up sweep ceiling (full index
 ATLAS_DEEP_EVERY_DAYS_DEFAULT = 30  # re-run the deep sweep this often (0 = never)
 ATLAS_STAT_PAGES_DEFAULT = 100      # provisional first-paint rows per harvest
 ATLAS_REQUEST_DELAY_DEFAULT = 3.0   # polite per-request delay (seconds)
-ATLAS_USER_AGENT = "RbxScout/1.0 (Roblox game discovery; contact via repo)"
+ATLAS_USER_AGENT = "StudioScouts/1.0 (Roblox game discovery; contact via repo)"
 ATLAS_PROXY_URLS_ENV = "RBXSCOUT_SEARCH_PROXY_URLS"  # flip-ready: shared pool var
 
 
@@ -497,6 +519,61 @@ def compact_num(n: Optional[float]) -> str:
         if abs(n) >= div:
             return f"{n / div:.1f}{suffix}"
     return f"{int(n)}"
+
+
+class ContactBackfillLock:
+    """Advisory coordination between the contact backfill and every other
+    job that can pull/push (i.e. atomically REPLACE) the catalog file.
+
+    Incident 2026-09-24: a redundant backfill launch pulled the store
+    mid-run, swapping the DB file out from under the live worker — the new
+    file predated contact_archive and every archive write failed until the
+    table was recreated. Protocol since:
+      * the backfill HOLDS this lock for its entire run;
+      * atlas_home checks (non-blocking) before its pull and before its
+        push, skipping the store step when the backfill is live — the
+        shared local DB means the backfill's own end-of-run push carries
+        atlas's writes anyway.
+    Uses flock(2); degrades to no-op where flock is unavailable.
+    """
+
+    PATH = Path(__file__).resolve().parent / "logs" / "contact_backfill.lock"
+
+    def __init__(self) -> None:
+        self._fh: Optional[IO] = None
+
+    def acquire(self, wait_s: float = 0.0) -> bool:
+        if fcntl is None:  # non-POSIX: advisory coordination unavailable
+            return True
+        self.PATH.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.PATH, "a+")
+        deadline = time.time() + max(0.0, wait_s)
+        while True:
+            try:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except OSError:
+                if time.time() >= deadline:
+                    self._fh.close()
+                    self._fh = None
+                    return False
+                time.sleep(2)
+
+    def release(self) -> None:
+        if self._fh is not None:
+            try:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            self._fh.close()
+            self._fh = None
+
+    @staticmethod
+    def is_busy() -> bool:
+        probe = ContactBackfillLock()
+        busy = not probe.acquire(0.0)
+        probe.release()
+        return busy
 
 
 # --------------------------------------------------------------------------- #
@@ -885,6 +962,14 @@ class RobloxPlatformScout:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_dq_status ON discovery_queue(status, priority)"
             )
+            # Contact-archive memory (2026-09-24): game_analytics rows die via
+            # prune_catalog when a game is observed dead, but the Discord
+            # verdict paid for with real Roblox requests must survive — decayer
+            # games (CCU dips below the gate) and dead giants that come back
+            # alive re-qualify WITHOUT ever paying for the lookup again. The
+            # archive is keyed by universe_id and pushed by the store like
+            # every other table, so the memory follows the catalog everywhere.
+            conn.execute(CONTACT_ARCHIVE_DDL)
 
     def _load_persisted_diagnostics(self) -> None:
         import json
@@ -1594,6 +1679,23 @@ class RobloxPlatformScout:
                     ")",
                     (int(max_strikes), f"-{int(TIER8_STALE_PRUNE_DAYS)} days"),
                 )]
+                if doomed:
+                    # Archive the paid-for Discord verdicts BEFORE the delete:
+                    # if a pruned game revives and re-qualifies, its contact is
+                    # restored from memory instead of re-resolved (see
+                    # _archive_contacts and _revive_archived_contacts).
+                    marks = ",".join("?" for _ in doomed)
+                    conn.execute(
+                        "INSERT OR REPLACE INTO contact_archive ("
+                        "universe_id, has_discord, discord_url, status, found_via, "
+                        "has_social_links, contacts_checked_at, contact_schema_version, "
+                        "title, archived_at) "
+                        "SELECT universe_id, has_discord, discord_url, status, found_via, "
+                        "has_social_links, contacts_checked_at, contact_schema_version, "
+                        "title, CURRENT_TIMESTAMP FROM game_analytics "
+                        f"WHERE universe_id IN ({marks})",
+                        doomed,
+                    )
                 if not doomed:
                     return 0
                 removed = 0
@@ -2031,6 +2133,23 @@ class RobloxPlatformScout:
             })
             return cached["record"]
 
+        # Revival memory: a pruned game that came back alive re-qualifies with
+        # a fresh row — but its Discord verdict was already paid for once.
+        # Serve it from the archive (schema- and throttle-aware, checked first
+        # because resolve() may have bumped the version since the check) so
+        # revived games never spend another Roblox request on a known answer.
+        if not force:
+            archived = self._load_archived_contact(uid)
+            if archived is not None:
+                self._set_contact_diagnostic(run_id, uid, {
+                    "cached": True,
+                    "archived": True,
+                    "selected_source": archived.get("found_via"),
+                    "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
+                _contact_memcache_put(int(uid), archived)
+                return archived
+
         # Roblox is actively throttling this IP (any session's 429 sets the
         # flag). Skip live resolution entirely instead of hammering the IP and
         # caching empty verdicts for hours. The verdict is NOT persisted — the
@@ -2130,8 +2249,120 @@ class RobloxPlatformScout:
             "contacts_checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
         self._store_contact_cache(uid, record)
+        self._archive_contact(uid, record)
         _contact_memcache_put(int(uid), record)
         return record
+
+    def _archive_contact(self, universe_id: int, record: Dict[str, Any]) -> None:
+        """Write-through the verdict into contact_archive (best effort).
+
+        Also refreshes the archived title so the backfill log can name games.
+        Never raises: the archive is a safety net, not a dependency.
+        """
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO contact_archive ("
+                    "universe_id, has_discord, discord_url, status, found_via, "
+                    "has_social_links, contacts_checked_at, contact_schema_version, "
+                    "title, archived_at) "
+                    "SELECT ?, ?, ?, ?, ?, ?, ?, ?, title, CURRENT_TIMESTAMP "
+                    "FROM game_analytics WHERE universe_id=? "
+                    "ON CONFLICT(universe_id) DO UPDATE SET "
+                    "has_discord=excluded.has_discord, discord_url=excluded.discord_url, "
+                    "status=excluded.status, found_via=excluded.found_via, "
+                    "has_social_links=excluded.has_social_links, "
+                    "contacts_checked_at=excluded.contacts_checked_at, "
+                    "contact_schema_version=excluded.contact_schema_version, "
+                    "title=excluded.title, archived_at=CURRENT_TIMESTAMP",
+                    (
+                        int(universe_id),
+                        record.get("has_discord"),
+                        record.get("discord_url"),
+                        record.get("status"),
+                        record.get("found_via"),
+                        record.get("has_social_links"),
+                        record.get("contacts_checked_at"),
+                        CONTACT_RESOLVER_VERSION,
+                        int(universe_id),
+                    ),
+                )
+        except (sqlite3.Error, TypeError, ValueError):
+            pass
+
+    def _load_archived_contact(self, universe_id: int) -> Optional[Dict[str, Any]]:
+        """Archived verdict for a (re)qualifying game, or None.
+
+        Enforces the SAME freshness guarantees as _load_contact_cache: stale
+        resolver versions are treated as missing, and archived "No Contact
+        Found" verdicts expire after CONTACT_RECHECK_HOURS so creators can be
+        re-checked if a game's links changed while it was dead.
+        """
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT has_discord, discord_url, status, found_via, "
+                    "has_social_links, contacts_checked_at, contact_schema_version "
+                    "FROM contact_archive WHERE universe_id = ?",
+                    (int(universe_id),),
+                ).fetchone()
+        except sqlite3.Error:
+            return None
+        if not row or int(row[6] or 0) != CONTACT_RESOLVER_VERSION:
+            return None
+        record = {
+            "universe_id": int(universe_id),
+            "has_discord": bool(row[0]),
+            "discord_url": row[1],
+            "status": row[2],
+            "found_via": row[3],
+            "has_social_links": bool(row[4]),
+            "contacts_checked_at": str(row[5] or ""),
+        }
+        if record["status"] != "OK":
+            # "No Contact Found" archives go stale on the normal recheck clock.
+            try:
+                parsed = time.strptime(record["contacts_checked_at"], "%Y-%m-%d %H:%M:%S")
+                if time.time() - calendar.timegm(parsed) >= CONTACT_RECHECK_HOURS * 3600:
+                    return None
+            except (ValueError, OverflowError):
+                return None
+        return record
+
+    def _revive_archived_contacts(self, universe_ids: Iterable[int]) -> int:
+        """Copy archived verdicts back onto (re)qualifying catalog rows.
+
+        Called on every gate-crossing path (upsert_game and the expansion
+        drain's upserts): a revived game's fresh row carries no contact state,
+        so any archived verdict restores has_discord/discord_url/status/
+        found_via/contacts_checked_at for free. Returns rows revived.
+        """
+        ids = [int(u) for u in dict.fromkeys(universe_ids)]
+        if not ids:
+            return 0
+        revived = 0
+        try:
+            with self._connect() as conn:
+                for i in range(0, len(ids), 900):
+                    chunk = ids[i : i + 900]
+                    marks = ",".join("?" for _ in chunk)
+                    cur = conn.execute(
+                        "UPDATE game_analytics SET "
+                        "has_discord = (SELECT a.has_discord FROM contact_archive a WHERE a.universe_id = game_analytics.universe_id), "
+                        "discord_url = (SELECT a.discord_url FROM contact_archive a WHERE a.universe_id = game_analytics.universe_id), "
+                        "status = (SELECT a.status FROM contact_archive a WHERE a.universe_id = game_analytics.universe_id), "
+                        "found_via = (SELECT a.found_via FROM contact_archive a WHERE a.universe_id = game_analytics.universe_id), "
+                        "has_social_links = (SELECT a.has_social_links FROM contact_archive a WHERE a.universe_id = game_analytics.universe_id), "
+                        "contacts_checked_at = (SELECT a.contacts_checked_at FROM contact_archive a WHERE a.universe_id = game_analytics.universe_id), "
+                        "contact_schema_version = (SELECT a.contact_schema_version FROM contact_archive a WHERE a.universe_id = game_analytics.universe_id) "
+                        f"WHERE universe_id IN ({marks}) AND contacts_checked_at IS NULL "
+                        "AND EXISTS (SELECT 1 FROM contact_archive a WHERE a.universe_id = game_analytics.universe_id)",
+                        chunk,
+                    )
+                    revived += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+        except sqlite3.Error:
+            pass
+        return revived
 
     def _load_contact_cache(self, universe_id: int) -> Optional[Dict[str, Any]]:
         try:
@@ -2190,6 +2421,7 @@ class RobloxPlatformScout:
                 )
         except sqlite3.Error:
             pass
+        self._archive_contact(universe_id, record)
 
     def _store_contact_verdicts_batch(self, records: Dict[int, Dict[str, Any]]) -> None:
         """Persist a page of contact verdicts in ONE transaction.
@@ -2225,20 +2457,65 @@ class RobloxPlatformScout:
         if not rows:
             return
         try:
-            with DB_WRITE_LOCK:
-                with self._connect() as conn:
-                    conn.execute("PRAGMA busy_timeout=15000")
-                    with conn:
-                        conn.executemany(
-                            "UPDATE game_analytics SET has_discord=?, discord_url=?, "
-                            "status=?, found_via=?, has_social_links=?, contacts_checked_at=?, "
-                            "contact_schema_version=? WHERE universe_id=?",
-                            rows,
-                        )
+            self._write_contact_verdict_rows(rows)
         except sqlite3.Error as exc:
-            log.warning("Batched contact write failed (%d rows): %s", len(rows), exc)
+            # The catalog can be REPLACED under this process (db_sync pull
+            # installs a store copy that predates contact_archive) — recreate
+            # the table and retry once instead of failing the whole batch.
+            if "no such table: contact_archive" in str(exc):
+                try:
+                    self._ensure_contact_archive()
+                    self._write_contact_verdict_rows(rows)
+                except sqlite3.Error as retry_exc:
+                    log.warning("Batched contact write failed after self-heal (%d rows): %s", len(rows), retry_exc)
+            else:
+                log.warning("Batched contact write failed (%d rows): %s", len(rows), exc)
         for uid, record in records.items():
             _contact_memcache_put(int(uid), dict(record))
+
+    def _write_contact_verdict_rows(self, rows: List[Tuple[Any, ...]]) -> None:
+        """One transaction: verdict UPDATE + archive write-through.
+
+        Both statements MUST share the transaction — the archive is the
+        revival memory, and a verdict that persists without it is exactly
+        the state a later prune would forget how to restore.
+        """
+        with DB_WRITE_LOCK:
+            with self._connect() as conn:
+                conn.execute("PRAGMA busy_timeout=15000")
+                with conn:
+                    conn.executemany(
+                        "UPDATE game_analytics SET has_discord=?, discord_url=?, "
+                        "status=?, found_via=?, has_social_links=?, contacts_checked_at=?, "
+                        "contact_schema_version=? WHERE universe_id=?",
+                        rows,
+                    )
+                    # Keep the revival memory in step with every persisted
+                    # verdict (same transaction): a row pruned later
+                    # resurrects with this answer already in hand.
+                    conn.executemany(
+                        "INSERT INTO contact_archive ("
+                        "universe_id, has_discord, discord_url, status, found_via, "
+                        "has_social_links, contacts_checked_at, contact_schema_version, "
+                        "title, archived_at) "
+                        "SELECT ?, ?, ?, ?, ?, ?, ?, ?, title, CURRENT_TIMESTAMP "
+                        "FROM game_analytics WHERE universe_id=? "
+                        "ON CONFLICT(universe_id) DO UPDATE SET "
+                        "has_discord=excluded.has_discord, discord_url=excluded.discord_url, "
+                        "status=excluded.status, found_via=excluded.found_via, "
+                        "has_social_links=excluded.has_social_links, "
+                        "contacts_checked_at=excluded.contacts_checked_at, "
+                        "contact_schema_version=excluded.contact_schema_version, "
+                        "title=excluded.title, archived_at=CURRENT_TIMESTAMP",
+                        [(row[-1],) + row for row in rows],
+                    )
+
+    def _ensure_contact_archive(self) -> None:
+        """Recreate contact_archive if a pull replaced the catalog with a
+        store copy that predates the table (idempotent)."""
+        with DB_WRITE_LOCK:
+            with self._connect() as conn:
+                conn.execute(CONTACT_ARCHIVE_DDL)
 
     @staticmethod
     def _pick_discord(links: List[Dict[str, str]]) -> Optional[str]:
@@ -2457,6 +2734,10 @@ class RobloxPlatformScout:
                 "found_via": "expansion",
             })
             self._mark_discovery_outcome(uid, "qualified")
+        if qualified:
+            # Revived decayers/dead giants among the new qualifiers get their
+            # archived Discord verdict restored for free (revival memory).
+            self._revive_archived_contacts(list(qualified))
         for uid in to_check:
             if uid not in qualified:
                 self._mark_discovery_outcome(
@@ -3232,6 +3513,53 @@ class RobloxPlatformScout:
             "contact_errors": prior_errors + errors,
         })
         return self.load_table(ids)
+
+    def contacts_backfill_due(
+        self,
+        min_visits: int = EXPANSION_TARGET_VISITS,
+        min_ccu: int = EXPANSION_TARGET_CCU,
+        min_visits_floor: int = 0,
+        limit: int = 0,
+    ) -> List[int]:
+        """Universe IDs with no stored contact verdict, gate-qualified first.
+
+        The one-time backfill pool: qualified games (dashboard-visible) come
+        first ordered oldest-inserted, then any other checked-in row above
+        ``min_visits_floor`` (the decayed band — kept behind the flag so the
+        overnight run can sweep it after the visible backlog drains).
+        Throttled/failed lookups never wrote contacts_checked_at, so re-running
+        the backfill is inherently resumable. ``limit=0`` means everything.
+        """
+        qualified_clause = "(COALESCE(visits, 0) >= ? AND COALESCE(ccu, 0) >= ?)"
+        floor_clause = "" if min_visits_floor <= 0 else " OR COALESCE(visits, 0) >= ?"
+        # Binding order matches the SQL text: WHERE params, then the ORDER BY
+        # params, then LIMIT (kept last so it can never land in an earlier
+        # slot — a swapped binding here silently breaks the ordering).
+        where_params: List[Any] = [int(min_visits), int(min_ccu)]
+        if min_visits_floor > 0:
+            where_params.append(int(min_visits_floor))
+        # ORDER BY: qualified first (the dashboard-visible backlog drains
+        # before the decayed band), then oldest-inserted, then stable id order.
+        order_params: List[Any] = [int(min_visits), int(min_ccu)]
+        limit_clause = ""
+        limit_params: List[Any] = []
+        if limit and int(limit) > 0:
+            limit_clause = "LIMIT ?"
+            limit_params.append(int(limit))
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT universe_id FROM game_analytics "
+                    "WHERE contacts_checked_at IS NULL "
+                    "AND (" + qualified_clause + floor_clause + ") "
+                    "ORDER BY " + qualified_clause + " DESC, "
+                    "first_seen ASC, universe_id ASC "
+                    + limit_clause,
+                    where_params + order_params + limit_params,
+                ).fetchall()
+            return [int(r[0]) for r in rows]
+        except sqlite3.Error:
+            return []
 
 
 # --------------------------------------------------------------------------- #

@@ -1,4 +1,4 @@
-# RbxScout expander — Atlas Dev seed harvest + discovery-queue drain (every 30 min).
+# Studio Scouts expander — Atlas Dev seed harvest + discovery-queue drain (every 30 min).
 #
 # The sole discovery pipeline (ATLAS_PLAN_REVIEW.md): a daily 24h-throttled
 # harvest of atlasdev.gg/analyze enqueues mid-tier universe IDs into the
@@ -45,6 +45,10 @@ env:
   # volume). Flip-ready: set this repo Variable to your proxy worker URL(s)
   # and Atlas traffic shifts through them with zero code change.
   RBXSCOUT_SEARCH_PROXY_URLS: ${{ vars.RBXSCOUT_SEARCH_PROXY_URLS || '' }}
+  # Split catalog: the push uploads Discord links only as the ENCRYPTED
+  # contacts.bundle sidecar. The key lives in repo secrets (same hex value
+  # as the laptop's contacts.key and the Streamlit CONTACTS_KEY secret).
+  CONTACTS_KEY: ${{ secrets.CONTACTS_KEY || '' }}
   # Atlas harvest knobs (defaults live in scout_core.py):
   ATLAS_SWEEP_PAGES: ${{ vars.ATLAS_SWEEP_PAGES || '' }}
   ATLAS_STAT_PAGES: ${{ vars.ATLAS_STAT_PAGES || '' }}

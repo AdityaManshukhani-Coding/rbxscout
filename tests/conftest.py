@@ -8,6 +8,7 @@ at per-test temp directories so tests never touch real state files.
 import pytest
 
 import catalog_fetch
+import contacts_privacy
 import scout_core
 
 # Test-only password. Deliberately NOT the real deployment password: no
@@ -22,6 +23,11 @@ def _isolated_stores(tmp_path, monkeypatch):
     monkeypatch.setenv("SS_GATE_DIR", str(tmp_path / "gate"))
     monkeypatch.setenv("SS_TEST_BYPASS_GATE", "1")
     monkeypatch.setenv("APP_PASSWORD", TEST_PASSWORD)
+    # Split-catalog key isolation: tests must never see the developer's real
+    # contacts.key (nor a CONTACTS_KEY env), so encrypt/decrypt paths run
+    # keyless unless a test installs its own key into the tmp dir.
+    monkeypatch.setattr(contacts_privacy, "KEY_PATH", tmp_path / "contacts.key")
+    monkeypatch.delenv("CONTACTS_KEY", raising=False)
     # Process-wide caches (multi-user safety features) must not leak state
     # between tests: the shared contact-verdict memcache would otherwise
     # serve one test's mocked verdict to the next, and a 429 seen in one

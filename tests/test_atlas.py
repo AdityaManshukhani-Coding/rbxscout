@@ -116,6 +116,146 @@ def test_merge_carries_new_catalog_columns(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Nightly bounded contact sweep (frontier Discord checks, home IP only)
+# --------------------------------------------------------------------------- #
+
+
+class _SweepScout(RobloxPlatformScout):
+    """Records the pool scan_contacts was called with; verdicts hit."""
+
+    last_pool = None
+    all_pools: list = []
+
+    def __init__(self, db_path=None, **_ignored):
+        self.db_path = db_path
+        self.max_workers = 1
+        self.request_timeout = 1
+        self.session = None
+        self.has_cookie = False
+        self.last_contact_diagnostics = {}
+        self.last_scan = {"run_id": None}
+        self.last_metrics = {}
+        self.source_diagnostics = {}
+        self.blowup_watch_events = {}
+        self._own_run_ids = set()
+        self._init_sqlite()
+
+    def set_cookie(self, roblox_cookie):
+        self.has_cookie = bool(roblox_cookie)
+
+    def scan_contacts(self, universe_ids, force=False, run_id=None, progress_cb=None):
+        type(self).last_pool = list(universe_ids)
+        type(self).all_pools.append(list(universe_ids))
+        import pandas as pd
+
+        rows = [{
+            "universe_id": uid,
+            "has_discord": uid % 2 == 0,
+            "discord_url": "https://discord.gg/x" if uid % 2 == 0 else None,
+            "status": "OK" if uid % 2 == 0 else "No Contact Found",
+            "found_via": None,
+            "has_social_links": uid % 2 == 0,
+            "contacts_checked_at": "2026-09-24 20:00:00",
+        } for uid in universe_ids]
+        return pd.DataFrame(rows)
+
+
+def test_contact_sweep_budgets_frontier_then_stragglers(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    monkeypatch.setenv("RBXSCOUT_COOKIE", ".ROBLOSECURITY=test-cookie")
+    monkeypatch.setattr(atlas_home, "CONTACT_SWEEP_BUDGET", 3)
+    # Build the real schema first: contact_sweep constructs a scout whose
+    # _init_sqlite migrates in a fixed column order and cannot run against a
+    # hand-rolled minimal table.
+    _SweepScout(str(db))
+    with sqlite3.connect(str(db)) as conn:
+        # Frontier: two Atlas discoveries from today. Timestamps are relative
+        # to now — hardcoded dates silently age out of the sweep's rolling
+        # 24h window (this test rotted at 12:00 PDT on 2026-09-25).
+        conn.execute("INSERT INTO discovery_queue (universe_id, source, status, seen_at) "
+                     "VALUES (2, 'atlas_dev', 'pending', datetime('now', '-2 hours'))")
+        conn.execute("INSERT INTO discovery_queue (universe_id, source, status, seen_at) "
+                     "VALUES (4, 'atlas_dev', 'pending', datetime('now', '-3 hours'))")
+        # Straggler: qualified but never checked (older than the budget).
+        conn.execute(
+            "INSERT INTO game_analytics (universe_id, visits, ccu, first_seen) "
+            "VALUES (6, 30000, 30, datetime('now', '-20 days'))"
+        )
+    import scout_core as sc
+    monkeypatch.setattr(sc, "RobloxPlatformScout", _SweepScout)
+
+    stats = {}
+    checked = atlas_home.contact_sweep(db, stats)
+
+    assert checked == 3
+    assert _SweepScout.last_pool == [2, 4, 6]  # frontier first, then straggler
+    assert stats["contacts_checked"] == 3
+    with sqlite3.connect(str(db)) as conn:
+        stamp = conn.execute(
+            "SELECT last_universe_id FROM scan_pointers WHERE id='home_contact_sweep_at'"
+        ).fetchone()
+    assert stamp is not None  # 24h self-throttle stamped
+
+
+def test_contact_sweep_two_cookies_split_pool(tmp_path, monkeypatch):
+    """Two cookies = two parallel lanes over disjoint halves of the pool."""
+    db = tmp_path / "t.db"
+    monkeypatch.setenv("RBXSCOUT_COOKIE",
+                       ".ROBLOSECURITY=cookie-A||.ROBLOSECURITY=cookie-B")
+    monkeypatch.setattr(atlas_home, "CONTACT_SWEEP_BUDGET", 4)
+    _SweepScout(str(db))
+    with sqlite3.connect(str(db)) as conn:
+        for uid, hours in ((1, 1), (2, 2), (3, 3), (4, 4)):
+            conn.execute(
+                "INSERT INTO discovery_queue (universe_id, source, status, seen_at) "
+                "VALUES (?, 'atlas_dev', 'pending', datetime('now', '-' || ? || ' hours'))",
+                (uid, hours))
+    import scout_core as sc
+    monkeypatch.setattr(sc, "RobloxPlatformScout", _SweepScout)
+
+    stats = {}
+    _SweepScout.all_pools = []  # class-level accumulator: reset per test
+    checked = atlas_home.contact_sweep(db, stats)
+
+    assert checked == 4
+    assert stats["contacts_checked"] == 4
+    # Two lanes ran, each with its own cookie; together they cover the pool
+    # exactly once (disjoint halves — no game requested twice). Which lane
+    # records last_pool is scheduling-dependent, so assert on all lanes.
+    assert len(_SweepScout.all_pools) == 2
+    flat = sorted(uid for p in _SweepScout.all_pools for uid in p)
+    assert flat == [1, 2, 3, 4]
+    assert not set(_SweepScout.all_pools[0]) & set(_SweepScout.all_pools[1])
+
+
+def test_contact_sweep_throttled_when_already_run_today(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    monkeypatch.setenv("RBXSCOUT_COOKIE", ".ROBLOSECURITY=test-cookie")
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute(
+            "CREATE TABLE scan_pointers (id TEXT PRIMARY KEY, "
+            "last_universe_id INTEGER, updated_at TIMESTAMP)"
+        )
+        conn.execute(
+            "INSERT INTO scan_pointers VALUES ('home_contact_sweep_at', 0, CURRENT_TIMESTAMP)"
+        )
+    stats = {}
+    assert atlas_home.contact_sweep(db, stats) == 0
+    assert stats == {}  # nothing ran
+
+
+def test_contact_sweep_skips_without_cookie(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    monkeypatch.delenv("RBXSCOUT_COOKIE", raising=False)
+    # Isolate APP_DIR so real local_cookie*.txt files on this machine can't
+    # satisfy the sweep — the test must pass on a cookie-less checkout.
+    monkeypatch.setattr(atlas_home, "APP_DIR", tmp_path)
+    stats = {}
+    assert atlas_home.contact_sweep(db, stats) == 0
+    assert stats == {}
+
+
+# --------------------------------------------------------------------------- #
 # Parser
 # --------------------------------------------------------------------------- #
 
@@ -169,7 +309,7 @@ def test_harvest_sends_honest_user_agent(scout, monkeypatch):
     _patch_http(monkeypatch, pages={"*": INDEX_HTML}, calls=calls)
     scout.harvest_atlas_seeds(pages=1, stat_pages=0, throttle_hours=0)
     assert calls, "expected at least one Atlas request"
-    assert "RbxScout" in calls[0]["headers"]["User-Agent"]
+    assert "StudioScouts" in calls[0]["headers"]["User-Agent"]
     assert "atlasdev.gg/analyze?" in calls[0]["url"]
 
 

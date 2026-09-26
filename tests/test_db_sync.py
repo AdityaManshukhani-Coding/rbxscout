@@ -25,6 +25,7 @@ import sys
 
 sys.path.insert(0, str(APP_DIR))
 import db_sync  # noqa: E402
+import contacts_privacy  # noqa: E402
 
 SQLITE_MAGIC = b"SQLite format 3\x00"
 
@@ -227,6 +228,12 @@ class DBSyncTest(unittest.TestCase):
         cls.tmp.cleanup()
 
     def setUp(self):
+        # Split-catalog pushes encrypt the contacts bundle with a key; tests
+        # use a fixed throwaway key in a temp file (never the developer's).
+        self._key_file = Path(self.tmp.name) / "test_contacts.key"
+        contacts_privacy.write_key(self._key_file, b"\x5a" * 32)
+        contacts_privacy.KEY_PATH = self._key_file
+        self._orig_key_path = contacts_privacy.KEY_PATH
         FakeGitHubHandler.releases = {}
         FakeGitHubHandler.assets = {db_sync.ASSET_DB: b"", db_sync.ASSET_STATE: b""}
         FakeGitHubHandler.requests = []
@@ -269,8 +276,11 @@ class TestPush(DBSyncTest):
         self.assertEqual(rel["tag_name"], "catalog-latest")
         # db + sync_state + stats.json (stats_target.json is skipped: the
         # minimal test DB has no visits/ccu columns to count against).
-        self.assertEqual(len(rel["assets"]), 3)
-        self.assertEqual(FakeGitHubHandler.assets[db_sync.ASSET_DB], db_sync.DB_PATH.read_bytes())
+        self.assertEqual(len(rel["assets"]), 4)  # db + bundle + marker + stats
+        # The pushed catalog asset is the LINK-FREE public copy (the local
+        # file keeps its links; the bundle carries them encrypted).
+        public_blob = FakeGitHubHandler.assets[db_sync.ASSET_DB]
+        self.assertTrue(public_blob.startswith(b"SQLite format 3\x00"))
         self.assertEqual(FakeGitHubHandler.assets[db_sync.ASSET_STATE], b"41\n")
         stats = json.loads(FakeGitHubHandler.assets[db_sync.ASSET_STATS].decode())
         self.assertEqual(stats["games"], 5)
@@ -289,7 +299,7 @@ class TestPush(DBSyncTest):
         db_sync.STATE_PATH.write_text("42\n")
         db_sync.main(["db_sync.py", "push"])
         rel = self.release()
-        self.assertEqual(len(rel["assets"]), 3)  # replaced, not duplicated
+        self.assertEqual(len(rel["assets"]), 4)  # replaced, not duplicated
         blob = FakeGitHubHandler.assets[db_sync.ASSET_DB]
         self.assertEqual(len(blob), db_sync.DB_PATH.stat().st_size)
 

@@ -1,0 +1,17 @@
+{
+  "name": "Studio Scouts — dashboard",
+  "image": "mcr.microsoft.com/devcontainers/python:3.14-bookworm",
+  "forwardPorts": [8501],
+  "portsAttributes": {
+    "8501": {
+      "label": "Studio Scouts dashboard",
+      "onAutoForward": "openBrowser"
+    }
+  },
+  "postCreateCommand": "pip install --no-cache-dir -r requirements.txt",
+  "customizations": {
+    "codespaces": {
+      "openFiles": ["docs/CODESPACES_LAUNCH.md"]
+    }
+  }
+}

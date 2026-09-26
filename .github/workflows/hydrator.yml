@@ -1,4 +1,4 @@
-# RbxScout hydrator — the frequent pass.
+# Studio Scouts hydrator — the frequent pass.
 #
 # Refreshes stats (CCU / visits / favorites) for games ALREADY in the
 # catalog by draining the tier-due queue. Cloudflare's Cron Trigger invokes
@@ -48,6 +48,10 @@ concurrency:
 
 env:
   RBXSCOUT_SEARCH_PROXY_URLS: ''   # hydrator never touches the search API
+  # Split catalog: push uploads Discord links only as the ENCRYPTED
+  # contacts.bundle sidecar (key matches the laptop's contacts.key and the
+  # Streamlit CONTACTS_KEY secret).
+  CONTACTS_KEY: ${{ secrets.CONTACTS_KEY || '' }}
 
 jobs:
   hydrate:

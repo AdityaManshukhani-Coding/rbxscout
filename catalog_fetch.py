@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RbxScout hosted catalog loader — for the Streamlit Community Cloud app.
+"""Studio Scouts hosted catalog loader — for the Streamlit Community Cloud app.
 
 The 24/7 pipeline (Cloudflare Worker → GitHub Actions → release asset) is the
 single writer of the catalog. Readers — your laptop via ``db_sync.py pull``,
@@ -22,6 +22,12 @@ cannot be used as a cache. Therefore:
 Local mode is untouched: if ``rbx_scout.db`` exists in the repo (or
 ``RBXSCOUT_LOCAL_DB=1``), the app reads the local file exactly as before and
 this module is never used.
+
+Contacts split (see contacts_privacy.py): the release's DB asset carries no
+discord_url values. Hosted installs restore them from the encrypted
+``contacts.bundle`` sidecar asset — decrypted with CONTACTS_KEY (a Streamlit
+secret). Without the key the dashboard still works (counts, has_discord
+filter), it just cannot show actual invite links.
 """
 
 from __future__ import annotations
@@ -51,6 +57,13 @@ FRESHNESS_CHECK_INTERVAL = 300  # seconds
 
 # One source of truth with db_sync.py for the “meets target” bar used below.
 from db_sync import TARGET_MIN_CCU, TARGET_MIN_VISITS
+
+from contacts_privacy import (
+    ASSET_BUNDLE,
+    apply_bundle,
+    decrypt_bundle,
+    load_key,
+)
 
 def _default_cache_dir() -> Path:
     """Cache dir: env override, else ~/.cache/rbxscout, else /tmp fallback.
@@ -82,160 +95,6 @@ class CatalogFetchError(RuntimeError):
     """Raised when the hosted catalog cannot be fetched; message is user-facing."""
 
 
-# ---------------------------------------------------------------------------
-# Contact overlay (UI-resolved Discord state that must survive asset swaps)
-# ---------------------------------------------------------------------------
-
-# The dashboard's page-by-page Discord lookups write contact state into the
-# cache copy of the catalog — but the pipeline replaces that whole file on
-# every sync. Without protection, every resolved invite (and every checked
-# "no Discord" verdict) would silently vanish from the filter minutes after
-# the user finds it. The overlay is a small sidecar JSON keyed by universe_id
-# holding the contact columns; it is replayed onto each freshly downloaded
-# catalog copy so user-visible progress accumulates instead of evaporating.
-CONTACT_COLUMNS = (
-    "has_discord",
-    "discord_url",
-    "status",
-    "found_via",
-    "has_social_links",
-    "contacts_checked_at",
-)
-OVERLAY_MAX_ROWS = 50_000  # hard cap so the file can never grow unbounded
-
-
-def _overlay_path() -> Path:
-    return CACHE_DIR / "contact_overlay.json"
-
-
-def load_contact_overlay() -> dict:
-    """Return the overlay as ``{universe_id_str: {column: value}}``. Never raises."""
-    try:
-        data = json.loads(_overlay_path().read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-# Serializes overlay read-modify-write cycles across all user sessions (see
-# record_contacts: last-writer-wins here silently dropped other sessions'
-# freshly resolved verdicts).
-_OVERLAY_LOCK = threading.Lock()
-
-
-def _jsonable(value):
-    """Coerce pandas/numpy cell values (np.bool_, np.int64, Timestamp) to JSON types."""
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    item = getattr(value, "item", None)
-    if callable(item):
-        try:
-            return item()
-        except Exception:
-            pass
-    iso = getattr(value, "isoformat", None)
-    if callable(iso):
-        try:
-            return iso()
-        except Exception:
-            pass
-    return str(value)
-
-
-def record_contacts(records: dict) -> None:
-    """Merge UI-resolved contact rows into the overlay (best effort).
-
-    ``records`` maps universe_id -> dict with the CONTACT_COLUMNS keys.
-    A failed write must never break the caller: the authoritative write
-    already happened in the catalog DB; the overlay only protects it from
-    the next asset replacement.
-
-    Concurrency-safe: a process-wide lock serializes the read-modify-write
-    (two sessions merging at once used to lose one side's rows), and the
-    file is written to a temp file + os.replace so a reader can never see a
-    half-written JSON (a torn file used to parse as {} and the next write
-    then persisted ONLY the new records — silently erasing every verdict
-    accumulated so far).
-    """
-    if not records:
-        return
-    try:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        with _OVERLAY_LOCK:
-            overlay = load_contact_overlay()
-            for uid, rec in records.items():
-                try:
-                    overlay[str(int(uid))] = {
-                        col: _jsonable(rec.get(col)) for col in CONTACT_COLUMNS
-                    }
-                except (TypeError, ValueError, AttributeError):
-                    continue
-            if len(overlay) > OVERLAY_MAX_ROWS:
-                # Keep the newest rows by checked timestamp; oldest fall off.
-                keep = sorted(
-                    overlay.items(),
-                    key=lambda kv: str((kv[1] or {}).get("contacts_checked_at") or ""),
-                    reverse=True,
-                )[:OVERLAY_MAX_ROWS]
-                overlay = dict(keep)
-            fd, tmp_name = tempfile.mkstemp(dir=str(CACHE_DIR), suffix=".tmp")
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    json.dump(overlay, handle)
-                os.replace(tmp_name, _overlay_path())
-            except Exception:
-                try:
-                    os.unlink(tmp_name)
-                except OSError:
-                    pass
-                raise
-    except Exception:
-        pass  # overlay is an optimization, never a dependency
-
-
-def _replay_overlay(db_path: Path) -> None:
-    """Re-apply overlay rows onto a freshly installed catalog copy.
-
-    Runs right after the atomic swap in _download_and_install, so the new
-    file starts with every contact verdict the UI ever resolved. Best
-    effort: any error leaves the fresh download as-is.
-    """
-    overlay = load_contact_overlay()
-    if not overlay:
-        return
-    try:
-        import sqlite3
-
-        rows = [
-            (
-                bool((rec or {}).get("has_discord")),
-                (rec or {}).get("discord_url"),
-                (rec or {}).get("status"),
-                (rec or {}).get("found_via"),
-                bool((rec or {}).get("has_social_links")),
-                (rec or {}).get("contacts_checked_at"),
-                int(uid),
-                str((rec or {}).get("contacts_checked_at") or ""),
-            )
-            for uid, rec in overlay.items()
-        ]
-        conn = sqlite3.connect(str(db_path))
-        try:
-            with conn:
-                conn.executemany(
-                    "UPDATE game_analytics SET has_discord=?, discord_url=?, "
-                    "status=?, found_via=?, has_social_links=?, "
-                    "contacts_checked_at=? "
-                    "WHERE universe_id=? AND (contacts_checked_at IS NULL "
-                    "OR contacts_checked_at < ?)",
-                    rows,
-                )
-        finally:
-            conn.close()
-    except Exception:
-        pass  # a schema drift or corrupt overlay must never block downloads
-
-
 def is_hosted() -> bool:
     """Hosted mode = no local DB and not explicitly forced local.
 
@@ -264,7 +123,7 @@ def local_catalog_path() -> str:
 def _headers() -> dict:
     headers = {
         "Accept": "application/vnd.github+json",
-        "User-Agent": "rbxscout-catalog-fetch",
+        "User-Agent": "studioscouts-catalog-fetch",
         "X-GitHub-Api-Version": "2022-11-28",
     }
     # Optional token (only needed if the repo ever goes private). Anonymous
@@ -418,7 +277,7 @@ def _download_and_install(timeout: float, state: dict) -> Path:
     tmp = CACHE_DIR / (ASSET_DB + ".tmp")
     tmp.write_bytes(blob)
     tmp.replace(CACHE_DB_PATH)  # atomic swap: readers never see a partial file
-    _replay_overlay(CACHE_DB_PATH)  # restore UI-resolved contacts the swap erased
+    _restore_contacts_from_bundle(CACHE_DB_PATH)  # decrypt + re-join owner links
     state.update({
         "checked_at": time.time(),
         "remote": info,
@@ -429,13 +288,33 @@ def _download_and_install(timeout: float, state: dict) -> Path:
     return CACHE_DB_PATH
 
 
-def _asset_download_url() -> str:
+def _asset_download_url(asset_name: str = ASSET_DB) -> str:
     # Browser-style URL: GitHub redirects it to the signed S3 object. Works
     # anonymously for a public repo and follows redirects via urllib.
     return (
         f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/"
-        f"releases/download/{RELEASE_TAG}/{ASSET_DB}"
+        f"releases/download/{RELEASE_TAG}/{asset_name}"
     )
+
+
+def _restore_contacts_from_bundle(db_path: Path) -> None:
+    """Re-apply the owner's Discord links after installing the public copy.
+
+    The release DB asset is link-free by design; the encrypted sidecar holds
+    them. Runs only when a CONTACTS_KEY is available (Streamlit secret on
+    Cloud, contacts.key on the laptop) — without it the public copy stays
+    as-is, which is exactly the point of the split. Any failure is silent:
+    a degraded (link-free) catalog must never break the download.
+    """
+    try:
+        key = load_key()
+        if not key:
+            return
+        blob = _get_bytes(_asset_download_url(ASSET_BUNDLE), timeout=60.0)
+        payload = decrypt_bundle(key, blob)
+        apply_bundle(db_path, payload)
+    except Exception:
+        pass  # never let the contacts restore break the catalog install
 
 
 def stale_cache_fallback(exc: CatalogFetchError) -> Path | None:
@@ -481,6 +360,56 @@ def _reset_counts_cache() -> None:
     """Test/ops hook: drop the cached counters (fresh read on next call)."""
     with _COUNTS_CACHE_LOCK:
         _COUNTS_CACHE.clear()
+
+
+def contact_coverage(db_path: str | Path) -> dict:
+    """Discord contact coverage over the gate-qualified catalog.
+
+    Feeds the dashboard chip: '512 games with Discord · 1,240 of 9,571
+    checked'. Reads the same store the results table reads; any schema
+    surprise degrades the field to None (same defensive stance as
+    catalog_counts). ``target`` = games meeting the 20k/25 bar, ``checked``
+    = those with a stored contact verdict, ``hits`` = those with Discord.
+    """
+    import sqlite3
+
+    coverage = {"target": None, "checked": None, "hits": None}
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            qualified = (
+                "FROM game_analytics WHERE visits >= ? AND ccu >= ?"
+            )
+            coverage["target"] = int(conn.execute(
+                "SELECT COUNT(*) " + qualified,
+                (TARGET_MIN_VISITS, TARGET_MIN_CCU),
+            ).fetchone()[0])
+            coverage["checked"] = int(conn.execute(
+                "SELECT COUNT(*) " + qualified + " AND contacts_checked_at IS NOT NULL",
+                (TARGET_MIN_VISITS, TARGET_MIN_CCU),
+            ).fetchone()[0])
+            coverage["hits"] = int(conn.execute(
+                "SELECT COUNT(*) FROM game_analytics WHERE has_discord = 1"
+            ).fetchone()[0])
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass
+    return coverage
+
+
+def contact_coverage_cached(db_path: str | Path) -> dict:
+    """60-second cached contact_coverage (same rationale as catalog_counts)."""
+    key = "contacts:" + str(Path(db_path))
+    now = time.monotonic()
+    with _COUNTS_CACHE_LOCK:
+        entry = _COUNTS_CACHE.get(key)
+        if entry and now - entry[0] < COUNTS_CACHE_TTL:
+            return dict(entry[1])
+    value = contact_coverage(db_path)
+    with _COUNTS_CACHE_LOCK:
+        _COUNTS_CACHE[key] = (now, value)
+    return dict(value)
 
 
 def catalog_counts(db_path: str | Path) -> dict:
