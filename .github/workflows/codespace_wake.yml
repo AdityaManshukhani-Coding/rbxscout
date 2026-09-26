@@ -1,0 +1,75 @@
+# Wake the dashboard codespace on demand (dispatched by the Worker doorbell).
+#
+# The Worker's /app route dispatches this workflow when its health probe of the
+# codespace URL fails — i.e. the machine idle-stopped (GitHub's 60-min timeout)
+# or Streamlit died. This job starts the machine, re-publicizes port 8501 and
+# relaunches Streamlit, then verifies health. Runtime ~1–2 min; free on a
+# public repo.
+#
+# Requires repo secret CODESPACES_PAT: a classic PAT of the codespace owner
+# with scopes repo, workflow and codespace.
+name: codespace_wake
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codespace-wake
+  cancel-in-progress: false
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Wake codespace and launch the dashboard
+        env:
+          GH_TOKEN: ${{ secrets.CODESPACES_PAT }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "CODESPACES_PAT is not set — add a classic PAT (repo, workflow,"
+            echo "codespace scopes) at repo Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+          # Table layout: NAME REPOSITORY BRANCH STATE CREATED AT (row 1 is the
+          # header — take the first data row).
+          CS_NAME="$(gh codespace list 2>/dev/null | awk 'NR==2 {print $1; exit}')"
+          if [ -z "$CS_NAME" ]; then
+            echo "No codespace exists yet. Create one once at https://github.com/codespaces"
+            echo "on this repo and run scripts/codespaces_bootstrap.sh inside it."
+            exit 1
+          fi
+          echo "Waking codespace: $CS_NAME"
+
+          gh codespace start -c "$CS_NAME" 2>/dev/null || true
+          for _ in $(seq 1 40); do
+            STATE="$(gh codespace list 2>/dev/null | awk -v n="$CS_NAME" '$1==n {print $4}')"
+            [ "$STATE" = "Running" ] && break
+            sleep 5
+          done
+          STATE="$(gh codespace list 2>/dev/null | awk -v n="$CS_NAME" '$1==n {print $4}')"
+          [ "$STATE" = "Running" ] || { echo "Codespace did not reach Running in time"; exit 1; }
+
+          # Idempotent: no-op if the port is already Public.
+          gh codespace ports visibility 8501:public -c "$CS_NAME" 2>/dev/null || true
+
+          gh codespace ssh -c "$CS_NAME" -- '
+            pkill -f "streamlit run" 2>/dev/null || true; sleep 1
+            cd /workspaces/rbxscout 2>/dev/null || cd ~
+            nohup python -m streamlit run app.py \
+              --server.port=8501 --server.address=0.0.0.0 --server.headless=true \
+              --browser.gatherUsageStats=false >/tmp/streamlit.log 2>&1 &
+            for _ in $(seq 1 30); do
+              curl -sf http://127.0.0.1:8501/_stcore/health >/dev/null && { echo APP_HEALTHY; exit 0; }
+              sleep 2
+            done
+            echo APP_FAILED; tail -20 /tmp/streamlit.log; exit 1
+          '
+
+          echo "Dashboard live: https://${CS_NAME}-8501.app.github.dev"

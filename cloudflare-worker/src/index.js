@@ -1,5 +1,5 @@
 /**
- * Studio Scouts Cloudflare Worker.
+ * UpScale Scouting Tool Cloudflare Worker.
  *
  * This Worker has two jobs:
  *
@@ -11,6 +11,11 @@
  *    Expander (Atlas Dev harvest + discovery-queue drain). GitHub's internal
  *    `schedule` triggers are disabled in this repository, so Cloudflare is
  *    the only automatic clock.
+ * 3. Doorbell (GET /app): the permanent link users bookmark. If the Codespace
+ *    dashboard is healthy it 302s straight into it; if the codespace has
+ *    idle-stopped, it dispatches the codespace_wake.yml workflow (Actions
+ *    starts the machine + relaunches Streamlit) and serves a splash page that
+ *    auto-refreshes until the app is live.
  *
  * The GitHub token is a Worker secret (`GITHUB_TOKEN`) and is never returned
  * in a response or written to logs.
@@ -50,6 +55,7 @@ const GITHUB_API_VERSION = "2022-11-28";
 const GITHUB_WORKFLOWS = {
   hydrator: "hydrator.yml",
   expander: "expander.yml",
+  wake: "codespace_wake.yml",
 };
 const GITHUB_DISPATCH_ATTEMPTS = 3;
 const GITHUB_RETRY_MAX_DELAY_MS = 30_000;
@@ -66,6 +72,103 @@ const GITHUB_RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 // Leave the variable unset to disable the ping entirely.
 const DASHBOARD_KEEPALIVE_URL_KEY = "DASHBOARD_KEEPALIVE_URL";
 
+// Doorbell (24/7 concierge for the Codespace dashboard). GET /app is the ONE
+// permanent link handed to users. Behavior:
+//   app healthy   -> 302 straight to the dashboard (users never notice)
+//   app down      -> dispatch codespace_wake.yml (Actions starts the machine,
+//                    relaunches Streamlit) + serve a splash page that
+//                    auto-refreshes every 20 s until the app is up
+// The first user of the day waits ~1-2 min on the splash; everyone after
+// walks straight in. The machine still closes itself via GitHub's idle
+// timeout (60 min) — nothing here pings the codespace, so no hours burn
+// while nobody is using the app.
+// Guards keep scrapers or a stuck refresh from burning quota: at most one
+// wake dispatch per 2 min and 10 per hour (per isolate — best effort).
+const DOORBELL_PATH = "/app";
+const APP_PUBLIC_URL_KEY = "APP_PUBLIC_URL";
+const FALLBACK_APP_URL_KEY = "FALLBACK_APP_URL";
+const WAKE_COOLDOWN_MS = 2 * 60_000;
+const WAKE_MAX_PER_HOUR = 10;
+
+let lastWakeDispatchMs = 0;
+const wakeTimestamps = [];
+
+async function handleDoorbell(request, env, url) {
+  if (rateLimited(clientIp(request))) {
+    return new Response("rate limited", { status: 429, headers: CORS_HEADERS });
+  }
+
+  const appUrl = String(env[APP_PUBLIC_URL_KEY] || "").replace(/\/+$/, "");
+  const fallbackUrl = String(
+    env[FALLBACK_APP_URL_KEY] || env[DASHBOARD_KEEPALIVE_URL_KEY] || "",
+  ).replace(/\/+$/, "");
+
+  // Probe the app's health endpoint first: when it answers, the machine is up
+  // and the user should not even see the splash page. The health endpoint does
+  // not create a Streamlit session, so this probe never counts as app usage
+  // and never keeps the machine alive artificially.
+  if (appUrl) {
+    try {
+      const probe = await fetch(`${appUrl}/_stcore/health`, {
+        signal: AbortSignal.timeout(5_000),
+        cf: { cacheTtl: 0 },
+      });
+      if (probe.ok) {
+        return Response.redirect(appUrl, 302);
+      }
+    } catch {
+      // Down (machine stopped or app dead) — fall through to the wake path.
+    }
+  }
+
+  const now = Date.now();
+  while (wakeTimestamps.length && now - wakeTimestamps[0] > 3_600_000) {
+    wakeTimestamps.shift();
+  }
+  const canWake =
+    appUrl &&
+    now - lastWakeDispatchMs >= WAKE_COOLDOWN_MS &&
+    wakeTimestamps.length < WAKE_MAX_PER_HOUR;
+  if (canWake) {
+    lastWakeDispatchMs = now;
+    wakeTimestamps.push(now);
+    try {
+      await dispatchWorkflow(GITHUB_WORKFLOWS.wake, env);
+      console.log("doorbell: wake workflow dispatched");
+    } catch (error) {
+      // The splash page refresh loop is the recovery path: the next hit
+      // re-probes and re-dispatches once the cooldown has passed.
+      console.error(`doorbell wake dispatch failed: ${error}`);
+    }
+  }
+
+  const html = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="20">
+<title>Studio Scouts — waking up</title>
+<style>
+ body{font-family:system-ui,sans-serif;background:#0e1117;color:#fafafa;margin:0;display:flex;min-height:100vh;align-items:center;justify-content:center}
+ main{text-align:center;max-width:34rem;padding:2rem;line-height:1.5}
+ h1{font-size:1.35rem;font-weight:600}
+ .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#4ade80;animation:p 1s infinite alternate;margin-right:.5rem}
+ @keyframes p{to{opacity:.25}}
+ a{color:#7dd3fc}
+</style></head><body><main>
+ <h1><span class="dot"></span>Waking the dashboard…</h1>
+ <p>The app powers down automatically when nobody has used it for a while,
+ which keeps it free to run. It is restarting now — this page retries every
+ 20 seconds and will drop you straight in, usually within 1–2 minutes.</p>
+ <p><b>Keep this tab open.</b></p>
+ ${fallbackUrl ? `<p>In a hurry? A lightweight backup copy is always online:
+ <a href="${fallbackUrl}">open the backup app</a>.</p>` : ""}
+</main></body></html>`;
+  return new Response(html, {
+    status: canWake || wakeTimestamps.length ? 200 : 503,
+    headers: { "Content-Type": "text/html; charset=utf-8", ...CORS_HEADERS },
+  });
+}
+
 function keepAliveDue(scheduledAt) {
   return scheduledAt.getUTCHours() % 11 === 0 && scheduledAt.getUTCMinutes() < 5;
 }
@@ -76,7 +179,7 @@ async function pingDashboard(env) {
   try {
     const response = await fetch(url, {
       method: "GET",
-      headers: { "User-Agent": "studioscouts-keepalive" },
+      headers: { "User-Agent": "upscalescouting-keepalive" },
       // Streamlit's HTTP layer answers health checks without rendering a
       // session; a plain GET (no _stcore stream upgrade) is enough to count
       // as app traffic for hibernation purposes.
@@ -155,7 +258,7 @@ async function dispatchWorkflow(workflow, env) {
           Accept: "application/vnd.github+json",
           Authorization: `Bearer ${env.GITHUB_TOKEN}`,
           "Content-Type": "application/json",
-          "User-Agent": "studioscouts-cloudflare-scheduler",
+          "User-Agent": "upscalescouting-cloudflare-scheduler",
           "X-GitHub-Api-Version": GITHUB_API_VERSION,
         },
         body: JSON.stringify({ ref: GITHUB_REF }),
@@ -254,6 +357,9 @@ export default {
     if (request.method !== "GET") {
       return new Response("method not allowed", { status: 405, headers: CORS_HEADERS });
     }
+    if (url.pathname === DOORBELL_PATH) {
+      return handleDoorbell(request, env, url);
+    }
     // Atlas path-mirror: /https://atlasdev.gg/analyze?... — the full target
     // URL is the path suffix plus this request's query string. The target
     // body is returned verbatim; only atlasdev.gg is allowed.
@@ -277,7 +383,7 @@ export default {
       const upstreamHeaders = new Headers({
         Accept: "text/html,*/*",
         "Accept-Language": "en",
-        "User-Agent": request.headers.get("user-agent") || "studioscouts-atlas-mirror",
+        "User-Agent": request.headers.get("user-agent") || "upscalescouting-atlas-mirror",
       });
       const upstream = await fetch(targetUrl, {
         headers: upstreamHeaders,
@@ -305,7 +411,7 @@ export default {
     const upstreamUrl = UPSTREAM + url.pathname + url.search;
 
     const headers = new Headers({ Accept: "application/json" });
-    headers.set("User-Agent", request.headers.get("user-agent") || "studioscouts-proxy");
+    headers.set("User-Agent", request.headers.get("user-agent") || "upscalescouting-proxy");
     // Deliberately no cookies/auth forwarded — public endpoint only.
 
     let response;

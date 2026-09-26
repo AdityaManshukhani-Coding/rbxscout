@@ -1,4 +1,4 @@
-# Launching Studio Scouts from GitHub Codespaces (free, no card)
+# Launching UpScale Scouting Tool from GitHub Codespaces (free, no card)
 
 Your GitHub account includes **120 core-hours/month = 60 hours on a 2-core,
 8 GB machine** — comfortably enough for your 100-user launch. No credit card
@@ -94,12 +94,87 @@ Two dials decide how much of the 60 hours you actually burn:
 
    Then share the SAME URL again — it never changed.
 
+## 24/7 with zero laptop: the Worker doorbell
+
+The dream setup — open 24/7, auto-close after 1 idle hour, auto-wake when
+someone shows up, users in any timezone — is built. The bridge is the
+Cloudflare Worker your pipeline already runs (`cloudflare-worker/`): it is
+always on, and it can both probe the app and start the machine.
+
+**How a user visit flows:**
+
+```text
+user opens  https://rbx-search-proxy.<you>.workers.dev/app   (the ONE link)
+      │
+      ├─ app healthy? ──► 302 straight into the dashboard (instant)
+      │
+      └─ app down?    ──► Worker dispatches codespace_wake.yml
+                          (Actions starts the machine + relaunches Streamlit,
+                           ~1–2 min) and serves a splash page that
+                          auto-refreshes every 20 s until the app is live
+```
+
+After the machine has been idle for 60 minutes (GitHub's idle timeout) it
+stops itself and the meter pauses — nothing pings it. The next user's
+doorbell hit wakes everything again. Your 60 hours become "only the hours
+people actually use the app", spread across every timezone.
+
+**One-time setup (~10 minutes):**
+
+1. Create the codespace and run the bootstrap once (sections above) — the
+   machine must exist and have run `scripts/codespaces_bootstrap.sh` at
+   least once (port Public, deps installed).
+2. **Wake credential** — the wake workflow needs a token allowed to start
+   YOUR codespace:
+   - github.com/settings/tokens → **Generate new token (classic)** →
+     scopes `repo`, `workflow`, `codespace` → copy it.
+   - Repo → Settings → Secrets and variables → Actions → **New repository
+     secret** → name `CODESPACES_PAT`, paste the token.
+3. **Point the doorbell at your app** (from `cloudflare-worker/`):
+
+   ```bash
+   npx wrangler login                      # the account that owns the Worker
+   npx wrangler vars put APP_PUBLIC_URL    # paste:
+                                           # https://<codespace-name>-8501.app.github.dev
+   ```
+
+   Optional: `npx wrangler vars put FALLBACK_APP_URL https://rbxscout.streamlit.app/`
+   (a second URL shown on the splash page while waking; defaults to the
+   keep-alive URL already configured).
+4. Deploy the updated worker once: `npx wrangler deploy`.
+
+**Give users the doorbell link**, not the direct codespace URL:
+`https://rbx-search-proxy.<your-subdomain>.workers.dev/app` — it never
+changes, works from any timezone, and wakes the machine when needed. The
+direct `*.app.github.dev` URL remains your internal shortcut.
+
+**Failure modes (all have a floor):**
+
+| Problem | What happens |
+|---|---|
+| PAT missing/expired | wake workflow fails; splash keeps retrying; fallback link still works |
+| No codespace yet | same — create it once (step 1) and the next hit wakes it |
+| Wake throttled (2-min cooldown, 10/hour) | splash keeps refreshing; next allowed hit dispatches |
+| Worker down (rare) | Streamlit Cloud fallback is independent of it |
+
+**Quota check:** even with the doorbell, only real usage hours burn. If
+usage is sparse enough that the machine fully closes between visits, a
+busy day of scattered visitors might total 4–6 machine hours (8–12
+core-hours) — **10–15 such days per free month**. If visitors keep it
+continuously alive for, say, 8 h/day (never a 60-min gap), that is 16
+core-hours/day ≈ 7 days/month. Watch the meter at
+<https://github.com/settings/billing>; when the pace outgrows the quota,
+move the app to a paid box (the `Dockerfile` is ready) and the doorbell
+simply points at the new URL.
+
 ## The corrected usage model (read this twice)
 
 - **Stopped = free.** The 60-hour meter only runs while the machine is up.
   Hours do not tick away while it sleeps.
-- **Stopped ≠ auto-wake.** A user opening the URL of a stopped codespace
-  gets a connection error — visitors CANNOT wake it. Only you can, via
+- **Stopped ≠ auto-wake — by default.** A user opening the direct codespace
+  URL of a stopped machine gets a connection error. The **doorbell** above
+  is the fix: users open the Worker's `/app` link and the machine wakes
+  itself; only direct links dead-end. Manual wake remains available via
   github.com/codespaces or `scripts/codespace_resume.sh`.
 - **Therefore:** treat it like a shop. You open (resume + keepalive) when
   your users are expected, close (Ctrl-C, 1 h later it sleeps) when not.

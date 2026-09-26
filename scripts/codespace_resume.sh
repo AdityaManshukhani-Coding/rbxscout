@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Studio Scouts — "open for business": wake a stopped codespace and bring the
+# UpScale Scouting Tool — "open for business": wake a stopped codespace and bring the
 # dashboard back up in one command from the Mac.
 #
 #   bash scripts/codespace_resume.sh          # find + start + relaunch app
@@ -40,7 +40,9 @@ fi
 echo "Relaunching Streamlit inside the codespace..."
 gh codespace ssh -c "$CS_NAME" -- '
   pkill -f "streamlit run" 2>/dev/null; sleep 1
-  cd /workspaces/rbxscout 2>/dev/null || cd $(gh_repo_dir 2>/dev/null) || cd ~
+  cd /workspaces/rbxscout 2>/dev/null \
+    || cd "$(find /workspaces -maxdepth 2 -name app.py -printf "%h\n" 2>/dev/null | head -1)" \
+    || cd ~
   nohup python -m streamlit run app.py --server.port=8501 --server.address=0.0.0.0 \
     --server.headless=true --browser.gatherUsageStats=false \
     > /tmp/streamlit.log 2>&1 &
