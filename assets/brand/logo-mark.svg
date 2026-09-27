@@ -1,8 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
-  <!-- UpScale mark: the U launches the arrow. The U uses currentColor so it
-       recolors with context; the arrow always stays UpScale Orange. The
-       two-tone badge version is logo-mark-badge.svg. -->
-  <path d="M19 15 V32 A13 13 0 0 0 45 32 V13" stroke="currentColor" stroke-width="11"/>
-  <rect x="39.5" y="9" width="11" height="12" fill="#FF6E01"/>
-  <path d="M45 1 L31.5 15.5 H58.5 Z" fill="#FF6E01"/>
-</svg>

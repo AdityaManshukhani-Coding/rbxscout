@@ -17,17 +17,17 @@ use the `us_` prefix.
 
 ## The mark
 
-The owner's logo, redrawn as vectors: a bold **U** whose right stem launches
-an **upward arrow** — up (the U) and scale (the arrow). The U is white, the
-arrow is always UpScale Orange; the two-tone pairing only works on a dark
-surface (the black app-icon badge supplies that by default).
+The owner's logo image, used verbatim: a bold white **U** whose right stem
+launches an **orange upward arrow** — up (the U) and scale (the arrow). The
+canonical file is `assets/brand/source-mark.png` (transparent background);
+every other raster is composited from it, never redrawn.
 
 | File | Use |
 | --- | --- |
-| `assets/brand/logo-mark.svg` | Inline/monochrome contexts; the U uses `currentColor`, the arrow stays orange |
-| `assets/brand/logo-mark-badge.svg` | App-icon contexts (dark badge baked in) |
-| `assets/brand/wordmark.svg` | Full lockup for docs, README, social cards |
-| `assets/brand/logo-mark-{192,512}.png` | Raster badge for UI surfaces that need PNG |
+| `assets/brand/source-mark.png` | The canonical mark — do not edit; replace to rebrand |
+| `assets/brand/logo-mark.png` | Mark alone, normalized 512px transparent |
+| `assets/brand/logo-mark-badge.png` | Mark on the black app-icon badge (512) |
+| `assets/brand/logo-mark-192.png` | Badge raster for sidebar / gate |
 | `assets/brand/favicon/*` | Browser favicon set + apple-touch-icon |
 
 Regenerate everything with `python generate_brand_assets.py` (Pillow).
@@ -51,8 +51,9 @@ text on white; the palette is built dark-first.
 ## Type
 
 System sans stack (Streamlit default) — no webfont, keeps Cloud deploys fast.
-Wordmark sets "Up**Scale**" bold 700 with "Scale" in UpScale Orange;
-labels/eyebrows are uppercase with wide letter-spacing (0.05em+).
+The UI wordmark is HTML/CSS: "Up**Scale**" bold 700 with "Scale" in
+UpScale Orange; labels/eyebrows are uppercase with wide letter-spacing
+(0.05em+).
 
 ## Voice
 

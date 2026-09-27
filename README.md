@@ -1,7 +1,7 @@
 # UpScale Scouting Tool — 24/7 Roblox Game Scout
 
 <p>
-  <img src="assets/brand/logo-mark-badge.svg" width="56" alt="UpScale mark" align="left">
+  <img src="assets/brand/logo-mark-badge.png" width="56" alt="UpScale mark" align="left">
   <strong>Up<span style="color:#FF6E01">Scale</span> Scouting Tool</strong> — a scout for
   Roblox games: it watches, it scans, it finds the contact.
 </p>
