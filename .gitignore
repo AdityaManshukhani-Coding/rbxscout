@@ -70,3 +70,6 @@ FIXES.md
 rbx_scout.db
 rbx_scout.db.sync_state
 contacts_backup.bundle
+
+# --- capacity metering state (per-container session/queue bookkeeping) ---
+.capacity/

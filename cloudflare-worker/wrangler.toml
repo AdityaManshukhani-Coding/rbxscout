@@ -15,21 +15,8 @@ crons = ["*/5 * * * *"]
 # pings it only every 11 hours (00:00, 11:00, 22:00 UTC — hours divisible
 # by 11), always landing inside Streamlit Cloud's 12 h idle timeout.
 # Public URL, so a plain variable is fine (not a secret).
-#
-# Doorbell (GET /app) variables — the permanent user-facing link:
-#   APP_PUBLIC_URL   the codespace dashboard URL, e.g.
-#                    "https://<codespace-name>-8501.app.github.dev"
-#                    Set it once after creating the codespace; update it only
-#                    if you delete and recreate the codespace. Leave empty to
-#                    disable the doorbell (it then serves the fallback only).
-#   FALLBACK_APP_URL optional second URL shown on the splash page (and used as
-#                    the redirect target if APP_PUBLIC_URL is empty) — the
-#                    Streamlit Cloud copy is the natural fallback. Defaults to
-#                    DASHBOARD_KEEPALIVE_URL when unset.
 [vars]
 DASHBOARD_KEEPALIVE_URL = "https://rbxscout.streamlit.app/"
-APP_PUBLIC_URL = ""
-FALLBACK_APP_URL = ""
 
 # Optional: pin a custom route after adding your zone to the account, e.g.
 # routes = [{ pattern = "rbx-proxy.example.com", custom_domain = true }]

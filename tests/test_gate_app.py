@@ -4,6 +4,7 @@ import pytest
 from streamlit.testing.v1 import AppTest
 
 import app
+import capacity
 import gate
 from conftest import TEST_PASSWORD
 
@@ -38,6 +39,9 @@ def _gate_state(tmp_path, monkeypatch):
     monkeypatch.setenv("SS_GATE_DIR", str(tmp_path / "gate"))
     monkeypatch.setenv("APP_PASSWORD", TEST_PASSWORD)
     monkeypatch.delenv("SS_TEST_BYPASS_GATE", raising=False)
+    # Capacity metering has its own dedicated tests; gate tests exercise the
+    # unlocked path straight through it.
+    monkeypatch.setenv("SS_CAPACITY_TEST_BYPASS", "1")
     return tmp_path / "gate"
 
 

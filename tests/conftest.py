@@ -21,6 +21,9 @@ TEST_PASSWORD = "test-pass-1234"
 def _isolated_stores(tmp_path, monkeypatch):
     monkeypatch.setenv("SS_PROFILE_DIR", str(tmp_path / "profiles"))
     monkeypatch.setenv("SS_GATE_DIR", str(tmp_path / "gate"))
+    # Capacity metering state: per-test directory so session counts never
+    # leak between tests (15 slots fill up fast under a big suite).
+    monkeypatch.setenv("SS_CAPACITY_DIR", str(tmp_path / "capacity"))
     monkeypatch.setenv("SS_TEST_BYPASS_GATE", "1")
     monkeypatch.setenv("APP_PASSWORD", TEST_PASSWORD)
     # Split-catalog key isolation: tests must never see the developer's real

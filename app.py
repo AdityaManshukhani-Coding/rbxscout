@@ -34,6 +34,7 @@ from scout_core import (
     render_outreach_message,
     truncate,
 )
+import capacity
 import catalog_fetch
 import gate
 import profile_store
@@ -315,7 +316,8 @@ def demo_dataframe() -> pd.DataFrame:
 # Device profile: remembers you across refreshes and back-navigation.
 # --------------------------------------------------------------------------- #
 
-_PROFILE_FIELDS = (        "discord_name",
+_PROFILE_FIELDS = (        "discord_filter_radio",
+    "discord_name",
     "discord_user_id",
     "message_template",
     "message_variant",
@@ -797,6 +799,19 @@ def render_onboarding() -> bool:
 
 _restored = initialize_session()
 _render_gate()  # private site: nothing below renders without the password
+
+# --- Capacity metering (free-container self-protection) -------------------- #
+# 1 GB ceiling, no auto-scaling: the app meters itself. First the watchdog
+# fragment (it may have observed an expiry/dead-slot release since the last
+# full run), then the admission decision for THIS rerun. Queue position and
+# the session countdown render right after (queue screen st.stop()s).
+if os.environ.get("SS_TEST_BYPASS_GATE") != "1" and os.environ.get("SS_CAPACITY_TEST_BYPASS") != "1":
+    _cap_ref = _device_ref()
+    if capacity.ensure_session(_cap_ref):
+        capacity.render_session_chip(_cap_ref)
+    else:
+        capacity.render_queue_screen(_cap_ref)
+        st.stop()
 if _restored and st.session_state.onboarding_complete:
     # Returning scout: auto-load their results once per session instead of
     # dropping them on an empty table after a refresh.
@@ -1083,31 +1098,11 @@ with st.sidebar.expander("Current target", expanded=True):
         persist_state="session",
     )
     st.caption("Targets filter your results the moment you sync. New games appear as the 24/7 pipeline discovers them.")
+    if st.button("Apply filters", type="primary", width="stretch", key="apply_filters"):
+        st.session_state.contact_page = 1
+        st.rerun()
 
-with st.sidebar.expander("Scan settings", expanded=False):
-    with st.sidebar.expander("This device", expanded=False):
-        st.caption(
-            "Your details (name, User ID, targets, template, progress) are "
-            "remembered on this device, so refreshes and back-navigation keep you "
-            "where you were."
-        )
-        if st.button("Forget this device", width="stretch", key="forget_device"):
-            ref = _device_ref()
-            if ref:
-                profile_store.clear_profile(ref)
-                gate.forget_unlock(ref)
-            had_device = "_device_ref" in st.session_state or "_device_cooked" in st.session_state
-            st.session_state.clear()
-            # Keep the tab-level device flags so clearing the profile does not
-            # re-trigger the one-shot cookie-mint reload script.
-            if had_device:
-                st.session_state._device_cooked = True
-            if ref:
-                st.session_state._device_ref = ref
-            gate.lockdown()  # back to the password screen, signed out
-            st.rerun()
-
-with st.sidebar.expander("Outreach message", expanded=False):
+with st.sidebar.expander("Your message", expanded=False):
     st.radio(
         "Starter message",
         options=_message_variant_options(),
@@ -1147,7 +1142,26 @@ with st.sidebar.expander("Outreach message", expanded=False):
         "above to customize what gets rotated."
     )
 
-sync = st.sidebar.button("Sync live data", type="primary", width="stretch", key="sync_live_data")
+if st.sidebar.button("Forget this device", width="stretch", key="forget_device"):
+    ref = _device_ref()
+    if ref:
+        profile_store.clear_profile(ref)
+        gate.forget_unlock(ref)
+        capacity.leave(ref)  # release the slot and the queue place too
+    had_device = "_device_ref" in st.session_state or "_device_cooked" in st.session_state
+    st.session_state.clear()
+    # Keep the tab-level device flags so clearing the profile does not
+    # re-trigger the one-shot cookie-mint reload script.
+    if had_device:
+        st.session_state._device_cooked = True
+    if ref:
+        st.session_state._device_ref = ref
+    gate.lockdown()  # back to the password screen, signed out
+    st.rerun()
+
+sync = st.sidebar.button(
+    "Sync live data", type="primary", width="stretch", key="sync_live_data"
+)
 
 if sync or st.session_state.pending_initial_scan:
     _profile_save()  # targets/identity snapshot rides along with the scan
@@ -1253,7 +1267,7 @@ if is_watch_view:
     selected_genres = []
 else:
     st.sidebar.header("Scout filters")
-    search = st.sidebar.text_input("Search game or creator", placeholder="e.g. blox, tycoon...")
+    search = ""
 
     # Discord contact filter (re-added 2026-09-24). Applies AFTER metric
     # filtering so it never changes which pages get contact checks; it only
@@ -1279,26 +1293,7 @@ else:
             )
     except Exception:
         pass  # a coverage read must never break the filter render
-
-    # Genre is a metric filter, so it is applied before contact requests.
-    genres = sorted(
-        str(g) for g in df["genre"].dropna().unique() if g and str(g) != "Unknown"
-    )
-    # The genre multiselect carries an explicit key so its selections can be
-    # sanitized BEFORE the widget renders. Streamlit raises
-    # StreamlitAPIException the instant a multiselect's session value names
-    # an option missing from the current options list — which happens when
-    # the picked genre no longer exists in the freshly loaded data (sync
-    # with different targets, demo/live data swap). That exception aborts
-    # the whole script and the page goes grey and unclickable. Dropping
-    # stale labels first makes the ✕ click (and any stale selection) fall
-    # back to the remaining valid genres with the visits/CCU targets
-    # untouched.
-    GENRE_KEY = "genre_multiselect"
-    picked_genres = st.session_state.get(GENRE_KEY) or []
-    if picked_genres and not set(picked_genres).issubset(set(genres)):
-        st.session_state[GENRE_KEY] = [g for g in picked_genres if g in set(genres)]
-    selected_genres = st.sidebar.multiselect("Genre", options=genres, key=GENRE_KEY)
+    selected_genres = []
 
 # Apply only metric-known filters when deciding which contact page to fetch.
 metric_filtered = apply_filters(
