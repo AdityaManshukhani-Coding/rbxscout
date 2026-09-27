@@ -42,6 +42,30 @@ from pathlib import Path
 APP_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(APP_DIR))
 
+# Single-instance guard (incident 2026-09-27): a transient duplicate burst at
+# 19:43 left several atlas_home processes alive at once and their nightly
+# contact sweeps raced on rbx_scout.db ("unable to open database file"),
+# killing the sweep 20 minutes later. flock() is auto-released by the OS if
+# the holder dies — no stale-lock cleanup is ever needed.
+_INSTANCE_LOCK = APP_DIR / "logs" / "atlas_home_instance.lock"
+_INSTANCE_FH = None  # module ref keeps the fd (and the lock) alive for life
+
+
+def _acquire_instance_lock() -> bool:
+    """True if this process is the sole atlas_home instance (lock held)."""
+    import fcntl
+
+    global _INSTANCE_FH
+    _INSTANCE_LOCK.parent.mkdir(exist_ok=True)
+    _INSTANCE_FH = _INSTANCE_LOCK.open("w")
+    try:
+        fcntl.flock(_INSTANCE_FH, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        _INSTANCE_FH.close()
+        _INSTANCE_FH = None
+        return False
+    return True
+
 LOG_DIR = APP_DIR / "logs"
 LOG_FILE = LOG_DIR / "atlas_home.log"
 
@@ -405,6 +429,11 @@ def main() -> int:
     parser.add_argument("--force", action="store_true",
                         help="ignore the 24h Atlas self-throttle (throttle_hours=0)")
     args = parser.parse_args()
+
+    if not _acquire_instance_lock():
+        log("another atlas_home instance is already running — exiting "
+            "(single-instance guard)")
+        return 0
 
     log("=" * 62)
     log("ATLAS HOME HARVEST — start")
