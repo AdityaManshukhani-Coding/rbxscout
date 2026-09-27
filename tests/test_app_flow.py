@@ -92,8 +92,9 @@ def test_render_fills_name_and_game_tags():
     assert "Blox Fruits" in message
     assert "[Your Name]" not in message
     assert "[Game Name]" not in message
-    assert "I'm dev_razor10 from UpScale" in message
-    assert "impressed by **Blox Fruits**" in message
+    assert "I'm [Your Name] from UpScale" not in message
+    assert "caught our eye" in message and "Blox Fruits" in message
+    assert "temporary percentage of revenue" in message
 
 
 def test_render_keeps_tag_when_name_missing():
@@ -674,10 +675,10 @@ def test_downcast_frame_shrinks_numerics_and_preserves_values():
     assert slim["title"].tolist() == ["a", "b", "c"], "strings untouched"
 
 
-def test_sidebar_has_discord_filter_radio_and_coverage_chip(monkeypatch):
-    """The Discord contact filter returned 2026-09-24 (user request): a
-    sidebar radio (All / Discord available / No Discord) plus a coverage
-    chip showing how much of the qualified catalog carries verdicts."""
+def test_sidebar_has_discord_filter_radio_without_coverage_chip(monkeypatch):
+    """The Discord contact filter (2026-09-24): a sidebar radio
+    (All / Discord available / No Discord). The coverage chip was removed
+    (2026-09-27, user request) — it must not render anywhere."""
     at = _render_dashboard()
     assert not at.exception
     radios = [r for r in at.sidebar.radio if (r.key or "") == "discord_filter_radio"]
@@ -685,10 +686,12 @@ def test_sidebar_has_discord_filter_radio_and_coverage_chip(monkeypatch):
     options = radios[0].options
     assert len(options) == 3
     assert any("Discord" in str(o) for o in options)
-    # Coverage chip sits in the sidebar.
-    assert any("checked" in (c.value or "") for c in at.sidebar.caption), [
-        c.value for c in at.sidebar.caption
-    ]
+    # The coverage chip is gone from every surface.
+    sidebar_all = " ".join(
+        str(el.value) for el in at.sidebar.caption
+    ) + " ".join(el.proto.body for el in at.sidebar.markdown)
+    assert "games with Discord ·" not in sidebar_all
+    assert "checked" not in sidebar_all
     # The old removal-era banner must stay gone.
     infos = [w.value for w in at.info]
     assert not any("known contact state" in v for v in infos)

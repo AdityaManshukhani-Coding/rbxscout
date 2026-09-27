@@ -50,6 +50,30 @@ SESSION_SECONDS = max(60.0, float(os.environ.get("SS_SESSION_MINUTES", "15") or 
 HEARTBEAT_TIMEOUT = 90.0  # no ping for 90 s == tab closed == slot released
 TICKER_SECONDS = max(5, int(os.environ.get("SS_CAPACITY_TICKER_SECONDS", "15") or 15))
 
+# Client-side countdown: the chip re-renders every TICKER_SECONDS, so the
+# displayed mm:ss used to freeze and jump a full block at a time. This script
+# ticks the [data-ss-session] element every second in the browser — zero
+# server traffic, and every rerun resyncs it to the server's truth.
+_SESSION_TICK_SCRIPT = r"""
+<script>
+(function () {
+  if (window.__ssSessionTick) { return; }
+  var tick = function () {
+    var el = document.querySelector('[data-ss-session]');
+    if (!el) { return; }
+    var m = /([0-9]+):([0-9]{2})/.exec(el.textContent);
+    if (!m) { return; }
+    var total = parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+    if (!(total > 0)) { return; }
+    total -= 1;
+    var mm = Math.floor(total / 60), ss = total % 60;
+    el.textContent = mm + ':' + (ss < 10 ? '0' : '') + ss + ' left';
+  };
+  window.__ssSessionTick = window.setInterval(tick, 1000);
+})();
+</script>
+"""
+
 _STATE_LOCK = threading.Lock()  # serializes file read-modify-write cycles
 
 
@@ -424,3 +448,4 @@ def render_session_chip(ref: str | None) -> None:
         unsafe_allow_html=True,
     )
     st.sidebar.caption("Session limit: 15 minutes. When time is up you rejoin the queue and keep all your saved details.")
+    st.html(_SESSION_TICK_SCRIPT, unsafe_allow_javascript=True)

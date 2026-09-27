@@ -1280,19 +1280,6 @@ else:
              "'No Discord' keeps games checked and found without one. "
              "Unchecked games disappear from both narrowed views.",
     )
-    # Coverage chip: how much of the qualified catalog carries a verdict.
-    # Grows nightly (backfill + Atlas frontier sweep) — visible proof the
-    # 'With Discord' view is filling in rather than honestly near-empty.
-    try:
-        _coverage = catalog_fetch.contact_coverage_cached(DB_PATH)
-        _cov_target = _coverage.get("target")
-        if _cov_target:
-            st.sidebar.caption(
-                f"🟣 {_coverage.get('hits', 0):,} games with Discord · "
-                f"{_coverage.get('checked', 0):,} of {_cov_target:,} checked"
-            )
-    except Exception:
-        pass  # a coverage read must never break the filter render
     selected_genres = []
 
 # Apply only metric-known filters when deciding which contact page to fetch.

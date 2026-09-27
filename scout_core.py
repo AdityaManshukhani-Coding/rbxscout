@@ -115,136 +115,67 @@ DISCORD_REGEX = (
 
 DISCORD_LOGO_URL = "https://cdn.simpleicons.org/discord/5865F2"
 
-# Default outreach message copied per game in the dashboard. The [Your Name]
-# and [Game Name] tags are placeholders: they are filled in automatically
-# when the user copies a message (name from the welcome flow, game from the
-# row's title). Users may edit the template freely in the welcome flow or
-# sidebar, but the tags must stay for auto-fill to keep working.
+# Default outreach messages copied per game in the dashboard. Placeholder
+# tags — [User] (the game owner), [Your Name], [Game Name] — are filled in
+# automatically when the user copies a message (name from the welcome flow,
+# game from the row's title; [User] stays a tag for Discord mention/name
+# handling at copy time). Users may edit the template freely in the welcome
+# flow or sidebar, but the tags must stay for auto-fill to keep working.
+#
+# The model every variant describes (owner's wording, 2026-09-27): UpScale
+# takes a temporary percentage of revenue for a set period, provides
+# dedicated PTR support and LiveOps, and when the term ends full revenue and
+# control return to the developer who keeps everything built during the
+# partnership. No portfolio links, no sale/investment framing.
 DEFAULT_MESSAGE_TEMPLATE = """\
-Hey,
+Hey [User],
 
-I'm [Your Name] from UpScale. We help Roblox developers scale, fund, and monetize their games by connecting them with leading industry partners.
+I'm [Your Name] from UpScale. At UpScale, we take a temporary percentage of revenue for a set period while providing our partners with dedicated PTR support and LiveOps. Once the term ends, full revenue and control return to you, and you keep everything built during the partnership.
 
-We’ve been following your progress and are really impressed by **[Game Name]**. I'm reaching out to see if you'd be open to discussing potential growth opportunities—whether that's selling a percentage of the game, securing investment/funding, or tapping into LiveOps, publishing, and marketing support.
+[Game Name] recently caught our eye, and we really love where you're taking the project. I wanted to see if you're open to exploring ways to scale it?
 
-I directly represent studios and investors like Jae Studio, Khalid Games, Ascend Studios, and several others (portfolio references below):
-
-* https://jaeceo.com/
-* https://spong.pro/
-* https://www.vexedinteractive.com/
-* https://summitinteractive.co.uk/
-* https://playastudios.org/
-* https://games.worldent.online/
-
-If you're open to exploring options, I'd love to share a few details and see what makes the most sense for your project.
-
-Looking forward to connecting!
-
-Best regards,
-
-**[Your Name]**
-
-UpScale"""
+If you're up for a quick look, I can answer any extra questions."""
 
 # Four more phrasings of the same outreach, so a scout can rotate between
 # copies and Discord's anti-spam heuristics see varied text instead of one
-# identical message pasted at 20 servers. Every variant keeps the [Your Name]
-# and [Game Name] tags (render_outreach_message fills them) and the same
-# portfolio links; openings, closings and sentence structures differ.
+# identical message pasted at 20 servers. Every variant keeps the [User],
+# [Your Name] and [Game Name] tags (render_outreach_message fills them) and
+# the same revenue-share/PTR/LiveOps model; openings, closings and sentence
+# structures differ.
 DEFAULT_MESSAGE_TEMPLATES = (
     DEFAULT_MESSAGE_TEMPLATE,
     """\
-Hi there,
+Hi [User],
 
-[Your Name] here, reaching out on behalf of UpScale. We connect Roblox developers with industry partners who help their games grow and earn more.
+[Your Name] here, from UpScale. Our model is simple: we take a temporary percentage of revenue for a set period, and in exchange our partners get dedicated PTR support and LiveOps. When the term ends, full revenue and control come back to you — everything built during the partnership stays yours.
 
-Your work on **[Game Name]** caught our team's eye — the momentum around it is hard to miss. I wanted to ask whether you'd be interested in a conversation about where the game could go next: a partial sale, outside investment, or hands-on publishing, LiveOps and marketing support.
+**[Game Name]** caught our eye recently, and honestly, we love the direction you're taking it. Would you be open to exploring a few ways to scale it?
 
-The studios and investors I work with directly include Jae Studio, Khalid Games, Ascend Studios and others — a few portfolio references:
-
-* https://jaeceo.com/
-* https://spong.pro/
-* https://www.vexedinteractive.com/
-* https://summitinteractive.co.uk/
-* https://playastudios.org/
-* https://games.worldent.online/
-
-If any of that sounds worth a chat, I'm happy to walk you through the details and see what fits your project.
-
-Hope to hear from you,
-
-**[Your Name]**
-
-UpScale""",
+Happy to answer any questions — a quick look costs you nothing.""",
     """\
-Hello!
+Hey [User],
 
-My name is [Your Name] and I scout for UpScale, a team that helps Roblox developers scale their games, secure funding and unlock new revenue by matching them with leading industry partners.
+I'm [Your Name] with UpScale. Here's how we work: UpScale takes a temporary cut of revenue for a fixed period while providing dedicated PTR support and LiveOps to our partners. Once that term ends, full revenue and control return to you, and you keep everything that was built along the way.
 
-We've had our eye on **[Game Name]** for a while — genuinely impressive growth. The reason I'm writing: would you be open to exploring growth opportunities? That could mean selling a percentage of the game, bringing in investment, or plugging into publishing, LiveOps and marketing support.
+We recently came across **[Game Name]** and really like where you're taking the project. I'd love to see if you're open to exploring ways to scale it.
 
-On our side, I represent studios and investors such as Jae Studio, Khalid Games, Ascend Studios and several more (a few portfolio links below):
-
-* https://jaeceo.com/
-* https://spong.pro/
-* https://www.vexedinteractive.com/
-* https://summitinteractive.co.uk/
-* https://playastudios.org/
-* https://games.worldent.online/
-
-Open to a quick conversation? I'd love to share the details and find what makes sense for your game.
-
-Best,
-
-**[Your Name]**
-
-UpScale""",
+If you're up for a quick chat, I can answer any extra questions you have.""",
     """\
-Hey [Game Name] team,
+Hi [User],
 
-I'm [Your Name] with UpScale. We partner with Roblox developers to help their games scale, raise funding and monetize better — by connecting them with leading industry partners.
+[Your Name] from UpScale here. Our partnership model: a temporary percentage of revenue for a set period, with dedicated PTR support and LiveOps provided throughout. When the term is over, full revenue and control return to you — and you keep everything built during the partnership.
 
-**[Game Name]** has been on our radar and the progress stands out. I'd love to hear whether you'd consider discussing what's next: a percentage sale, investment or funding, or support across LiveOps, publishing and marketing.
+**[Game Name]** recently caught our attention, and we genuinely love where you're taking it. I wanted to ask if you'd be open to exploring some ways to scale the game.
 
-I work directly with studios and investors — Jae Studio, Khalid Games, Ascend Studios among them (portfolio references below):
-
-* https://jaeceo.com/
-* https://spong.pro/
-* https://www.vexedinteractive.com/
-* https://summitinteractive.co.uk/
-* https://playastudios.org/
-* https://games.worldent.online/
-
-If you're open to it, I'll share a few details and we can see what makes the most sense for the project.
-
-Talk soon,
-
-**[Your Name]**
-
-UpScale""",
+Up for a quick look? I'm happy to answer any extra questions.""",
     """\
-Hi,
+Hey [User],
 
-This is [Your Name] from UpScale — we help Roblox developers grow, fund and monetize their games by introducing them to leading industry partners.
+This is [Your Name] from UpScale. We take a temporary percentage of revenue for a set period, and our partners get dedicated PTR support and LiveOps the whole way. Once the term ends, full revenue and control go back to you — everything built during the partnership is yours to keep.
 
-Congrats on what you've built with **[Game Name]**; it hasn't gone unnoticed. I'm getting in touch to see if you'd be up for a conversation about growth options: selling a stake, securing investment or funding, or tapping LiveOps, publishing and marketing support.
+**[Game Name]** caught our eye recently and we really like the direction you're taking it. Would you be interested in exploring ways to scale it together?
 
-Among the studios and investors I represent directly: Jae Studio, Khalid Games, Ascend Studios and several others (portfolio references below):
-
-* https://jaeceo.com/
-* https://spong.pro/
-* https://www.vexedinteractive.com/
-* https://summitinteractive.co.uk/
-* https://playastudios.org/
-* https://games.worldent.online/
-
-Would love to swap a few details and figure out what works best for your project, if you're interested.
-
-Cheers,
-
-**[Your Name]**
-
-UpScale""",
+If you'd like, I can walk you through it and answer any extra questions.""",
 )
 # Backwards-compatible alias: the first variant IS the original default.
 DEFAULT_MESSAGE_TEMPLATE = DEFAULT_MESSAGE_TEMPLATES[0]
