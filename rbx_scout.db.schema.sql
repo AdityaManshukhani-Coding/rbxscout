@@ -1,4 +1,4 @@
--- Studio Scouts catalog schema reference.
+-- UpScale Scouting Tool catalog schema reference.
 -- The catalog itself (rbx_scout.db) is the `rbx_scout.db` asset of the
 -- rolling Release tag `catalog-latest` in this repo — pull it with:
 --   python db_sync.py pull

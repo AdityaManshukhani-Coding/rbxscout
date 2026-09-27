@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Studio Scouts — Codespace keepalive for launch events.
+# UpScale Scouting Tool — Codespace keepalive for launch events.
 #
 # Run this on YOUR MAC (not inside the codespace) while the launch event is
 # live. It counts as editor activity, resetting GitHub's idle timer, so the

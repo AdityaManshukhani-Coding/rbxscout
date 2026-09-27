@@ -1,4 +1,4 @@
-# Studio Scouts hydrator — the frequent pass.
+# UpScale Scouting Tool hydrator — the frequent pass.
 #
 # Refreshes stats (CCU / visits / favorites) for games ALREADY in the
 # catalog by draining the tier-due queue. Cloudflare's Cron Trigger invokes

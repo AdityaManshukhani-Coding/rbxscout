@@ -9,7 +9,7 @@
 
 Their scale comes from a different **capture policy**, not a better net:
 
-| | RoTrends / Atlas-style trackers | Studio Scouts (you) |
+| | RoTrends / Atlas-style trackers | UpScale (you) |
 |---|---|---|
 | Capture rule | Every universe that *ever appeared* in any public endpoint gets a row | Games must pass quality gates (visits/CCU) and keep proving life |
 | Why they balloon | Roblox hosts ~40M+ universes; search/chart crawls scrape endless abandoned baseplates | Crawl candidates below threshold are dropped before insert |

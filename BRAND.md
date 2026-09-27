@@ -1,4 +1,4 @@
-# Studio Scouts — Brand Identity
+# UpScale Scouting Tool — Brand Identity
 
 One source of truth for the mark, the palette, the type and the naming.
 Every surface (dashboard, gate, README, pipeline identity) draws from here;
@@ -6,22 +6,25 @@ Every surface (dashboard, gate, README, pipeline identity) draws from here;
 
 ## Name
 
-**Studio Scouts** — no emoji in the product name, no "Rbx" prefix. "Studio"
-is the buyer; "Scouts" is what the tool does. Written as two words, both
-capitalized. The old codename (RbxScout) survives only in technical plumbing
-that is expensive to rename (the SQLite catalog filename `rbx_scout.db`, the
-repo slug, cache paths) — never in anything a user reads. Internal
-identifiers may use the `ss_` prefix (Studio Scouts).
+**UpScale Scouting Tool** — no emoji in the product name, no "Rbx"/"Studio"
+leftovers. "UpScale" is the promise to the buyer (grow the game); "Scouting
+Tool" is what it is. Written as three words, each capitalized; "UpScale" is
+one word with a capital U and S. Short form in prose: **UpScale**. The old
+codenames (RbxScout, Studio Scouts) survive only in technical plumbing that
+is expensive to rename (the SQLite catalog filename `rbx_scout.db`, the repo
+slug, cache paths) — never in anything a user reads. Internal identifiers may
+use the `us_` prefix.
 
 ## The mark
 
-A **radar**: the ring is the watch, the sweep is the daily scan, the blip is
-the contact found. Drawn as geometric strokes so it stays crisp from 16 px
-favicon to 512 px app icon.
+The owner's logo, redrawn as vectors: a bold **U** whose right stem launches
+an **upward arrow** — up (the U) and scale (the arrow). The U is white, the
+arrow is always UpScale Orange; the two-tone pairing only works on a dark
+surface (the black app-icon badge supplies that by default).
 
 | File | Use |
 | --- | --- |
-| `assets/brand/logo-mark.svg` | Inline/monochrome contexts; strokes use `currentColor` |
+| `assets/brand/logo-mark.svg` | Inline/monochrome contexts; the U uses `currentColor`, the arrow stays orange |
 | `assets/brand/logo-mark-badge.svg` | App-icon contexts (dark badge baked in) |
 | `assets/brand/wordmark.svg` | Full lockup for docs, README, social cards |
 | `assets/brand/logo-mark-{192,512}.png` | Raster badge for UI surfaces that need PNG |
@@ -33,21 +36,22 @@ Regenerate everything with `python generate_brand_assets.py` (Pillow).
 
 | Token | Hex | Role |
 | --- | --- | --- |
-| Ink | `#0B0E14` | Page background (darker than the old `#0d1117` — quieter, more "instrument panel") |
+| Ink | `#0B0E14` | Page background and the badge fill — quiet, lets the mark pop |
 | Panel | `#12161E` | Raised surfaces: cards, sidebar, table body |
 | Hairline | `#262A33` | Borders, dividers, table grid |
-| Scout Green | `#2BD98A` | THE brand color. Primary buttons, active states, the sweep, positive deltas |
+| UpScale Orange | `#FF6E01` | THE brand color. Primary buttons, active states, the arrow, positive deltas. Sampled from the owner's logo (`#FF6E01`) |
 | Text | `#E7ECF3` | Primary text |
 | Muted | `#9AA4B2` | Captions, secondary text |
 
-Scout Green replaces Discord blurple (`#5865F2`) as the primary. Discord's
-own logo keeps its blue inside the contact column — that is Discord's brand,
-not ours. Red stays `#EF4444` for negative deltas only.
+UpScale Orange replaces Scout Green (`#2BD98A`) as the primary. Discord's
+logo keeps its blue inside the contact column — that is Discord's brand,
+not ours. Red stays `#EF4444` for negative deltas only. Never put orange
+text on white; the palette is built dark-first.
 
 ## Type
 
 System sans stack (Streamlit default) — no webfont, keeps Cloud deploys fast.
-Wordmark uses the same stack, weight 500 for "Studio" and 700 for "SCOUTS";
+Wordmark sets "Up**Scale**" bold 700 with "Scale" in UpScale Orange;
 labels/eyebrows are uppercase with wide letter-spacing (0.05em+).
 
 ## Voice

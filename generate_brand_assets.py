@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Studio Scouts brand asset generator.
+"""UpScale Scouting Tool brand asset generator.
 
 One command rebuilds every logo/favicon asset from code, so the brand never
 drifts between hand-edited exports:
@@ -7,22 +7,21 @@ drifts between hand-edited exports:
     python generate_brand_assets.py
 
 Outputs (all under assets/brand/):
-    logo-mark.svg            transparent mark, strokes use currentColor
-    logo-mark-badge.svg      mark on the dark app-icon badge
-    wordmark.svg             full lockup: badge mark + "Studio Scouts" type
+    logo-mark.svg            transparent mark: U in currentColor + orange arrow
+    logo-mark-badge.svg      two-tone mark on the black app-icon badge
+    wordmark.svg             full lockup: badge mark + "UpScale" type
     logo-mark-512.png        raster badge (sidebar / gate rendering)
     logo-mark-192.png
     favicon/favicon.ico      multi-size Windows/browser favicon
     favicon/favicon-16.png   favicon-32.png, apple-touch-icon.png (180)
 
-The mark is a radar: the ring is the watch, the sweep is the daily scan, the
-blip is the contact found. Palette tokens live in BRAND.md and must stay in
-sync with .streamlit/config.toml.
+The mark is the owner's logo: a bold "U" whose right stem launches an upward
+arrow — up (the U) and scale (the arrow). Palette tokens live in BRAND.md and
+must stay in sync with .streamlit/config.toml.
 """
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -31,117 +30,121 @@ BRAND_DIR = Path(__file__).resolve().parent / "assets" / "brand"
 FAVICON_DIR = BRAND_DIR / "favicon"
 
 # Brand tokens (BRAND.md is the source of truth for usage rules).
-INK = (11, 14, 20)        # #0B0E14 page/background
-PANEL = (18, 22, 30)      # #12161E raised surface
+INK = (11, 14, 20)        # #0B0E14 page/background and badge fill
 HAIRLINE = (38, 42, 51)   # #262A33 borders
-ACCENT = (43, 217, 138)   # #2BD98A Scout Green
+ACCENT = (255, 110, 1)    # #FF6E01 UpScale Orange (sampled from the owner's logo)
 TEXT = (231, 236, 243)    # #E7ECF3 primary text
+MUTED = (154, 164, 178)   # #9AA4B2 captions
+WHITE = (254, 254, 254)   # #FEFEFE the U, as drawn in the owner's logo
 
-# Radar geometry, in 512-canvas units.
-CANVAS = 512
-CENTER = CANVAS // 2
-RING_RADIUS = 160         # the watch ring
-RING_WIDTH = 20
-SWEEP_START = 270         # PIL angles: 0 = 3 o'clock, clockwise; 270 = 12 o'clock
-SWEEP_END = 330           # 60-degree sweep, the daily pass
-BLIP_ANGLE = -35          # degrees, standard math convention (up-right)
-BLIP_DISTANCE = RING_RADIUS * 0.80
+# Mark geometry, in 64-canvas units (scaled up for raster output).
+MARK_BOX = 64
+U_STEM_X_LEFT = 19        # centerline of the left stem
+U_STEM_X_RIGHT = 45       # centerline of the right stem (becomes the arrow shaft)
+U_TOP_Y = 15              # stem tops
+U_BOWL_Y = 32             # where the bowl arc starts
+U_BOWL_R = 13             # bowl radius (centerline)
+STROKE_W = 11             # U stroke width (centerline units)
+ARROW_SHAFT_TOP = 9       # arrow shaft reaches above the stem top
+ARROW_HEAD_TIP = (45, 1)
+ARROW_HEAD_HALF_W = 13.5  # head is ~2.5x the stem width, like the logo
+ARROW_HEAD_BASE_Y = 15.5
 
 
-def _polar(distance: float, degrees: float) -> tuple[float, float]:
-    rad = math.radians(degrees)
-    return CENTER + distance * math.cos(rad), CENTER - distance * math.sin(rad)
+def _draw_mark(img: Image.Image, ox: float, oy: float, scale: float,
+               u_color: tuple[int, int, int, int]) -> None:
+    """Draw the U + arrow mark onto `img` offset by (ox, oy) at `scale` px/unit."""
+    d = ImageDraw.Draw(img)
+    w = STROKE_W * scale
+    s = scale
+
+    def x(v: float) -> float:
+        return ox + v * s
+
+    def y(v: float) -> float:
+        return oy + v * s
+
+    half = w / 2
+
+    # The U: left stem, bowl, right stem (white in the two-tone badge version).
+    d.line([x(U_STEM_X_LEFT), y(U_TOP_Y), x(U_STEM_X_LEFT), y(U_BOWL_Y)],
+           fill=u_color, width=int(w))
+    d.arc([x(U_STEM_X_LEFT - U_BOWL_R), y(U_BOWL_Y - U_BOWL_R),
+           x(U_STEM_X_RIGHT + U_BOWL_R), y(U_BOWL_Y + U_BOWL_R)],
+          start=0, end=180, fill=u_color, width=int(w))
+    d.line([x(U_STEM_X_RIGHT), y(U_BOWL_Y), x(U_STEM_X_RIGHT), y(ARROW_SHAFT_TOP + 4)],
+           fill=u_color, width=int(w))
+
+    # The arrow: shaft rides the right stem, head launches upward (orange).
+    d.rectangle([x(U_STEM_X_RIGHT - STROKE_W / 2), y(ARROW_SHAFT_TOP),
+                 x(U_STEM_X_RIGHT + STROKE_W / 2), y(U_BOWL_Y)],
+                fill=ACCENT + (255,))
+    hx, hy = ARROW_HEAD_TIP
+    d.polygon(
+        [
+            (x(hx), y(hy)),
+            (x(hx - ARROW_HEAD_HALF_W), y(ARROW_HEAD_BASE_Y)),
+            (x(hx + ARROW_HEAD_HALF_W), y(ARROW_HEAD_BASE_Y)),
+        ],
+        fill=ACCENT + (255,),
+    )
 
 
 def draw_badge(size: int) -> Image.Image:
-    """Render the full badge (dark rounded square + radar mark) at `size` px."""
-    img = Image.new("RGBA", (CANVAS, CANVAS), (0, 0, 0, 0))
+    """Render the full badge (black rounded square + two-tone mark) at `size` px."""
+    canvas = 512
+    img = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
 
     # Badge: near-black rounded square with a hairline inner border.
-    d.rounded_rectangle([0, 0, CANVAS - 1, CANVAS - 1], radius=116, fill=INK + (255,))
-    d.rounded_rectangle([12, 12, CANVAS - 13, CANVAS - 13], radius=106,
+    d.rounded_rectangle([0, 0, canvas - 1, canvas - 1], radius=116, fill=INK + (255,))
+    d.rounded_rectangle([12, 12, canvas - 13, canvas - 13], radius=106,
                         outline=HAIRLINE + (255,), width=4)
 
-    # The watch: a faint full ring under a bright sweep trail.
-    box = [CENTER - RING_RADIUS, CENTER - RING_RADIUS,
-           CENTER + RING_RADIUS, CENTER + RING_RADIUS]
-    d.arc(box, start=0, end=360, fill=ACCENT + (64,), width=6)
+    # Center the mark: its 64-unit box spans x 12.5..58.5, y 1..51.5.
+    scale = 300 / 64  # mark occupies ~300px of the 512px badge
+    _draw_mark(img, ox=76, oy=116, scale=scale, u_color=WHITE + (255,))
 
-    # Sweep trail: translucent wedge + bright leading edge.
-    wedge = Image.new("RGBA", (CANVAS, CANVAS), (0, 0, 0, 0))
-    ImageDraw.Draw(wedge).pieslice(box, start=SWEEP_START, end=SWEEP_END,
-                                   fill=ACCENT + (52,))
-    img = Image.alpha_composite(img, wedge)
-    d = ImageDraw.Draw(img)
-    d.arc(box, start=SWEEP_START, end=SWEEP_END, fill=ACCENT + (255,), width=RING_WIDTH)
-
-    # Contact blip: the scout found something. Soft glow, then solid dot.
-    bx, by = _polar(BLIP_DISTANCE, BLIP_ANGLE)
-    glow_radius = 46
-    d.ellipse([bx - glow_radius, by - glow_radius, bx + glow_radius, by + glow_radius],
-              fill=ACCENT + (36,))
-    blip_radius = 26
-    d.ellipse([bx - blip_radius, by - blip_radius, bx + blip_radius, by + blip_radius],
-              fill=ACCENT + (255,))
-
-    # Radar origin.
-    origin_radius = 12
-    d.ellipse([CENTER - origin_radius, CENTER - origin_radius,
-               CENTER + origin_radius, CENTER + origin_radius],
-              fill=ACCENT + (150,))
-
-    if size != CANVAS:
+    if size != canvas:
         img = img.resize((size, size), Image.LANCZOS)
     return img
 
 
 MARK_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
-  <!-- Studio Scouts mark: the radar. Ring = the watch, wedge = the daily
-       sweep, dot = the contact found. Strokes use currentColor so the mark
-       recolors with context; the badge version is logo-mark-badge.svg. -->
-  <circle cx="32" cy="32" r="19" stroke="currentColor" stroke-opacity="0.35" stroke-width="1.6"/>
-  <path d="M32 32 L32 13 A19 19 0 0 1 47.63 22.75 Z" fill="currentColor" fill-opacity="0.14"/>
-  <path d="M32 13 A19 19 0 0 1 47.63 22.75" stroke="currentColor" stroke-width="3.2" stroke-linecap="round"/>
-  <circle cx="44.5" cy="20.2" r="3.4" fill="currentColor"/>
-  <circle cx="32" cy="32" r="1.7" fill="currentColor" fill-opacity="0.55"/>
+  <!-- UpScale mark: the U launches the arrow. The U uses currentColor so it
+       recolors with context; the arrow always stays UpScale Orange. The
+       two-tone badge version is logo-mark-badge.svg. -->
+  <path d="M19 15 V32 A13 13 0 0 0 45 32 V13" stroke="currentColor" stroke-width="11"/>
+  <rect x="39.5" y="9" width="11" height="12" fill="#FF6E01"/>
+  <path d="M45 1 L31.5 15.5 H58.5 Z" fill="#FF6E01"/>
 </svg>
 """
 
 MARK_BADGE_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
-  <!-- Studio Scouts badge mark: the radar on the app-icon dark badge. -->
+  <!-- UpScale badge mark: the two-tone U + arrow on the black app-icon badge. -->
   <rect width="64" height="64" rx="14.5" fill="#0B0E14"/>
   <rect x="1.5" y="1.5" width="61" height="61" rx="13" stroke="#262A33" stroke-width="1"/>
-  <g stroke="#2BD98A">
-    <circle cx="32" cy="32" r="19" stroke-opacity="0.35" stroke-width="1.6"/>
-    <path d="M32 32 L32 13 A19 19 0 0 1 47.63 22.75 Z" fill="#2BD98A" fill-opacity="0.14" stroke="none"/>
-    <path d="M32 13 A19 19 0 0 1 47.63 22.75" stroke-width="3.2" stroke-linecap="round"/>
-  </g>
-  <circle cx="44.5" cy="20.2" r="3.4" fill="#2BD98A"/>
-  <circle cx="32" cy="32" r="1.7" fill="#2BD98A" fill-opacity="0.55"/>
+  <path d="M19 15 V32 A13 13 0 0 0 45 32 V13" stroke="#FEFEFE" stroke-width="11"/>
+  <rect x="39.5" y="9" width="11" height="12" fill="#FF6E01"/>
+  <path d="M45 1 L31.5 15.5 H58.5 Z" fill="#FF6E01"/>
 </svg>
 """
 
-WORDMARK_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 460 84" fill="none">
-  <!-- Studio Scouts lockup: badge mark + name treatment.
-       "Studio" set regular in text color, "Scouts" set bold in Scout Green. -->
+WORDMARK_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 84" fill="none">
+  <!-- UpScale Scouting Tool lockup: badge mark + name treatment.
+       "Up" set bold in text color, "Scale" set bold in UpScale Orange;
+       "SCOUTING TOOL" is the eyebrow beneath. -->
   <g transform="translate(10,10) scale(1.0)">
     <rect width="64" height="64" rx="14.5" fill="#0B0E14"/>
     <rect x="1.5" y="1.5" width="61" height="61" rx="13" stroke="#262A33" stroke-width="1"/>
-    <g stroke="#2BD98A">
-      <circle cx="32" cy="32" r="19" stroke-opacity="0.35" stroke-width="1.6"/>
-      <path d="M32 32 L32 13 A19 19 0 0 1 47.63 22.75 Z" fill="#2BD98A" fill-opacity="0.14" stroke="none"/>
-      <path d="M32 13 A19 19 0 0 1 47.63 22.75" stroke-width="3.2" stroke-linecap="round"/>
-    </g>
-    <circle cx="44.5" cy="20.2" r="3.4" fill="#2BD98A"/>
-    <circle cx="32" cy="32" r="1.7" fill="#2BD98A" fill-opacity="0.55"/>
+    <path d="M19 15 V32 A13 13 0 0 0 45 32 V13" stroke="#FEFEFE" stroke-width="11"/>
+    <rect x="39.5" y="9" width="11" height="12" fill="#FF6E01"/>
+    <path d="M45 1 L31.5 15.5 H58.5 Z" fill="#FF6E01"/>
   </g>
-  <text x="92" y="40" font-family="'Avenir Next','Segoe UI',Helvetica,Arial,sans-serif"
-        font-size="30" font-weight="500" letter-spacing="1" fill="#E7ECF3">Studio</text>
-  <text x="92" y="72" font-family="'Avenir Next','Segoe UI',Helvetica,Arial,sans-serif"
-        font-size="30" font-weight="700" letter-spacing="1" fill="#2BD98A">SCOUTS</text>
-  <text x="196" y="72" font-family="'Avenir Next','Segoe UI',Helvetica,Arial,sans-serif"
-        font-size="11" font-weight="500" letter-spacing="2.6" fill="#9AA4B2">ROBLOX GAME SCOUTING</text>
+  <text x="92" y="46" font-family="'Avenir Next','Segoe UI',Helvetica,Arial,sans-serif"
+        font-size="32" font-weight="700" letter-spacing="0.5" fill="#E7ECF3">Up<tspan fill="#FF6E01">Scale</tspan></text>
+  <text x="94" y="70" font-family="'Avenir Next','Segoe UI',Helvetica,Arial,sans-serif"
+        font-size="11" font-weight="500" letter-spacing="3" fill="#9AA4B2">SCOUTING TOOL</text>
 </svg>
 """
 

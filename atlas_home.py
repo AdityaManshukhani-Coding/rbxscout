@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Studio Scouts home-IP Atlas harvester — the daily discovery run from this laptop.
+"""UpScale Scouting Tool home-IP Atlas harvester — the daily discovery run from this laptop.
 
 Why this exists: atlasdev.gg 403s every request from GitHub Actions (datacenter
 IPs) AND from the Cloudflare Worker relay (Cloudflare-to-Cloudflare), but works

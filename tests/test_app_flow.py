@@ -92,7 +92,7 @@ def test_render_fills_name_and_game_tags():
     assert "Blox Fruits" in message
     assert "[Your Name]" not in message
     assert "[Game Name]" not in message
-    assert "I'm dev_razor10 from Studio Scouts" in message
+    assert "I'm dev_razor10 from UpScale" in message
     assert "impressed by **Blox Fruits**" in message
 
 
@@ -110,7 +110,7 @@ def test_render_case_insensitive_tags():
 
 def test_render_empty_template_falls_back_to_default():
     message = render_outreach_message("   ", "ace", "Speed Run")
-    assert "I'm ace from Studio Scouts" in message
+    assert "I'm ace from UpScale" in message
 
 
 # --------------------------------------------------------------------------- #
@@ -288,13 +288,13 @@ def _table_html(at: AppTest) -> str:
 
 def test_sidebar_renders_brand_lockup():
     """The sidebar shows the radar badge + name treatment (no emoji title):
-    the brand HTML carries the lockup classes and the Scout Green accent."""
+    the brand HTML carries the lockup classes and the UpScale Orange accent."""
     at = _render_dashboard()
     assert not at.exception
     sidebar_html = " ".join(el.proto.body for el in at.sidebar.markdown)
     assert "ss-brand" in sidebar_html
-    assert "Studio <span class=\"ss-accent\">Scouts</span>" in sidebar_html
-    assert "2BD98A" in sidebar_html
+    assert "Up<span class=\"ss-accent\">Scale</span> Scouting Tool" in sidebar_html
+    assert "FF6E01" in sidebar_html
 
 
 def test_gate_screen_uses_brand_mark(monkeypatch):
@@ -307,7 +307,7 @@ def test_gate_screen_uses_brand_mark(monkeypatch):
     assert not at.exception
     markdown_html = " ".join(el.proto.body for el in at.markdown)
     assert "gate-brand" in markdown_html
-    assert "Studio <span class=\"ss-accent\">Scouts</span>" in markdown_html
+    assert "Up<span class=\"ss-accent\">Scale</span> Scouting Tool" in markdown_html
 
 
 def test_browser_favicon_injected_as_data_uri():
@@ -355,7 +355,7 @@ def test_store_outage_shows_banner_instead_of_crashing(monkeypatch):
     warnings = [w.value for w in at.warning]
     assert any("temporarily unavailable" in w for w in warnings)
     # The welcome flow still renders on top of the banner.
-    assert any("Studio Scouts" in el.value for el in at.header) or at.title
+    assert any("UpScale" in el.value for el in at.header) or at.title
 
 
 def test_table_column_order_discord_before_averages():

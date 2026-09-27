@@ -1,5 +1,5 @@
 """
-Studio Scouts - Roblox Game Scouting & Contact Dashboard.
+UpScale Scouting Tool - Roblox Game Scouting & Contact Dashboard.
 
 Run: streamlit run app.py
 Deploy marker: table reorder + No-Discord label + literal search + genre-✕ fix (2026-09-23).
@@ -45,8 +45,8 @@ BRAND_DIR = APP_DIR / "assets" / "brand"
 
 # Brand tokens — the source of truth is BRAND.md; keep in sync with
 # generate_brand_assets.py. The palette leans quieter than Streamlit's
-# defaults so the Scout Green accent reads as THE brand color.
-BRAND_ACCENT = "#2BD98A"    # Scout Green: primary buttons, the sweep, positive deltas
+# defaults so the UpScale Orange accent reads as THE brand color.
+BRAND_ACCENT = "#FF6E01"    # UpScale Orange (owner's logo): primary buttons, the arrow, positive deltas
 BRAND_NEGATIVE = "#EF4444"  # red is reserved for negative momentum only
 BRAND_INK = "#0B0E14"
 BRAND_PANEL = "#12161E"
@@ -220,7 +220,7 @@ def slim_result_frame(data: pd.DataFrame) -> pd.DataFrame:
         return data
 
 st.set_page_config(
-    page_title="Studio Scouts — Roblox Game Scouting",
+    page_title="UpScale Scouting Tool — Roblox Game Scouting",
     # The radar badge (assets/brand/favicon/favicon-32.png) is also injected
     # as the real browser favicon below; this emoji is only the fallback
     # page icon for contexts that cannot load the data URI.
@@ -462,7 +462,7 @@ def _render_gate() -> None:
                 font-size: 1.6rem; font-weight: 700; letter-spacing: 0.04em;
                 margin-bottom: 0.2rem;
             }
-            .gate-brand .ss-accent { color: #2BD98A; }
+            .gate-brand .ss-accent { color: #FF6E01; }
             .gate-tag {
                 font-size: 0.72rem; font-weight: 600; letter-spacing: 0.22em;
                 text-transform: uppercase; color: #9AA4B2; margin-top: 0;
@@ -473,7 +473,7 @@ def _render_gate() -> None:
     )
     st.markdown(
         f'<div class="gate-card">{gate_icon_html}'
-        '<div class="gate-brand">Studio <span class="ss-accent">Scouts</span></div>'
+        '<div class="gate-brand">Up<span class="ss-accent">Scale</span> Scouting Tool</div>'
         '<p class="gate-tag">Roblox game scouting</p>'
         '<p style="opacity:0.75;margin-top:0.8rem">This site is private. Enter the access password to continue.</p>',
         unsafe_allow_html=True,
@@ -614,7 +614,7 @@ def render_onboarding() -> bool:
 
     if step == 0:
         st.title("Welcome Fellow Scout")
-        st.subheader("to the Studio Scouts Website")
+        st.subheader("to the UpScale Scouting Tool")
         st.write("Find Roblox games that fit your targets, then check only the results you care about.")
         st.info("Your first scan uses the targets you choose next. Contact lookups are loaded page by page.")
         if st.button("Next", type="primary", width="stretch", key="onb0_next"):
@@ -1028,16 +1028,16 @@ st.sidebar.markdown(
         font-size: 1.18rem; font-weight: 700; letter-spacing: 0.03em;
         line-height: 1.1; color: #E7ECF3;
       }}
-      .ss-brand-name .ss-accent {{ color: #2BD98A; }}
+      .ss-brand-name .ss-accent {{ color: #FF6E01; }}
       .ss-brand-tag {{
         font-size: 0.68rem; font-weight: 600; letter-spacing: 0.18em;
         text-transform: uppercase; color: #9AA4B2; margin-top: 2px;
       }}
     </style>
     <div class="ss-brand">
-      <img {_sidebar_badge_src} alt="Studio Scouts">
+      <img {_sidebar_badge_src} alt="UpScale Scouting Tool">
       <div>
-        <div class="ss-brand-name">Studio <span class="ss-accent">Scouts</span></div>
+        <div class="ss-brand-name">Up<span class="ss-accent">Scale</span> Scouting Tool</div>
         <div class="ss-brand-tag">Roblox game scouting</div>
       </div>
     </div>
@@ -1390,8 +1390,8 @@ def game_url(row: pd.Series) -> str:
 
 TABLE_STYLE = """
 <style>
-/* Results panel — Studio Scouts brand tokens (BRAND.md): Ink background,
-   Hairline borders, Scout Green reserved for positive signal. */
+/* Results panel — UpScale Scouting Tool brand tokens (BRAND.md): Ink background,
+   Hairline borders, UpScale Orange reserved for positive signal. */
 .ss-panel {
   border: 1px solid #262A33; border-radius: 14px; overflow: hidden;
   background: #12161E; margin-top: 4px;
@@ -1418,7 +1418,7 @@ TABLE_STYLE = """
   background: #1a1d25; border: 1px solid #262a33; color: #c3c8d1;
   font-size: 0.78rem; white-space: nowrap;
 }
-.ss-up { color: #2BD98A; white-space: nowrap; }
+.ss-up { color: #FF6E01; white-space: nowrap; }
 .ss-down { color: #EF4444; white-space: nowrap; }
 .ss-game { display: inline-flex; align-items: center; gap: 9px; text-decoration: none; color: inherit; }
 .ss-game:hover .ss-name { text-decoration: underline; }
@@ -1439,7 +1439,7 @@ TABLE_STYLE = """
   color: inherit; white-space: nowrap; font-family: inherit;
 }
 .ss-copy:hover { background: rgba(128, 128, 128, 0.15); }
-.ss-copied { color: #2BD98A; border-color: #2BD98A; }
+.ss-copied { color: #FF6E01; border-color: #FF6E01; }
 .ss-copyfail { color: #EF4444; border-color: #EF4444; }
 .ss-none { opacity: 0.55; }
 </style>
@@ -1760,7 +1760,7 @@ else:
     st.download_button(
         "Export visible results (CSV)",
         visible.to_csv(index=False).encode(),
-        file_name=f"studio-scouts-export_{time.strftime('%Y%m%d_%H%M')}.csv",
+        file_name=f"upscale-scouting-export_{time.strftime('%Y%m%d_%H%M')}.csv",
         mime="text/csv",
         width="content",
     )

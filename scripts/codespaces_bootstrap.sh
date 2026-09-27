@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Studio Scouts — one-command Codespaces launch.
+# UpScale Scouting Tool — one-command Codespaces launch.
 #
 #   bash scripts/codespaces_bootstrap.sh
 #

@@ -309,7 +309,7 @@ def test_harvest_sends_honest_user_agent(scout, monkeypatch):
     _patch_http(monkeypatch, pages={"*": INDEX_HTML}, calls=calls)
     scout.harvest_atlas_seeds(pages=1, stat_pages=0, throttle_hours=0)
     assert calls, "expected at least one Atlas request"
-    assert "StudioScouts" in calls[0]["headers"]["User-Agent"]
+    assert "UpScaleScoutingTool" in calls[0]["headers"]["User-Agent"]
     assert "atlasdev.gg/analyze?" in calls[0]["url"]
 
 

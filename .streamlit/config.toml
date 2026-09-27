@@ -1,9 +1,9 @@
 [theme]
 base = "dark"
-# Studio Scouts palette — tokens documented in BRAND.md; keep in sync with
-# generate_brand_assets.py. Scout Green (#2BD98A) is the brand primary;
-# Discord blurple is retired everywhere except Discord's own logo glyph.
-primaryColor = "#2BD98A"
+# UpScale Scouting Tool palette — tokens documented in BRAND.md; keep in sync
+# with generate_brand_assets.py. UpScale Orange (#FF6E01, sampled from the
+# owner's logo) is the brand primary; Scout Green is retired.
+primaryColor = "#FF6E01"
 backgroundColor = "#0B0E14"
 secondaryBackgroundColor = "#12161E"
 textColor = "#E7ECF3"

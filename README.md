@@ -1,8 +1,8 @@
-# Studio Scouts — 24/7 Roblox Game Scout
+# UpScale Scouting Tool — 24/7 Roblox Game Scout
 
 <p>
-  <img src="assets/brand/logo-mark-badge.svg" width="56" alt="Studio Scouts mark" align="left">
-  <strong>Studio <span style="color:#2BD98A">Scouts</span></strong> — a radar for
+  <img src="assets/brand/logo-mark-badge.svg" width="56" alt="UpScale mark" align="left">
+  <strong>Up<span style="color:#FF6E01">Scale</span> Scouting Tool</strong> — a scout for
   Roblox games: it watches, it scans, it finds the contact.
 </p>
 
@@ -160,7 +160,7 @@ per-window quota and rolls overflow to the next sync.
 
 The existing Worker in [`cloudflare-worker/`](cloudflare-worker/) now combines
 the Roblox search proxy with the scheduler. Deploy it once, then Cloudflare
-becomes the only automatic clock for Studio Scouts.
+becomes the only automatic clock for UpScale.
 
 ### One-time setup checklist
 

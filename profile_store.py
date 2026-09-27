@@ -1,4 +1,4 @@
-"""Per-device profile persistence for Studio Scouts.
+"""Per-device profile persistence for UpScale Scouting Tool.
 
 Each browser gets an opaque device id delivered as the ``ss_ref`` cookie. The
 server keeps one small JSON profile per id in a gitignored directory: identity

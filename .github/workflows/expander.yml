@@ -1,4 +1,4 @@
-# Studio Scouts expander — Atlas Dev seed harvest + discovery-queue drain (every 30 min).
+# UpScale Scouting Tool expander — Atlas Dev seed harvest + discovery-queue drain (every 30 min).
 #
 # The sole discovery pipeline (ATLAS_PLAN_REVIEW.md): a daily 24h-throttled
 # harvest of atlasdev.gg/analyze enqueues mid-tier universe IDs into the

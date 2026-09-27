@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Studio Scouts catalog store — the SQLite catalog lives on a GitHub Release asset.
+"""UpScale Scouting Tool catalog store — the SQLite catalog lives on a GitHub Release asset.
 
 The repo used to carry rbx_scout.db as a committed blob (a fresh ~11 MB file
 in every sync commit). Now the catalog is the **first asset** of a GitHub
@@ -71,7 +71,7 @@ DB_PATH = APP_DIR / "rbx_scout.db"
 STATE_PATH = APP_DIR / "rbx_scout.db.sync_state"
 
 RELEASE_TAG = "catalog-latest"
-RELEASE_NAME = "Studio Scouts catalog (rolling)"
+RELEASE_NAME = "UpScale Scouting Tool catalog (rolling)"
 ASSET_DB = "rbx_scout.db"
 ASSET_STATE = "rbx_scout.db.sync_state"
 ASSET_STATS = "stats.json"
@@ -145,7 +145,7 @@ def _headers(token: str, accept: str = "application/vnd.github+json") -> dict:
         "Authorization": f"Bearer {token}",
         "Accept": accept,
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "studioscouts-db-sync",
+        "User-Agent": "upscalescouting-db-sync",
     }
 
 
@@ -183,7 +183,7 @@ def get_release(token: str) -> dict | None:
 
 def release_body() -> str:
     return (
-        "Rolling catalog storage for Studio Scouts — written by the Hydrator/Finder "
+        "Rolling catalog storage for UpScale Scouting Tool — written by the Hydrator/Finder "
         "workflows, read by db_sync.py. The 'rbx_scout.db' asset is the current "
         "catalog and 'rbx_scout.db.sync_state' counts the syncs that wrote it. "
         "The 📊 line at the top shows the live catalog counts (stats.json is "

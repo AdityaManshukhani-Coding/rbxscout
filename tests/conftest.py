@@ -1,4 +1,4 @@
-"""Shared test isolation for the Studio Scouts test suite.
+"""Shared test isolation for the UpScale Scouting Tool test suite.
 
 App-level tests bypass the password gate (the gate has its own dedicated
 tests) and both server-side stores (gate state, device profiles) are pointed

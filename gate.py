@@ -1,4 +1,4 @@
-"""Password gate for Studio Scouts.
+"""Password gate for UpScale Scouting Tool.
 
 The site is private, so every visitor must enter the shared password before
 any app content renders. Wrong attempts get an iPhone-style escalating

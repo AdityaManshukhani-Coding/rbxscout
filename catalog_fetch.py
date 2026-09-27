@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Studio Scouts hosted catalog loader — for the Streamlit Community Cloud app.
+"""UpScale Scouting Tool hosted catalog loader — for the Streamlit Community Cloud app.
 
 The 24/7 pipeline (Cloudflare Worker → GitHub Actions → release asset) is the
 single writer of the catalog. Readers — your laptop via ``db_sync.py pull``,
@@ -123,7 +123,7 @@ def local_catalog_path() -> str:
 def _headers() -> dict:
     headers = {
         "Accept": "application/vnd.github+json",
-        "User-Agent": "studioscouts-catalog-fetch",
+        "User-Agent": "upscalescouting-catalog-fetch",
         "X-GitHub-Api-Version": "2022-11-28",
     }
     # Optional token (only needed if the repo ever goes private). Anonymous

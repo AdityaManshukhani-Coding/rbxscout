@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate 100 random access passwords for Studio Scouts.
+"""Generate 100 random access passwords for UpScale Scouting Tool.
 
 Writes TWO artifacts:
 
