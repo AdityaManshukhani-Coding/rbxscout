@@ -16,7 +16,7 @@ crons = ["*/5 * * * *"]
 # by 11), always landing inside Streamlit Cloud's 12 h idle timeout.
 # Public URL, so a plain variable is fine (not a secret).
 [vars]
-DASHBOARD_KEEPALIVE_URL = "https://rbxscout.streamlit.app/"
+DASHBOARD_KEEPALIVE_URL = "https://upscaletool.streamlit.app/"
 
 # Optional: pin a custom route after adding your zone to the account, e.g.
 # routes = [{ pattern = "rbx-proxy.example.com", custom_domain = true }]

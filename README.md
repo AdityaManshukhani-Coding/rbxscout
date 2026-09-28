@@ -298,7 +298,7 @@ the same passes that fetch icons).
 
 ### Hosted dashboard (Streamlit Community Cloud, free)
 
-The dashboard also runs hosted at `https://rbxscout.streamlit.app` — no
+The dashboard also runs hosted at `https://upscaletool.streamlit.app` — no
 laptop required. Same app, same catalog, two source modes chosen
 automatically:
 
@@ -320,7 +320,7 @@ Deploy / redeploy it in two minutes:
 3. Repo `AdityaManshukhani-Coding/rbxscout`, branch `main`, file `app.py`.
 4. **App URL**: set the subdomain to `rbxscout`. Python: pick the newest
    offered (the Actions runners use 3.14). No secrets needed.
-5. Deploy — the URL is `https://rbxscout.streamlit.app`.
+5. Deploy — the URL is `https://upscaletool.streamlit.app`.
 
 The **live catalog tracker** at the top of the dashboard is the
 subscriber-counter-style number: total cataloged games, how many meet the
@@ -366,7 +366,7 @@ never does. The URL lives in `wrangler.toml` under `[vars]`:
 
 ```toml
 [vars]
-DASHBOARD_KEEPALIVE_URL = "https://rbxscout.streamlit.app/"
+DASHBOARD_KEEPALIVE_URL = "https://upscaletool.streamlit.app/"
 ```
 
 Redeploy with `npx wrangler deploy` after changing it; delete the var (or

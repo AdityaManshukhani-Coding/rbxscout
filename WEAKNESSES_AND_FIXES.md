@@ -1,7 +1,7 @@
 # UpScale Scouting Tool — Weaknesses & Fixes for a 400-User Launch
 
 **Audit date:** 2026-09-18 · **Scope:** full read-only review of the dashboard + shared state (no code changed)
-**Focus question:** *what crashes, degrades, or misbehaves when ~400 users hit `rbxscout.streamlit.app`?*
+**Focus question:** *what crashes, degrades, or misbehaves when ~400 users hit `upscaletool.streamlit.app`?*
 
 ---
 

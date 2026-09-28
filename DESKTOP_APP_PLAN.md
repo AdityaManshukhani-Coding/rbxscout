@@ -33,7 +33,7 @@ Estimated total build: 1–2 days.
 
 ## A. Product shape & audience split
 
-- **Mobile users** → `https://rbxscout.streamlit.app/`. Nothing changes for
+- **Mobile users** → `https://upscaletool.streamlit.app/`. Nothing changes for
   them. If the Worker API exists, the site *also* moves its gate and link
   serving behind it (one key list for both surfaces), but this is optional
   for launch.
