@@ -178,6 +178,44 @@ _FAVICON_SCRIPT = r"""
 """.replace("%FAVICON32%", _brand_png("favicon/favicon-32.png")) \
      .replace("%APPLEICON%", _brand_png("favicon/apple-touch-icon.png"))
 
+# Duplicate eye icons on the password field (fixed 2026-09-28): Streamlit's
+# password box ships its OWN reveal toggle (BaseWeb "Show password text"
+# button), and Safari additionally injects its AutoFill key/eye INSIDE the
+# field. Two icons, same purpose. This script keeps the Streamlit toggle and
+# suppresses the browser-injected one: attributes the field so Safari's
+# AutoFill (and any other password-management overlay) stands down, plus a
+# MutationObserver sweep because Streamlit re-renders inputs on every rerun.
+_PASSWORD_ICON_GUARD_SCRIPT = r"""
+<style>
+/* Belt: never let the native AutoFill button through, on any engine. */
+input[type="password"]::-webkit-credentials-auto-fill-button {
+  display: none !important; visibility: hidden !important;
+}
+</style>
+<script>
+(function () {
+  if (window.__ssPasswordIconGuard) { return; }  // one guard per page, rerun-proof
+  window.__ssPasswordIconGuard = true;
+  var sweep = function () {
+    var fields = document.querySelectorAll('input[type="password"]');
+    for (var i = 0; i < fields.length; i++) {
+      fields[i].setAttribute('autocomplete', 'new-password');
+      fields[i].setAttribute('readonly', 'readonly');
+      window.setTimeout(function (el) { return function () { el.removeAttribute('readonly'); }; }(fields[i]), 0);
+    }
+  };
+  sweep();
+  var pending = null;
+  var observer = new MutationObserver(function () {
+    if (pending) { return; }
+    pending = window.setTimeout(function () { pending = null; sweep(); }, 120);
+  });
+  observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['type'] });
+})();
+</script>
+"""
+
+
 PAGE_SIZE = 20
 DEFAULT_MIN_VISITS = 20_000
 DEFAULT_MIN_CCU = 25
@@ -530,7 +568,7 @@ def _render_gate() -> None:
         )
 
     st.markdown("</div>", unsafe_allow_html=True)
-    st.html(_INPUT_GUARD_SCRIPT + _FAVICON_SCRIPT, unsafe_allow_javascript=True)  # no save-password prompt here either
+    st.html(_INPUT_GUARD_SCRIPT + _FAVICON_SCRIPT + _PASSWORD_ICON_GUARD_SCRIPT, unsafe_allow_javascript=True)  # no save-password prompt here either
     st.stop()
 
 
@@ -1282,13 +1320,18 @@ else:
     )
     selected_genres = []
 
-# Apply only metric-known filters when deciding which contact page to fetch.
+# Apply metric + Discord-availability filters when deciding which contact
+# page to fetch. The Discord filter MUST run before the page slice: applied
+# after, it only narrowed the 20 rows already on the page (2–5 visible games
+# instead of 20) and contact checks were scheduled for filtered-out rows.
+discord_view = st.session_state.get("discord_filter_radio", DISCORD_FILTER_ALL)
 metric_filtered = apply_filters(
     df,
     search=search,
     min_visits=eff_min_visits,
     min_ccu=eff_min_ccu,
     genres=selected_genres,
+    discord_filter=discord_view,
 )
 
 signature = "|".join([
@@ -1296,6 +1339,7 @@ signature = "|".join([
     str(min_visits),
     str(min_ccu),
     ",".join(selected_genres),
+    discord_view,
 ])
 if signature != st.session_state.get("filter_signature"):
     st.session_state.filter_signature = signature
@@ -1324,15 +1368,9 @@ page_start = (int(page) - 1) * int(page_size)
 page_rows = metric_filtered.iloc[page_start:page_start + int(page_size)]
 page_ids = [int(uid) for uid in page_rows["universe_id"].tolist()]
 
-# Apply contact filters only after the current page has had a chance to resolve.
-visible = apply_filters(
-    page_rows,
-    search="",
-    min_visits=0,
-    min_ccu=0,
-    genres=selected_genres,
-    discord_filter=st.session_state.get("discord_filter_radio", DISCORD_FILTER_ALL),
-)
+# The Discord filter already ran above, before the page slice — no second
+# pass here. The visible page IS the filtered page, so 20 rows render as 20.
+visible = page_rows
 
 # Failures stay visible even without the diagnostics section: a failed sync
 # or a crashed scan is surfaced as a quiet error line, everything else
@@ -1731,9 +1769,9 @@ if visible.empty:
         discord_view = st.session_state.get("discord_filter_radio", DISCORD_FILTER_ALL)
         if discord_view == DISCORD_FILTER_TRUE and not metric_filtered.empty:
             st.info(
-                "No games with a resolved Discord invite on this page. The "
-                "overnight backfill is still working through the catalog — "
-                "check the coverage chip in the sidebar."
+                "No games with a resolved Discord invite in the filtered "
+                "results yet. The overnight backfill is still working through "
+                "the catalog — sync live data later to pick up new verdicts."
             )
         else:
             st.info("No games on this page match the selected filters.")

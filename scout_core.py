@@ -116,11 +116,10 @@ DISCORD_REGEX = (
 DISCORD_LOGO_URL = "https://cdn.simpleicons.org/discord/5865F2"
 
 # Default outreach messages copied per game in the dashboard. Placeholder
-# tags — [User] (the game owner), [Your Name], [Game Name] — are filled in
-# automatically when the user copies a message (name from the welcome flow,
-# game from the row's title; [User] stays a tag for Discord mention/name
-# handling at copy time). Users may edit the template freely in the welcome
-# flow or sidebar, but the tags must stay for auto-fill to keep working.
+# tags — [Your Name], [Game Name] — are filled in automatically when the
+# user copies a message (name from the welcome flow, game from the row's
+# title). Users may edit the template freely in the welcome flow or sidebar,
+# but the tags must stay for auto-fill to keep working.
 #
 # The model every variant describes (owner's wording, 2026-09-27): UpScale
 # takes a temporary percentage of revenue for a set period, provides
@@ -128,7 +127,7 @@ DISCORD_LOGO_URL = "https://cdn.simpleicons.org/discord/5865F2"
 # control return to the developer who keeps everything built during the
 # partnership. No portfolio links, no sale/investment framing.
 DEFAULT_MESSAGE_TEMPLATE = """\
-Hey [User],
+Hey,
 
 I'm [Your Name] from UpScale. At UpScale, we take a temporary percentage of revenue for a set period while providing our partners with dedicated PTR support and LiveOps. Once the term ends, full revenue and control return to you, and you keep everything built during the partnership.
 
@@ -138,14 +137,14 @@ If you're up for a quick look, I can answer any extra questions."""
 
 # Four more phrasings of the same outreach, so a scout can rotate between
 # copies and Discord's anti-spam heuristics see varied text instead of one
-# identical message pasted at 20 servers. Every variant keeps the [User],
+# identical message pasted at 20 servers. Every variant keeps the
 # [Your Name] and [Game Name] tags (render_outreach_message fills them) and
 # the same revenue-share/PTR/LiveOps model; openings, closings and sentence
 # structures differ.
 DEFAULT_MESSAGE_TEMPLATES = (
     DEFAULT_MESSAGE_TEMPLATE,
     """\
-Hi [User],
+Hi,
 
 [Your Name] here, from UpScale. Our model is simple: we take a temporary percentage of revenue for a set period, and in exchange our partners get dedicated PTR support and LiveOps. When the term ends, full revenue and control come back to you — everything built during the partnership stays yours.
 
@@ -153,7 +152,7 @@ Hi [User],
 
 Happy to answer any questions — a quick look costs you nothing.""",
     """\
-Hey [User],
+Hey,
 
 I'm [Your Name] with UpScale. Here's how we work: UpScale takes a temporary cut of revenue for a fixed period while providing dedicated PTR support and LiveOps to our partners. Once that term ends, full revenue and control return to you, and you keep everything that was built along the way.
 
@@ -161,7 +160,7 @@ We recently came across **[Game Name]** and really like where you're taking the 
 
 If you're up for a quick chat, I can answer any extra questions you have.""",
     """\
-Hi [User],
+Hi,
 
 [Your Name] from UpScale here. Our partnership model: a temporary percentage of revenue for a set period, with dedicated PTR support and LiveOps provided throughout. When the term is over, full revenue and control return to you — and you keep everything built during the partnership.
 
@@ -169,7 +168,7 @@ Hi [User],
 
 Up for a quick look? I'm happy to answer any extra questions.""",
     """\
-Hey [User],
+Hey,
 
 This is [Your Name] from UpScale. We take a temporary percentage of revenue for a set period, and our partners get dedicated PTR support and LiveOps the whole way. Once the term ends, full revenue and control go back to you — everything built during the partnership is yours to keep.
 

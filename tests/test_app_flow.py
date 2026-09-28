@@ -114,6 +114,14 @@ def test_render_empty_template_falls_back_to_default():
     assert "I'm ace from UpScale" in message
 
 
+def test_default_templates_open_with_plain_greeting():
+    """(2026-09-28) The [User] placeholder is gone: every starter opens with
+    a plain greeting, so nothing is ever copied with an unfilled tag."""
+    for template in DEFAULT_MESSAGE_TEMPLATES:
+        assert "[User]" not in template
+        assert template.splitlines()[0] in ("Hey,", "Hi,"), template.splitlines()[0]
+
+
 # --------------------------------------------------------------------------- #
 # Optional Discord User ID -> real <@ID> mention in the copied message
 # --------------------------------------------------------------------------- #
@@ -695,6 +703,50 @@ def test_sidebar_has_discord_filter_radio_without_coverage_chip(monkeypatch):
     # The old removal-era banner must stay gone.
     infos = [w.value for w in at.info]
     assert not any("known contact state" in v for v in infos)
+
+
+# --------------------------------------------------------------------------- #
+# Discord availability filter narrows BEFORE the page slice (fixed
+# 2026-09-28): the filter used to run after paging, so a 20-row page
+# collapsed to the 2–5 rows on that page that happened to have Discord.
+# --------------------------------------------------------------------------- #
+
+
+def test_discord_filter_shows_full_page_of_matching_games(monkeypatch):
+    """With 'Discord available' selected, a 20-game page shows all 20 Discord
+    games — not the handful that survived a filter applied after paging."""
+    at = _fresh_app()
+    at.run()
+    at.session_state["onboarding_complete"] = True
+    at.session_state["pending_initial_scan"] = False
+    at.session_state["welcome_scan_started"] = True
+    at.session_state["discord_name"] = "dev_razor10"
+    # 30 games: 25 with Discord, 5 without — filtering 25 rows to a
+    # 20-per-page slice must still render a full 20-row page.
+    base = _demo_frame()
+    import copy
+    rows = []
+    for i in range(30):
+        row = base.iloc[0].copy()
+        row["universe_id"] = i + 1
+        row["root_place_id"] = 1000 + i
+        row["title"] = f"Game {i}"
+        row["visits"] = 50_000_000 + i
+        row["ccu"] = 1000 + i
+        has_discord = i < 25
+        row["has_discord"] = has_discord
+        row["discord_url"] = "https://discord.gg/test" if has_discord else None
+        rows.append(row)
+    at.session_state["data"] = pd.DataFrame(rows)
+    at.session_state["source"] = "demo"
+    at.session_state["discord_filter_radio"] = "Discord Available (True)"
+    at.run()
+    assert not at.exception
+    table_html = _table_html(at)
+    count = table_html.count("<tr>") - 1  # minus the header row
+    assert count == 20, f"expected a full 20-row page, got {count}"
+    assert "Game 0" in table_html and "Game 19" in table_html, "first 20 Discord games"
+    assert "Game 25" not in table_html, "no-Discord games are filtered out"
 
 
 # --------------------------------------------------------------------------- #
