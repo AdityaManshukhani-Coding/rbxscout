@@ -131,7 +131,7 @@ Hey,
 
 I'm [Your Name] from UpScale. At UpScale, we take a temporary percentage of revenue for a set period while providing our partners with dedicated PTR support and LiveOps. Once the term ends, full revenue and control return to you, and you keep everything built during the partnership.
 
-[Game Name] recently caught our eye, and we really love where you're taking the project. I wanted to see if you're open to exploring ways to scale it?
+**[Game Name]** recently caught our eye, and we really love where you're taking the project. I wanted to see if you're open to exploring ways to scale it?
 
 If you're up for a quick look, I can answer any extra questions."""
 
