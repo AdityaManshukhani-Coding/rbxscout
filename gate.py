@@ -26,14 +26,17 @@ access passwords (``access_passwords.json`` next to this module: SHA-256
 hashes of the 100 generated keys; the plaintext list lives only with the
 owner, e.g. pasted into a private Google Doc next to each friend's name).
 
-Anti-sharing rule: each user password records the (client IP, device id)
-pairs it is used from. The moment one password shows up from **two
-different IPs AND two different device ids**, it is assumed shared between
-two people: the password is banned and both users are locked out (their
-remembered unlocks are revoked too, so a refresh sends them back to the
-password screen). Same-IP multi-device use (one friend on laptop + phone
-at home) never triggers the ban — the two conditions must hold together.
-The master password is exempt from all of this by design.
+Anti-sharing rule: each user password records the (device id, client IP)
+logins it is used from. The moment one password is used by **two devices on
+two different networks within a short window** (90 s — a key passed hand to
+hand), it is assumed shared between two people: the password is banned and
+both users are locked out (their remembered unlocks are revoked too, so a
+refresh sends them back to the password screen). Every honest pattern is
+naturally outside that window: a returning scout re-logs in minutes or days
+later, classmates on one wifi share the IP, and one device on the move
+shares the device id. A key banned under the ORIGINAL over-eager rule (two
+IPs + two devices in any combination) self-heals on its owner's next
+correct sign-in. The master password is exempt from all of this by design.
 """
 
 from __future__ import annotations
@@ -89,6 +92,12 @@ def _expected_password() -> str:
 _USER_HASH_SALT = "rbxscout-access-v1:"
 # Per-password history bounds (last-seen wins; sharing needs only 2 entries).
 _MAX_TRACKED = 8
+# Two logins inside this window count as SIMULTANEOUS use — the signature of
+# two people actively passing one key around. Sequential re-logins (a scout
+# coming back the next day from a different network) sit far outside it.
+# 90 s covers a copy-paste handoff plus a page reload; no honest single user
+# needs two devices within 90 seconds.
+_PAIR_WINDOW_SECONDS = 90.0
 
 
 def _user_hashes_path() -> Path:
@@ -147,52 +156,93 @@ def user_password_status(candidate: str) -> str:
 def check_user_password(candidate: str, ref: str | None, ip: str | None) -> str:
     """Validate one user-key attempt; returns ``ok``/``banned``/``wrong``.
 
-    On ``ok`` the IP and the device id are recorded for that key. When the
-    history shows TWO separate IPs AND TWO separate device ids, the key is
-    being shared between two people: it is banned for everyone and its
-    remembered unlocks are revoked, so both users hit the password screen
-    again and are refused from there. Owner's rule: one password = one
-    person = one device. (Edge case accepted by the owner: one person using
-    two devices on two networks also trips the ban — stick to one device.)
+    On ``ok`` the (device id, client IP) login is recorded for that key.
+    When the history shows TWO PEOPLE using the key, it is banned for
+    everyone and its remembered unlocks are revoked, so both users hit the
+    password screen again and are refused from there. Owner's rule: one
+    password = one person = one device.
 
-    Lenient corners: an "unknown" IP (bare tests, localhost) never counts
-    toward the two-IP condition, so local development is never banned.
+    What counts as a second person (fixed 2026-09-28): the ORIGINAL rule —
+    "two distinct IPs AND two distinct device ids, in any combination" —
+    banned a single returning scout whose device id expired (localStorage
+    cleared, new browser, ``?ref`` lost): their re-login arrived from a NEW
+    device id on a NEW network (wifi -> cellular), completing both
+    conditions although nobody shared anything. The tripwire now requires
+    SIMULTANEOUS use: two logins whose device ids differ AND whose IPs
+    differ within ``_PAIR_WINDOW_SECONDS`` of each other. That is the
+    signature of a key being passed around live; every honest pattern is
+    naturally outside it —
+      * a returning scout re-logs in minutes or days later, never seconds;
+      * classmates sharing one wifi differ in device, never in IP;
+      * one device on the move differs in IP but shares the device id.
+    The master password is exempt from all of this by design.
+
+    Lenient corners: an "unknown" IP (bare tests, localhost) never counts,
+    so local development is never banned.
+
+    Self-heal (2026-09-28): keys banned under the old over-eager rule are
+    unbanned by their owner's next correct sign-in — presenting the right
+    plaintext clears the flag, so currently existing passwords fix
+    themselves with no manual state surgery.
     """
     key = _user_hash(candidate)
     if key not in _load_user_hashes():
         return "wrong"
     device = _ref_key(ref)
+    now = time.time()
     banned_now = False
     with _STATE_LOCK:
         state = _load_user_state()
         entry = state.get(key) if isinstance(state.get(key), dict) else {}
         if entry.get("banned"):
-            return "banned"
+            # A key banned under the OLD two-IP+two-device rule locked out
+            # returning scouts who had done nothing wrong. Someone presenting
+            # the correct plaintext proves ownership (a sharer would need
+            # BOTH plaintexts, and the old ban was never proof of sharing),
+            # so the ban clears here and the login proceeds.
+            entry.pop("banned", None)
+            entry.pop("banned_at", None)
+            entry.pop("banned_reason", None)
+            # Fresh tracking too: the ban (wrong or stale) must not immediately
+            # re-trip from login evidence gathered under the old rule.
+            entry.pop("logins", None)
+            entry["unbanned_at"] = now
         ips = [str(x) for x in entry.get("ips", []) if x]
         refs = [str(x) for x in entry.get("refs", []) if x]
-        if ip and ip != "unknown" and ip not in ips:
-            ips = (ips + [ip])[-_MAX_TRACKED:]
-        if device and device not in refs:
-            refs = (refs + [device])[-_MAX_TRACKED:]
-        now = time.time()
+        logins = [
+            [str(d), str(a), float(t)]
+            for d, a, t in (entry.get("logins") or [])
+            if d and a and t
+        ]
+        if ip and ip != "unknown":
+            if ip not in ips:
+                ips = (ips + [ip])[-_MAX_TRACKED:]
+            if device and device not in refs:
+                refs = (refs + [device])[-_MAX_TRACKED:]
+            logins.append([device or "", ip, now])
+            logins = logins[-_MAX_TRACKED:]
+            # The sharing tripwire: a PREVIOUS login from a DIFFERENT device
+            # on a DIFFERENT IP inside the simultaneity window.
+            for d, a, t in logins[:-1]:
+                if d != device and a != ip and abs(now - t) <= _PAIR_WINDOW_SECONDS:
+                    entry["banned"] = True
+                    entry["banned_at"] = now
+                    entry["banned_reason"] = (
+                        "used from two devices on two networks within "
+                        f"{_PAIR_WINDOW_SECONDS:.0f}s "
+                        f"({a} / {d} then {ip} / {device})"
+                    )
+                    banned_now = True
+                    break
         entry.update(
             {
                 "ips": ips,
                 "refs": refs,
+                "logins": logins,
                 "first_seen": entry.get("first_seen") or now,
                 "last_seen": now,
             }
         )
-        # The sharing tripwire, exactly as specified: two separate IPs AND
-        # two separate device ids on the same key = shared password = ban.
-        if len(ips) >= 2 and len(refs) >= 2:
-            entry["banned"] = True
-            entry["banned_at"] = now
-            entry["banned_reason"] = (
-                f"used from {len(ips)} IPs and {len(refs)} devices "
-                f"({', '.join(ips)} / {', '.join(refs)})"
-            )
-            banned_now = True
         state[key] = entry
         _save_user_state(state)
     # Unlock revocation happens OUTSIDE _STATE_LOCK: it acquires the same
