@@ -275,12 +275,31 @@ def replace_catalog_asset(rel: dict, token: str, name: str, data: bytes) -> None
                     expect_json=True, timeout=UPLOAD_TIMEOUT)
     reported = int((uploaded or {}).get("size") or 0)
     if reported != len(data):
-        # The old asset is still in place — nothing was lost. Fail loudly so
-        # the workflow run is marked failed and the next push retries.
-        raise SyncError(
-            f"upload verification failed for {name}: GitHub reports "
-            f"{reported} bytes, expected {len(data)} — old catalog left intact"
-        )
+        # GitHub sometimes completes the upload but returns an empty or
+        # truncated response body (observed 2026-10-02 on the ~100 MB
+        # catalog: two pushes in one evening reported "0 bytes" although
+        # the blob had stored fine). An empty report is NOT proof of
+        # failure — re-check the stored asset's size in the release before
+        # giving up; the old catalog is still in place either way.
+        stored_ok = False
+        if reported == 0:
+            rel_fresh = get_release(token) or {}
+            incoming = next(
+                (a for a in rel_fresh.get("assets", [])
+                 if a.get("name") == incoming_name), None)
+            stored_ok = (incoming is not None
+                         and int(incoming.get("size") or 0) == len(data))
+            if stored_ok:
+                uploaded = incoming
+        if not stored_ok:
+            # The old asset is still in place — nothing was lost. Fail
+            # loudly so the workflow run is marked failed and the next
+            # push retries.
+            raise SyncError(
+                f"upload verification failed for {name}: GitHub reports "
+                f"{reported} bytes, expected {len(data)} — old catalog "
+                f"left intact"
+            )
     old = next((a for a in rel.get("assets", []) if a.get("name") == name), None)
     if old is not None:
         _api("DELETE", f"/repos/{repo_slug()}/releases/assets/{old['id']}", token)
@@ -509,7 +528,16 @@ def cmd_pull() -> int:
     _checkpoint_wal(DB_PATH)
     tmp.replace(DB_PATH)
     _restore_contacts_from_bundle(rel, token)
-    state = _asset_state(rel, token)
+    # The state marker download shares the empty-response flakiness that
+    # hit the uploads (2026-10-02: pulls installed the catalog but read
+    # "sync #?", leaving the local counter stale and every later push
+    # "refused" as a rollback). Retry before accepting an empty read.
+    state = None
+    for _ in range(3):
+        state = _asset_state(rel, token)
+        if state:
+            break
+        time.sleep(3)
     if state:
         STATE_PATH.write_text(state + "\n")
     if recovered:

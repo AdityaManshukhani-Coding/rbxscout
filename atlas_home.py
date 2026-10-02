@@ -400,7 +400,10 @@ def push_with_merge_retry(harvest_copy: Path) -> None:
     the push guard can no longer fire."""
     import scout_core
 
-    for attempt in range(1, 4):
+    # Five attempts, not three: on a flaky network evening (VPN re-key,
+    # DNS blips, GitHub dropping upload response bodies) three rounds of
+    # pull-merge-upload can exhaust before one lands cleanly.
+    for attempt in range(1, 6):
         # The backfill holds its lock for the whole run; if it started since
         # our pull, do NOT pull (file replace under its worker) — just retry
         # the push: the counter guard refuses stale pushes anyway.
@@ -414,11 +417,20 @@ def push_with_merge_retry(harvest_copy: Path) -> None:
             log("  " + out.replace("\n", "\n  "))
         if rc == 0:
             return
-        if "refusing to push" in out and attempt < 3:
+        if "refusing to push" in out and attempt < 5:
             log(f"push raced with Actions (attempt {attempt}) — re-pulling + re-merging…")
             db_sync("pull")
             merged = merge_harvest_into(APP_DIR / "rbx_scout.db", harvest_copy)
             log(f"re-merge: {merged}")
+            continue
+        # A failed upload verification (flaky network dropping the response
+        # body mid-transfer — twice in one evening on 2026-10-02) is a
+        # TRANSIENT failure: the incoming blob is cleaned up by the next
+        # attempt and the store is never left worse than before it, so
+        # retry instead of aborting the whole run.
+        if "upload verification failed" in out and attempt < 5:
+            log(f"upload verification failed (attempt {attempt}) — retrying push…")
+            time.sleep(30)
             continue
         raise SystemExit(f"db_sync.py push failed (rc={rc})")
     raise SystemExit("push failed after 3 merge-retries")
