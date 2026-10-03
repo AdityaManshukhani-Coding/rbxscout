@@ -216,6 +216,111 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 """
 
 
+# --------------------------------------------------------------------------- #
+# Motion design system (UI_MICRO_ANIMATIONS_PLAN.md Phase 0).
+#
+# One shared vocabulary for every animation in the app: the same three
+# durations, one outgoing easing curve, and a single reduced-motion guard
+# that a CSS refactor cannot silently drop (pinned by tests/test_motion_css.py).
+# Rules of the road: animate only transform/opacity, 150-320ms, orange only
+# for positive/active signal, and every entrance must survive st.rerun()
+# (Streamlit remounts HTML blocks, which re-triggers CSS animations for free).
+_MOTION_CORE = """
+<style>
+:root {
+  /* Durations — never longer than 320ms for feedback */
+  --motion-fast: 120ms;   /* hover, press, toggle          */
+  --motion-base: 200ms;   /* enter/exit, color transitions */
+  --motion-slow: 320ms;   /* panels, page transitions      */
+  /* Easing — a single outgoing curve for everything small */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+}
+/* One media query disables ALL motion for users whose OS asks for less
+   (and for @test snapshot runs): durations collapse to effectively zero
+   while end states still apply via forwards/both fills. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+</style>
+"""
+
+# Full main-app motion block: the core tokens plus the app-wide interaction
+# rules (buttons, inputs). Rendered once per run right after the gate.
+_MOTION_CSS = _MOTION_CORE + """
+<style>
+/* Buttons: press depth + hover glow (plan 1.3). Transform/box-shadow only. */
+[data-testid="stButton"] button, [data-testid="stDownloadButton"] button {
+  transition: transform var(--motion-fast) var(--ease-out),
+              background var(--motion-fast) linear,
+              box-shadow var(--motion-fast) linear,
+              border-color var(--motion-fast) linear,
+              color var(--motion-fast) linear;
+}
+[data-testid="stButton"] button:hover:not(:disabled),
+[data-testid="stDownloadButton"] button:hover:not(:disabled) {
+  box-shadow: 0 0 0 1px rgba(255, 110, 1, 0.35);
+}
+[data-testid="stButton"] button:active:not(:disabled),
+[data-testid="stDownloadButton"] button:active:not(:disabled) {
+  transform: scale(0.97);
+}
+/* Sidebar focus-ring polish (plan 1.7): thin orange ring replaces the
+   browser default on every text-ish input. */
+.stApp input, .stApp textarea {
+  transition: box-shadow var(--motion-fast) linear,
+              border-color var(--motion-fast) linear;
+}
+.stApp input:focus, .stApp textarea:focus {
+  box-shadow: 0 0 0 2px rgba(255, 110, 1, 0.5) !important;
+  border-color: rgba(255, 110, 1, 0.5) !important;
+}
+</style>
+"""
+
+# Wrong-password shake (plan 3.3): a 4px horizontal shake on the gate card —
+# instant physical feedback that needs no extra text. Mounted as a script
+# because the class must be added after the card is in the DOM.
+_GATE_SHAKE_SCRIPT = r"""
+<script>
+(function () {
+  var card = document.querySelector('.gate-card');
+  if (!card || card.classList.contains('ss-shake')) { return; }
+  card.classList.add('ss-shake');
+})();
+</script>
+"""
+
+# Sync-completion toast (plan 2.3). The server drops a pending flag when a
+# sync succeeds; this script consumes it on the NEXT rerun and slides a
+# small card up from the bottom-right (translateY + opacity, motion-slow),
+# auto-dismissing after 3s. Pure DOM, no libraries; the guard key keeps the
+# toast one-shot even if Streamlit remounts the block mid-display. The
+# message text is substituted server-side (%TOAST_TEXT%) — DOMPurify strips
+# custom body attributes, so no data-attribute round-trip.
+_SYNC_TOAST_SCRIPT = r"""
+<script>
+(function () {
+  if (window.__ssToastShown) { return; }
+  window.__ssToastShown = true;
+  var el = document.createElement('div');
+  el.className = 'ss-toast';
+  el.setAttribute('role', 'status');
+  el.textContent = '%TOAST_TEXT%';
+  document.body.appendChild(el);
+  window.requestAnimationFrame(function () {
+    window.requestAnimationFrame(function () { el.classList.add('ss-toast-in'); });
+  });
+  window.setTimeout(function () {
+    el.classList.add('ss-toast-out');
+    window.setTimeout(function () { el.remove(); }, 400);
+  }, 3000);
+})();
+</script>
+"""
+
 PAGE_SIZE = 20
 DEFAULT_MIN_VISITS = 20_000
 DEFAULT_MIN_CCU = 25
@@ -353,6 +458,20 @@ def demo_dataframe() -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Device profile: remembers you across refreshes and back-navigation.
 # --------------------------------------------------------------------------- #
+
+
+def _is_watch_view() -> bool:
+    """True when the current render is the New & Upcoming watchlist.
+
+    Read from the workspace radio's session key (the same source the render
+    path uses) so table helpers can branch without threading a parameter
+    through every call. Never raises.
+    """
+    try:
+        return st.session_state.get("workspace_view") == "New & Upcoming"
+    except Exception:
+        return False
+
 
 _PROFILE_FIELDS = (        "discord_filter_radio",
     "discord_name",
@@ -496,6 +615,27 @@ def _render_gate() -> None:
                 max-width: 420px; margin: 9vh auto 0 auto; padding: 2.4rem 2.4rem;
                 border: 1px solid rgba(250, 250, 250, 0.12); border-radius: 18px;
                 background: rgba(250, 250, 250, 0.04); text-align: center;
+                /* Gate entrance (plan 3.3): card fades up 12px, mark scales in. */
+                animation: ss-gate-in var(--motion-slow) var(--ease-out) backwards;
+            }
+            @keyframes ss-gate-in {
+                from { opacity: 0; transform: translateY(12px); }
+                to { opacity: 1; transform: none; }
+            }
+            .gate-card img {
+                animation: ss-gate-mark 400ms var(--ease-out) backwards;
+            }
+            @keyframes ss-gate-mark {
+                from { opacity: 0; transform: scale(0.96); }
+                to { opacity: 1; transform: none; }
+            }
+            /* Wrong-password shake: one 240ms cycle, triggered by the shake
+               script adding .ss-shake after a failed attempt rerun. */
+            .gate-card.ss-shake { animation: ss-gate-shake 240ms linear 1; }
+            @keyframes ss-gate-shake {
+                0%, 100% { transform: none; }
+                25% { transform: translateX(-4px); }
+                75% { transform: translateX(4px); }
             }
             .gate-lock { font-size: 2.6rem; }
             .gate-brand {
@@ -551,6 +691,9 @@ def _render_gate() -> None:
                         f"Wrong password. {left} "
                         f"attempt{'s' if left != 1 else ''} left before the wait starts."
                     )
+                # Physical feedback (plan 3.3): the card shakes once. Set now,
+                # consumed on the rerun the error line itself rides on.
+                st.session_state["_gate_wrong_attempt"] = True
     else:
         total = gate.cooldown_total(ref) or 60.0
         mm, ss = divmod(int(remaining + 0.999), 60)
@@ -568,7 +711,8 @@ def _render_gate() -> None:
         )
 
     st.markdown("</div>", unsafe_allow_html=True)
-    st.html(_INPUT_GUARD_SCRIPT + _FAVICON_SCRIPT + _PASSWORD_ICON_GUARD_SCRIPT, unsafe_allow_javascript=True)  # no save-password prompt here either
+    shake = _GATE_SHAKE_SCRIPT if st.session_state.pop("_gate_wrong_attempt", False) else ""
+    st.html(_MOTION_CORE + shake + _INPUT_GUARD_SCRIPT + _FAVICON_SCRIPT + _PASSWORD_ICON_GUARD_SCRIPT, unsafe_allow_javascript=True)  # no save-password prompt here either
     st.stop()
 
 
@@ -837,6 +981,9 @@ def render_onboarding() -> bool:
 
 _restored = initialize_session()
 _render_gate()  # private site: nothing below renders without the password
+
+# Motion tokens + app-wide interaction rules, once per run (Phase 0).
+st.html(_MOTION_CSS, unsafe_allow_javascript=True)
 
 # --- Capacity metering (free-container self-protection) -------------------- #
 # 1 GB ceiling, no auto-scaling: the app meters itself. First the watchdog
@@ -1206,6 +1353,7 @@ if sync or st.session_state.pending_initial_scan:
     st.session_state.pending_initial_scan = False
     st.session_state.welcome_scan_started = True
     st.session_state.scan_error = ""
+    _sync_was_explicit = bool(sync)
     with st.spinner("Loading games that meet your targets..."):
         try:
             # Read-only catalog query — no discovery, no Roblox requests.
@@ -1235,6 +1383,12 @@ if sync or st.session_state.pending_initial_scan:
             st.session_state.source = "live"
             st.session_state.active_run_id = None
             reset_contact_page()
+            # Successful sync (plan 2.3): a toast slides up bottom-right on
+            # the rerun that renders the fresh table. Only for an explicit
+            # 'Sync live data' click — the automatic initial scan must not
+            # greet returning scouts with a notification they did not ask for.
+            if _sync_was_explicit:
+                st.session_state["_sync_toast_pending"] = True
         except Exception as exc:
             st.session_state.scan_error = str(exc)
             # On failure show a clear schema-stable empty frame; do NOT drag
@@ -1377,6 +1531,21 @@ visible = page_rows
 # (cookie state, endpoint results, queue budgets) stays internal.
 if st.session_state.get("scan_error"):
     st.sidebar.error(f"Last sync error: {st.session_state.scan_error}")
+
+# Sync toast (plan 2.3): consume the pending flag exactly once, on the rerun
+# AFTER the sync ran, so the toast appears together with the fresh table.
+# The page count rounds the message ('N games on this page') without a DB hit.
+if st.session_state.pop("_sync_toast_pending", False):
+    _toast_count = len(visible) if hasattr(visible, "__len__") else 0
+    # html.escape directly (not _esc): this block runs before the display
+    # helpers are defined in module order.
+    _toast_text = html.escape(
+        f"Catalog synced · {_toast_count} game{'s' if _toast_count != 1 else ''} on this page"
+    )
+    st.html(
+        _SYNC_TOAST_SCRIPT.replace("%TOAST_TEXT%", _toast_text),
+        unsafe_allow_javascript=True,
+    )
 elif scout.last_scan and scout.last_scan.get("error"):
     st.sidebar.error(f"Scan error: {scout.last_scan['error']}")
 
@@ -1408,13 +1577,23 @@ def game_url(row: pd.Series) -> str:
 
 
 
-TABLE_STYLE = """
+TABLE_STYLE = _MOTION_CORE + """
 <style>
 /* Results panel — UpScale Scouting Tool brand tokens (BRAND.md): Ink background,
-   Hairline borders, UpScale Orange reserved for positive signal. */
+   Hairline borders, UpScale Orange reserved for positive signal. Motion per
+   UI_MICRO_ANIMATIONS_PLAN.md: transform/opacity only, 150-320ms, one easing
+   curve; the reduced-motion guard ships inside _MOTION_CORE above. */
 .ss-panel {
   border: 1px solid #262A33; border-radius: 14px; overflow: hidden;
   background: #12161E; margin-top: 4px;
+  /* Panel + table ride the same entrance (plan 1.1 / 2.6): the whole
+     results panel fades up 8px once per remount (page change, view switch,
+     sync) — Streamlit remounts the block, which re-triggers it for free. */
+  animation: ss-panel-in var(--motion-slow) var(--ease-out) backwards;
+}
+@keyframes ss-panel-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
 }
 .ss-wrap { overflow-x: auto; }
 .ss-table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
@@ -1423,30 +1602,70 @@ TABLE_STYLE = """
   background: #161B24; color: #9AA4B2; font-weight: 600;
   font-size: 0.74rem; letter-spacing: 0.08em; text-transform: uppercase;
   border-bottom: 1px solid #262A33;
+  transition: box-shadow var(--motion-base) linear;
+}
+/* Scroll-linked header (plan 3.5): the top hairline brightens while the
+   table is scrolled right — a class the wrap script toggles on scroll. */
+.ss-panel.ss-scrolled .ss-table thead th {
+  box-shadow: inset 0 1px 0 rgba(255, 110, 1, 0.4);
 }
 .ss-table thead th.ss-col-game { text-align: left; padding-left: 18px; }
 .ss-table tbody td {
   padding: 9px 14px; vertical-align: middle; text-align: center;
   border-bottom: 1px solid #1B2029; color: #D7DCE4;
+  transition: background var(--motion-fast) linear;
 }
 .ss-table tbody tr:last-child td { border-bottom: none; }
-.ss-table tbody tr:hover td { background: rgba(255, 255, 255, 0.028); }
+/* Row entrance stagger (plan 1.1): fade-and-rise, 18ms per row capped at
+   220ms (~12 rows), so deep pages still feel snappy. Rendered as generated
+   nth-child rules in _ROW_STAGGER_CSS so the row markup, which tests match
+   literally, stays untouched. */
+.ss-table tbody tr { opacity: 0; animation: ss-row-in var(--motion-base) var(--ease-out) forwards; }
+@keyframes ss-row-in { to { opacity: 1; transform: none; } }
+.ss-table tbody tr { transform: translateY(6px); }
+/* Row hover (plan 1.2): a quiet lift — brighter wash, no scale on rows
+   (20-row tables shear). Background transitions fast and linear. */
+.ss-table tbody tr:hover td { background: rgba(255, 255, 255, 0.035); }
 .ss-cell-game { text-align: left !important; padding-left: 18px !important; }
 .ss-num { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .ss-genre {
   display: inline-block; padding: 3px 11px; border-radius: 999px;
   background: #1a1d25; border: 1px solid #262a33; color: #c3c8d1;
   font-size: 0.78rem; white-space: nowrap;
+  /* Genre pill wash-in (plan 1.5): Panel -> faint orange-tint border on
+     hover; color noise stays out of the resting state. */
+  transition: border-color var(--motion-fast) linear,
+              color var(--motion-fast) linear;
 }
+.ss-genre:hover { border-color: rgba(255, 110, 1, 0.45); color: #E7ECF3; }
 .ss-up { color: #FF6E01; white-space: nowrap; }
 .ss-down { color: #EF4444; white-space: nowrap; }
 .ss-game { display: inline-flex; align-items: center; gap: 9px; text-decoration: none; color: inherit; }
 .ss-game:hover .ss-name { text-decoration: underline; }
-.ss-thumb { width: 44px; height: 44px; min-width: 44px; border-radius: 10px; object-fit: cover; background: rgba(128, 128, 128, 0.15); }
+.ss-thumb {
+  width: 44px; height: 44px; min-width: 44px; border-radius: 10px; object-fit: cover;
+  background: rgba(128, 128, 128, 0.15);
+  /* Thumb zoom-on-hover (plan 1.4): signals the link before the underline. */
+  transition: transform var(--motion-base) var(--ease-out),
+              box-shadow var(--motion-base) var(--ease-out);
+}
+.ss-game:hover .ss-thumb {
+  transform: scale(1.08);
+  box-shadow: 0 0 0 1px #262A33;
+}
 .ss-fallback {
   width: 44px; height: 44px; min-width: 44px; border-radius: 10px;
   display: inline-flex; align-items: center; justify-content: center;
   background: rgba(128, 128, 128, 0.15);
+  /* Skeleton shimmer (plan 1.8): a one-time gradient sweep over the gray
+     placeholder so a missing thumbnail reads as 'loading', not 'broken'. */
+  background-image: linear-gradient(100deg, transparent 30%, rgba(255, 255, 255, 0.06) 50%, transparent 70%);
+  background-size: 220% 100%;
+  animation: ss-shimmer 900ms var(--ease-out) 1 backwards;
+}
+@keyframes ss-shimmer {
+  from { background-position: 120% 0; }
+  to { background-position: -120% 0; }
 }
 .ss-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; font-size: 0.98rem; }
 .ss-discord { display: inline-flex; align-items: center; gap: 7px; text-decoration: none; }
@@ -1457,13 +1676,77 @@ TABLE_STYLE = """
   font-size: 0.8rem; padding: 5px 10px; border-radius: 8px; cursor: pointer;
   border: 1px solid rgba(128, 128, 128, 0.5); background: transparent;
   color: inherit; white-space: nowrap; font-family: inherit;
+  transition: transform var(--motion-fast) var(--ease-out),
+              background var(--motion-fast) linear,
+              box-shadow var(--motion-fast) linear,
+              border-color var(--motion-fast) linear,
+              color var(--motion-fast) linear;
 }
-.ss-copy:hover { background: rgba(128, 128, 128, 0.15); }
-.ss-copied { color: #FF6E01; border-color: #FF6E01; }
+.ss-copy:hover { background: rgba(128, 128, 128, 0.15); box-shadow: 0 0 0 1px rgba(255, 110, 1, 0.35); }
+.ss-copy:active { transform: scale(0.97); }
+.ss-copied { color: #FF6E01; border-color: #FF6E01; animation: ss-copy-pulse 160ms var(--ease-out) 1; }
 .ss-copyfail { color: #EF4444; border-color: #EF4444; }
+/* Checkmark draw (plan 2.2): the SVG path in the copy script animates its
+   stroke-dashoffset through this keyframe. */
+@keyframes ss-check-draw { to { stroke-dashoffset: 0; } }
+/* Copy success pulse (plan 1.6): one small scale beat so 'copied' registers
+   peripherally; the checkmark draw itself lives in the copy script (2.2). */
+@keyframes ss-copy-pulse {
+  0% { transform: scale(1); }
+  60% { transform: scale(1.06); }
+  100% { transform: scale(1); }
+}
 .ss-none { opacity: 0.55; }
+/* Blow-up flag pulse (plan 2.5, watchlist only): a ONE-time two-pulse orange
+   left border on entrance, then settles. The single sanctioned repeated
+   pulse — it IS the product signal. Applied via the ss-blowup row class. */
+tr.ss-blowup td:first-child {
+  box-shadow: inset 2px 0 0 #FF6E01;
+  animation: ss-blowup-pulse 700ms var(--ease-out) 1;
+}
+@keyframes ss-blowup-pulse {
+  0%, 100% { box-shadow: inset 2px 0 0 #FF6E01; }
+  30% { box-shadow: inset 3px 0 6px rgba(255, 110, 1, 0.75); }
+  55% { box-shadow: inset 2px 0 1px rgba(255, 110, 1, 0.45); }
+  75% { box-shadow: inset 3px 0 6px rgba(255, 110, 1, 0.55); }
+}
+/* Pagination direction (plan 3.1): the wrap script adds ss-page-left/right
+   for one directional slide so a page change keeps its compass. */
+.ss-wrap.ss-page-left { animation: ss-page-left var(--motion-slow) var(--ease-out); }
+.ss-wrap.ss-page-right { animation: ss-page-right var(--motion-slow) var(--ease-out); }
+@keyframes ss-page-left {
+  from { opacity: 0; transform: translateX(-12px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes ss-page-right {
+  from { opacity: 0; transform: translateX(12px); }
+  to { opacity: 1; transform: none; }
+}
+/* Sync toast (plan 2.3): slides up bottom-right after a successful sync,
+   auto-dismisses. The DOM node + script live in _SYNC_TOAST_SCRIPT. */
+.ss-toast {
+  position: fixed; right: 18px; bottom: 18px; z-index: 999999;
+  background: #12161E; border: 1px solid #262A33; border-left: 2px solid #FF6E01;
+  border-radius: 10px; padding: 10px 14px; color: #E7ECF3;
+  font-size: 0.85rem; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  transform: translateY(10px); opacity: 0;
+  transition: transform var(--motion-slow) var(--ease-out),
+              opacity var(--motion-slow) var(--ease-out);
+  font-family: 'Source Sans Pro', sans-serif;
+}
+.ss-toast.ss-toast-in { transform: none; opacity: 1; }
+.ss-toast.ss-toast-out { transform: translateY(10px); opacity: 0; }
 </style>
 """
+
+# Row-stagger delays (plan 1.1): one nth-child rule per row position with an
+# 18ms increment, capped at ~220ms. Generated here (not inline styles) so
+# the <tr> markup — which tests match literally — stays untouched.
+_ROW_STAGGER_MAX_INDEX = 12
+_ROW_STAGGER_CSS = "<style>" + "".join(
+    f".ss-table tbody tr:nth-child({index}) {{ animation-delay: {min((index - 1) * 18, 220)}ms; }}"
+    for index in range(1, _ROW_STAGGER_MAX_INDEX + 1)
+) + "</style>"""
 
 
 def _esc(value) -> str:
@@ -1578,12 +1861,39 @@ document.addEventListener('click', function (event) {
     msg = msg.replace(/\[Your Name\]/gi, name).replace(/\[Name\]/gi, name);
   }
   var finish = function () {
-    btn.textContent = ok ? '✓ Copied!' : '✗ Copy failed';
-    btn.classList.add(ok ? 'ss-copied' : 'ss-copyfail');
+    // Copy confirmation (plan 2.2): an inline SVG checkmark whose stroke is
+    // DRAWN via stroke-dashoffset (~250ms), orange, then the label fades
+    // back after 1.2s. Replaces the plain text swap — the drawn tick reads
+    // as motion, the text alone read as a relabel.
+    var done = ok ? '✓ Copied!' : '✗ Copy failed';
+    btn.textContent = done;
+    if (ok) {
+      var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('viewBox', '0 0 16 16');
+      svg.setAttribute('width', '13'); svg.setAttribute('height', '13');
+      svg.setAttribute('aria-hidden', 'true');
+      svg.setAttribute('style', 'vertical-align:-2px;margin-right:4px;');
+      var path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', 'M2.5 8.5 L6.5 12.5 L13.5 4');
+      path.setAttribute('fill', 'none');
+      path.setAttribute('stroke', '#FF6E01');
+      path.setAttribute('stroke-width', '2');
+      path.setAttribute('stroke-linecap', 'round');
+      path.setAttribute('stroke-linejoin', 'round');
+      var len = 18;  // path length (approx, rounded up)
+      path.setAttribute('stroke-dasharray', String(len));
+      path.setAttribute('stroke-dashoffset', String(len));
+      path.style.animation = 'ss-check-draw 250ms var(--ease-out, ease-out) forwards';
+      svg.appendChild(path);
+      btn.insertBefore(svg, btn.firstChild);
+      btn.classList.add('ss-copied');
+    } else {
+      btn.classList.add('ss-copyfail');
+    }
     setTimeout(function () {
       btn.textContent = label;
       btn.classList.remove('ss-copied', 'ss-copyfail');
-    }, 1600);
+    }, 1200);
   };
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(msg).then(function () { ok = true; finish(); },
@@ -1597,6 +1907,52 @@ document.addEventListener('click', function (event) {
     ta.remove(); finish();
   }
 });
+</script>
+"""
+
+# Table feedback script (plan 3.1 + 3.5): two small listeners inside the
+# table's own st.html block so they remount with it on every rerun.
+#
+# 3.5 scroll-linked header: while the table is scrolled right, the panel
+# gets .ss-scrolled and the header hairline brightens — a functional
+# 'there is more to the right' signal on narrow screens.
+# 3.1 directional paging: on a page change the wrap slides 12px in the
+# direction of travel. The PREVIOUS page number is stashed in localStorage
+# by this same script; on the next remount a diff decides left vs right
+# (a full reload or view switch has no stash and skips the slide — the
+# plain stagger from _ROW_STAGGER_CSS carries the entrance instead).
+_PAGE_FEEDBACK_SCRIPT = r"""
+<script>
+(function () {
+  var wrap = document.querySelector('.ss-wrap');
+  if (!wrap) { return; }
+  // --- scroll-linked header hairline -------------------------------------
+  var panel = document.querySelector('.ss-panel');
+  var syncScrolled = function () {
+    if (panel) { panel.classList.toggle('ss-scrolled', wrap.scrollLeft > 4); }
+  };
+  wrap.addEventListener('scroll', syncScrolled, { passive: true });
+  syncScrolled();
+  // --- directional page slide --------------------------------------------
+  try {
+    var KEY = 'ss_last_page';
+    var now = wrap.closest('[data-testid="stElementContainer"], .stHtml') || wrap;
+    var seq = document.querySelectorAll('.ss-wrap').length;
+    var prev = parseInt(window.sessionStorage.getItem(KEY) || '0', 10) || 0;
+    var pageText = '';
+    var caps = document.querySelectorAll('.stCaption, [data-testid="stCaptionContainer"]');
+    for (var i = 0; i < caps.length; i++) {
+      var m = /Page (\d+) of (\d+)/.exec(caps[i].textContent || '');
+      if (m) { pageText = m[1] + '/' + m[2]; break; }
+    }
+    if (pageText && prev) {
+      var pNow = parseInt(pageText.split('/')[0], 10);
+      if (pNow > prev) { wrap.classList.add('ss-page-right'); }
+      else if (pNow < prev) { wrap.classList.add('ss-page-left'); }
+    }
+    window.sessionStorage.setItem(KEY, pageText);
+  } catch (e) { /* storage unavailable: skip the directional slide */ }
+})();
 </script>
 """
 
@@ -1686,6 +2042,19 @@ def _momentum_cell(value) -> str:
     return "<span class='ss-none'>0</span>"
 
 
+def _is_blowup_row(row: pd.Series) -> bool:
+    """True when a watchlist row carries the blow-up signal class.
+
+    The watchlist loads flagged games via load_blowup_watch(); the demo/live
+    frames never set the column, so the check must tolerate its absence.
+    """
+    try:
+        flag = row.get("blowup_flag")
+        return bool(flag) and not pd.isna(flag)
+    except (TypeError, ValueError):
+        return False
+
+
 def _rating_cell(row: pd.Series) -> str:
     """Rating cell: like ratio as a whole percent; '-' when no votes yet."""
     try:
@@ -1721,9 +2090,12 @@ def render_table(frame: pd.DataFrame) -> None:
     ]
     rows = []
     for _, row in frame.iterrows():
+        # Blow-up pulse (plan 2.5): watchlist rows carry the one-shot orange
+        # border pulse on entrance — main-scout rows never do.
+        row_open = '<tr class="ss-blowup">' if _is_watch_view() and _is_blowup_row(row) else "<tr>"
         rows.append(
-            "<tr>"
-            f"<td class='ss-cell-game'>{game_cell_html(row)}</td>"
+            row_open
+            + f"<td class='ss-cell-game'>{game_cell_html(row)}</td>"
             f"<td><span class='ss-genre'>{_esc(_text(row.get('genre'), 'Unknown'))}</span></td>"
             f"<td class='ss-num'>{_num_cell(row.get('visits'))}</td>"
             f"<td class='ss-num'>{_ccu_cell(row.get('ccu'))}</td>"
@@ -1733,7 +2105,7 @@ def render_table(frame: pd.DataFrame) -> None:
             f"<td class='ss-num'>{_ccu_cell(row.get('avg_ccu_3d'))}</td>"
             f"<td class='ss-num'>{_momentum_cell(row.get('momentum_1d'))}</td>"
             f"<td class='ss-num'>{_rating_cell(row)}</td>"
-            "</tr>"
+            + "</tr>"
         )
     # st.html with unsafe_allow_javascript=True is required for the copy
     # buttons: Streamlit's DOMPurify sanitization strips inline event
@@ -1742,12 +2114,14 @@ def render_table(frame: pd.DataFrame) -> None:
     # in _COPY_SCRIPT.
     st.html(
         TABLE_STYLE
+        + _ROW_STAGGER_CSS
         + '<div class="ss-panel"><div class="ss-wrap"><table class="ss-table"><thead><tr>'
         + f"<th class='ss-col-game'>{_esc(head[0])}</th>"
         + "".join(f"<th>{_esc(label)}</th>" for label in head[1:])
         + "</tr></thead><tbody>"
         + "".join(rows)
         + "</tbody></table></div></div>"
+        + _PAGE_FEEDBACK_SCRIPT
         + _COPY_SCRIPT,
         unsafe_allow_javascript=True,
     )
@@ -1783,7 +2157,34 @@ else:
         file_name=f"upscale-scouting-export_{time.strftime('%Y%m%d_%H%M')}.csv",
         mime="text/csv",
         width="content",
+        key="export_csv_button",
     )
+    # CSV export success state (plan 3.2): the browser's download bar is
+    # easy to miss, so the button itself confirms. Streamlit swaps widget
+    # labels only on rerun, so this runs on the NEXT rerun after the click
+    # (the click itself triggers one) — label morphs, then reverts in 2s.
+    if st.session_state.get("export_csv_button"):
+        st.html(
+            """
+<script>
+(function () {
+  var btns = document.querySelectorAll('[data-testid="stDownloadButton"] button');
+  var btn = btns[btns.length - 1];
+  if (!btn || btn.dataset.ssExported) { return; }
+  btn.dataset.ssExported = '1';
+  var label = btn.textContent;
+  btn.textContent = 'Exported ✓';
+  btn.classList.add('ss-copied');
+  setTimeout(function () {
+    btn.textContent = label;
+    btn.classList.remove('ss-copied');
+    delete btn.dataset.ssExported;
+  }, 2000);
+})();
+</script>
+""",
+            unsafe_allow_javascript=True,
+        )
 
 # Pagination sits under the results table, where users look for it.
 nav_left, nav_center, nav_right = st.columns([1, 2, 1])
