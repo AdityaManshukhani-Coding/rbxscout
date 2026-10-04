@@ -7,43 +7,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: curl baseline (no browser)
-        run: |
-          code=$(curl -s -o /tmp/b -w '%{http_code}' -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" "https://atlasdev.gg/api/prufer/universe-metric-series/994732206?days=1&bucket=1d")
-          echo "curl direct -> HTTP $code | $(head -c 80 /tmp/b)"
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Headless stealth browser test
+      - name: Free public proxy test against atlasdev.gg
         run: |
-          pip install -q patchright
-          python -m patchright install chromium --with-deps > /dev/null 2>&1 || true
-          python - <<'EOF'
-          from patchright.sync_api import sync_playwright
-          UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-          with sync_playwright() as p:
-              b = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-blink-features=AutomationControlled"])
-              ctx = b.new_context(user_agent=UA, locale="en-US", viewport={"width":1366,"height":768})
-              page = ctx.new_page()
-              try:
-                  page.goto("https://atlasdev.gg/analyze/994732206", timeout=60000, wait_until="domcontentloaded")
-                  page.wait_for_timeout(10000)
-                  html = page.content()
-                  print("page title:", page.title())
-                  print("challenge page:", "Just a moment" in html)
-                  meta = page.locator('meta[name="description"]').get_attribute("content")
-                  print("meta description:", meta)
-              except Exception as e:
-                  print("browser page failed:", str(e)[:200])
-              try:
-                  r = ctx.request.get("https://atlasdev.gg/api/prufer/universe-metric-series/994732206?days=2&bucket=1d", timeout=30000)
-                  print("prufer via browser context:", r.status, r.text()[:120])
-              except Exception as e:
-                  print("browser ctx request failed:", str(e)[:200])
-              b.close()
-          EOF
-      - name: Free public proxy test
-        run: |
+          pip install -q requests
           python - <<'EOF'
           import requests, random, concurrent.futures as cf
           UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36"}
@@ -68,10 +37,10 @@ jobs:
                   return None
           ok = []
           with cf.ThreadPoolExecutor(30) as ex:
-              for res in ex.map(test, proxies[:300]):
+              for res in ex.map(test, proxies[:400]):
                   if res and res[1] == 200:
                       ok.append(res)
-          print(f"tested 300 proxies, working against atlasdev.gg: {len(ok)}")
-          for px, code, body in ok[:10]:
+          print(f"tested 400 proxies, working against atlasdev.gg: {len(ok)}")
+          for px, code, body in ok[:15]:
               print("WORKS:", px, body)
           EOF
