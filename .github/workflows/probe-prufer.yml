@@ -5,22 +5,73 @@ permissions: {}
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
     steps:
-      - name: Probe atlasdev.gg from this runner
-        shell: bash
+      - name: curl baseline (no browser)
         run: |
-          set -u
-          echo "runner egress IP: $(curl -s https://api.ipify.org)"
-          UA="UpScaleScoutingTool/1.0 (Roblox game discovery; contact via repo)"
-          W1="https://rbx-search-proxy.thegamingbuddiesarethebest.workers.dev"
-          W2="https://rbx-search-proxy-mirror.other-subdomain.example.workers.dev"
-          probe () {
-            code=$(curl -s -o /tmp/body -w '%{http_code}' -H "User-Agent: $UA" "$2")
-            echo "$1 -> HTTP $code | $(head -c 100 /tmp/body | tr -d '\n')"
-          }
-          for i in 1 2 3; do
-            probe "prufer DIRECT run$i  " "https://atlasdev.gg/api/prufer/universe-metric-series/994732206?days=1&bucket=1d"
-            probe "prufer WORKER1 run$i " "$W1/https://atlasdev.gg/api/prufer/universe-metric-series/994732206?days=1&bucket=1d"
-            sleep 2
-          done
+          code=$(curl -s -o /tmp/b -w '%{http_code}' -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" "https://atlasdev.gg/api/prufer/universe-metric-series/994732206?days=1&bucket=1d")
+          echo "curl direct -> HTTP $code | $(head -c 80 /tmp/b)"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Headless stealth browser test
+        run: |
+          pip install -q patchright
+          python -m patchright install chromium --with-deps > /dev/null 2>&1 || true
+          python - <<'EOF'
+          from patchright.sync_api import sync_playwright
+          UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+          with sync_playwright() as p:
+              b = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-blink-features=AutomationControlled"])
+              ctx = b.new_context(user_agent=UA, locale="en-US", viewport={"width":1366,"height":768})
+              page = ctx.new_page()
+              try:
+                  page.goto("https://atlasdev.gg/analyze/994732206", timeout=60000, wait_until="domcontentloaded")
+                  page.wait_for_timeout(10000)
+                  html = page.content()
+                  print("page title:", page.title())
+                  print("challenge page:", "Just a moment" in html)
+                  meta = page.locator('meta[name="description"]').get_attribute("content")
+                  print("meta description:", meta)
+              except Exception as e:
+                  print("browser page failed:", str(e)[:200])
+              try:
+                  r = ctx.request.get("https://atlasdev.gg/api/prufer/universe-metric-series/994732206?days=2&bucket=1d", timeout=30000)
+                  print("prufer via browser context:", r.status, r.text()[:120])
+              except Exception as e:
+                  print("browser ctx request failed:", str(e)[:200])
+              b.close()
+          EOF
+      - name: Free public proxy test
+        run: |
+          python - <<'EOF'
+          import requests, random, concurrent.futures as cf
+          UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36"}
+          urls = [
+              "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+              "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+          ]
+          proxies = []
+          for u in urls:
+              try:
+                  proxies += [x.strip() for x in requests.get(u, timeout=15).text.splitlines() if x.strip()]
+              except Exception as e:
+                  print("list fetch failed:", u, str(e)[:80])
+          print("proxy pool:", len(proxies))
+          random.shuffle(proxies)
+          def test(px):
+              try:
+                  r = requests.get("https://atlasdev.gg/api/prufer/universe-metric-series/994732206?days=1&bucket=1d",
+                                   headers=UA, proxies={"http": f"http://{px}", "https": f"http://{px}"}, timeout=8)
+                  return (px, r.status_code, r.text[:60] if r.status_code == 200 else "")
+              except Exception:
+                  return None
+          ok = []
+          with cf.ThreadPoolExecutor(30) as ex:
+              for res in ex.map(test, proxies[:300]):
+                  if res and res[1] == 200:
+                      ok.append(res)
+          print(f"tested 300 proxies, working against atlasdev.gg: {len(ok)}")
+          for px, code, body in ok[:10]:
+              print("WORKS:", px, body)
+          EOF
