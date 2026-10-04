@@ -13,12 +13,14 @@ jobs:
           set -u
           echo "runner egress IP: $(curl -s https://api.ipify.org)"
           UA="UpScaleScoutingTool/1.0 (Roblox game discovery; contact via repo)"
-          W="https://rbx-search-proxy.thegamingbuddiesarethebest.workers.dev"
+          W1="https://rbx-search-proxy.thegamingbuddiesarethebest.workers.dev"
+          W2="https://rbx-search-proxy-mirror.other-subdomain.example.workers.dev"
           probe () {
             code=$(curl -s -o /tmp/body -w '%{http_code}' -H "User-Agent: $UA" "$2")
-            echo "$1 -> HTTP $code | $(head -c 120 /tmp/body)"
+            echo "$1 -> HTTP $code | $(head -c 100 /tmp/body | tr -d '\n')"
           }
-          probe "prufer DIRECT       " "https://atlasdev.gg/api/prufer/universe-metric-series/994732206?days=3&bucket=1d"
-          probe "prufer VIA WORKER   " "$W/https://atlasdev.gg/api/prufer/universe-metric-series/994732206?days=3&bucket=1d"
-          probe "analyze DIRECT (html)" "https://atlasdev.gg/analyze/994732206"
-          probe "analyze VIA WORKER   " "$W/https://atlasdev.gg/analyze/994732206"
+          for i in 1 2 3; do
+            probe "prufer DIRECT run$i  " "https://atlasdev.gg/api/prufer/universe-metric-series/994732206?days=1&bucket=1d"
+            probe "prufer WORKER1 run$i " "$W1/https://atlasdev.gg/api/prufer/universe-metric-series/994732206?days=1&bucket=1d"
+            sleep 2
+          done
