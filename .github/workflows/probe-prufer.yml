@@ -5,17 +5,18 @@ permissions: {}
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Free public proxy test against atlasdev.gg
+      - name: Full free-proxy pool test against atlasdev.gg
         run: |
           pip install -q requests
           python - <<'EOF'
-          import requests, random, concurrent.futures as cf
+          import requests, time, collections, concurrent.futures as cf
           UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36"}
+          URL = "https://atlasdev.gg/api/prufer/universe-metric-series/994732206?days=1&bucket=1d"
           urls = [
               "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
               "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
@@ -26,21 +27,29 @@ jobs:
                   proxies += [x.strip() for x in requests.get(u, timeout=15).text.splitlines() if x.strip()]
               except Exception as e:
                   print("list fetch failed:", u, str(e)[:80])
-          print("proxy pool:", len(proxies))
-          random.shuffle(proxies)
+          proxies = list(dict.fromkeys(proxies))  # dedupe, keep order
+          print("proxy pool (deduped):", len(proxies))
+          t0 = time.time()
+          outcomes = collections.Counter()
+          working = []
           def test(px):
               try:
-                  r = requests.get("https://atlasdev.gg/api/prufer/universe-metric-series/994732206?days=1&bucket=1d",
-                                   headers=UA, proxies={"http": f"http://{px}", "https": f"http://{px}"}, timeout=8)
+                  r = requests.get(URL, headers=UA,
+                                   proxies={"http": f"http://{px}", "https": f"http://{px}"}, timeout=8)
                   return (px, r.status_code, r.text[:60] if r.status_code == 200 else "")
               except Exception:
-                  return None
-          ok = []
-          with cf.ThreadPoolExecutor(30) as ex:
-              for res in ex.map(test, proxies[:400]):
-                  if res and res[1] == 200:
-                      ok.append(res)
-          print(f"tested 400 proxies, working against atlasdev.gg: {len(ok)}")
-          for px, code, body in ok[:15]:
+                  return (px, 0, "")
+          with cf.ThreadPoolExecutor(60) as ex:
+              for px, code, body in ex.map(test, proxies):
+                  outcomes[code] += 1
+                  if code == 200:
+                      working.append((px, body))
+          dt = time.time() - t0
+          total = len(proxies)
+          print(f"tested ALL {total} proxies in {dt:.0f}s")
+          print("outcome breakdown:", dict(outcomes))
+          ok = outcomes[200]
+          print(f"SUCCESS RATE: {ok}/{total} = {100*ok/total:.1f}%")
+          for px, body in working[:10]:
               print("WORKS:", px, body)
           EOF
