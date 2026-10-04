@@ -179,6 +179,55 @@ If you'd like, I can walk you through it and answer any extra questions.""",
 # Backwards-compatible alias: the first variant IS the original default.
 DEFAULT_MESSAGE_TEMPLATE = DEFAULT_MESSAGE_TEMPLATES[0]
 
+# Master-key-only alternative starter set ("Increates Studio"). Shown as a
+# second studio choice in the welcome flow and sidebar when the deployment's
+# master password (the owner's key) unlocked the app — regular scout keys
+# never see it. Same shape as the UpScale set: five rotations, [Game Name]
+# tag kept for render_outreach_message, casual deals-first voice, 🫡 sign-off
+# (owner-requested override of the no-emoji rule for this set).
+INCREASES_MESSAGE_TEMPLATES = (
+    """\
+Hey,
+
+I was wondering if there's any chance you'd be open to any deals for **[Game Name]**?
+
+We can offer you a competitive price and provide help with LiveOps, thumbnails, growth, monetisation & much more.
+
+Thanks so much for your time 🫡""",
+    """\
+Hey,
+
+Quick one — would you be open to hearing a deal or two for **[Game Name]**?
+
+We keep our offers competitive and back them up with hands-on help: LiveOps, thumbnails, growth, monetisation & a lot more.
+
+Appreciate you taking a look 🫡""",
+    """\
+Hi,
+
+Would you be interested in talking deals for **[Game Name]** at all?
+
+We can put a competitive price on the table and bring real support with it — LiveOps, thumbnails, growth, monetisation & much more besides.
+
+Thanks a lot for your time 🫡""",
+    """\
+Hey,
+
+Is there any room to chat about a deal for **[Game Name]**?
+
+We come in with a competitive offer and back it up with the full toolkit: LiveOps, thumbnails, growth, monetisation & more.
+
+Cheers for reading 🫡""",
+    """\
+Hi,
+
+Would you be open to exploring some deals for **[Game Name]**?
+
+Our offers are competitive, and we bring hands-on help along with them — LiveOps, thumbnails, growth, monetisation & much more.
+
+Thanks so much 🫡""",
+)
+
 NAME_TAG_REGEX = re.compile(r"\[(?:your name|name)\]", re.IGNORECASE)
 GAME_TAG_REGEX = re.compile(r"\[(?:game name|game)\]", re.IGNORECASE)
 

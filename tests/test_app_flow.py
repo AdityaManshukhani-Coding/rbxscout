@@ -515,6 +515,22 @@ def test_copy_button_rotates_all_variants_never_repeating():
     assert "filter" in js, "previous variant is excluded from the pick"
 
 
+def test_standard_session_rotation_pool_has_no_increates_messages():
+    """A regular (friend-key or gate-bypassed) session never rotates the
+    master-only Increates set: the pool stays exactly the 5 UpScale starters."""
+    at = _render_dashboard()
+    assert not at.exception
+
+    table_html = _table_html(at)
+    match = re.search(r'data-alts="([^"]+)"', table_html)
+    assert match, "copy button should embed the rotation pool"
+    pool = json.loads(html_module.unescape(match.group(1)))
+    texts = [entry["t"] for entry in pool]
+    for template in scout_core.INCREASES_MESSAGE_TEMPLATES:
+        rendered = render_outreach_message(template, "", "Blox Fruits")
+        assert rendered not in texts, "Increates copy leaked into a standard session"
+
+
 def test_copy_script_rewrites_identity_from_live_sidebar_inputs():
     """The freshness override must cover BOTH identity widgets.
 

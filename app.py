@@ -23,6 +23,7 @@ import streamlit as st
 from scout_core import (
     DEFAULT_MESSAGE_TEMPLATES,
     DEFAULT_MESSAGE_TEMPLATE,
+    INCREASES_MESSAGE_TEMPLATES,
     DISCORD_FILTER_ALL,
     DISCORD_FILTER_TRUE,
     DISCORD_FILTER_FALSE,
@@ -478,6 +479,8 @@ _PROFILE_FIELDS = (        "discord_filter_radio",
     "discord_user_id",
     "message_template",
     "message_variant",
+    "message_studio",
+    "master_unlocked",
     "target_min_visits",
     "target_min_ccu",
     "onboarding_step",
@@ -674,6 +677,14 @@ def _render_gate() -> None:
             result = gate.check_password(candidate, ref, gate._client_ip())
             if result == "ok":
                 st.session_state.gate_unlocked = True
+                # Master-key marker: only the deployment's own password (the
+                # owner's key) unlocks the Increates Studio choice. Friend
+                # keys never see it. Kept in the device profile so it
+                # survives refreshes — the gate itself only remembers THAT
+                # the device is unlocked, not which password did it.
+                if candidate == gate._expected_password():
+                    st.session_state.master_unlocked = True
+                    _profile_save()
                 gate.remember_unlock(ref)
                 st.rerun()
             if result == "banned":
@@ -728,6 +739,8 @@ def initialize_session() -> bool:
         "discord_user_id": "",  # optional; turns [Your Name] into a real <@ID> mention
         "message_template": DEFAULT_MESSAGE_TEMPLATE,
         "message_variant": 0,  # which of the 5 starter templates is active
+        "message_studio": "UpScale Studio",  # master-only: UpScale vs Increates
+        "master_unlocked": False,  # True when the owner's own password unlocked
         "pending_initial_scan": False,
     "welcome_scan_started": False,
         "active_run_id": None,
@@ -774,6 +787,27 @@ def _message_variant_options() -> list:
     ]
 
 
+def _master_unlocked() -> bool:
+    """True when the deployment's own (owner/master) password unlocked this
+    device. Regular scout friend-keys get the standard flow only."""
+    return bool(st.session_state.get("master_unlocked", False))
+
+
+def _active_message_templates() -> tuple:
+    """The starter set for the chosen studio (master-only switch)."""
+    if _master_unlocked() and st.session_state.get("message_studio") == "Increates Studio":
+        return INCREASES_MESSAGE_TEMPLATES
+    return DEFAULT_MESSAGE_TEMPLATES
+
+
+def _apply_message_studio() -> None:
+    """Load the freshly chosen studio's first starter into the editable
+    template and remember the choice (master-only control)."""
+    st.session_state.message_variant = _message_variant_options()[0]
+    st.session_state.message_template = _active_message_templates()[0]
+    _profile_save()
+
+
 def _apply_message_variant() -> None:
     """Load the picked starter into the editable template and remember it.
 
@@ -787,7 +821,7 @@ def _apply_message_variant() -> None:
         index = options.index(st.session_state.get("message_variant"))
     except (ValueError, TypeError):
         index = 0
-    st.session_state.message_template = DEFAULT_MESSAGE_TEMPLATES[index]
+    st.session_state.message_template = _active_message_templates()[index]
     _profile_save()
 
 
@@ -913,6 +947,21 @@ def render_onboarding() -> bool:
             "This is the message the Copy button prepares for each game. Edit it "
             "however you like, or continue with the default."
         )
+        if _master_unlocked():
+            # Owner-only (master password): pick which studio's starter set
+            # the rotation draws from. Regular scout keys never see this.
+            st.radio(
+                "Studio",
+                options=("UpScale Studio", "Increates Studio"),
+                key="message_studio",
+                persist_state="session",
+                on_change=_apply_message_studio,
+                help=(
+                    "UpScale Studio rotates the five original revenue-share "
+                    "starters. Increates Studio swaps in a deals-first set "
+                    "instead."
+                ),
+            )
         st.radio(
             "Starter message",
             options=_message_variant_options(),
@@ -1288,6 +1337,16 @@ with st.sidebar.expander("Current target", expanded=True):
         st.rerun()
 
 with st.sidebar.expander("Your message", expanded=False):
+    if _master_unlocked():
+        # Owner-only (master password): the studio switch follows the scout
+        # out of the welcome flow, so the set can be flipped any time.
+        st.radio(
+            "Studio",
+            options=("UpScale Studio", "Increates Studio"),
+            key="message_studio",
+            persist_state="session",
+            on_change=_apply_message_studio,
+        )
     st.radio(
         "Starter message",
         options=_message_variant_options(),
@@ -1968,9 +2027,9 @@ def _copy_pool(row: pd.Series) -> list:
     the saved one, exactly like the single-message path). Keys ("s0"…"s5")
     let the client script avoid repeating the same variant back to back.
     """
-    templates = list(DEFAULT_MESSAGE_TEMPLATES)
+    templates = list(_active_message_templates())
     current = str(st.session_state.get("message_template") or "").strip()
-    if current and current not in {t.strip() for t in DEFAULT_MESSAGE_TEMPLATES}:
+    if current and current not in {t.strip() for t in templates}:
         templates.append(current)  # a customized template joins the rotation
     return [
         (
