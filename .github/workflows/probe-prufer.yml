@@ -1,0 +1,24 @@
+name: Atlas prufer reachability probe
+on:
+  workflow_dispatch: {}
+permissions: {}
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe atlasdev.gg from this runner
+        shell: bash
+        run: |
+          set -u
+          echo "runner egress IP: $(curl -s https://api.ipify.org)"
+          UA="UpScaleScoutingTool/1.0 (Roblox game discovery; contact via repo)"
+          W="https://rbx-search-proxy.thegamingbuddiesarethebest.workers.dev"
+          probe () {
+            code=$(curl -s -o /tmp/body -w '%{http_code}' -H "User-Agent: $UA" "$2")
+            echo "$1 -> HTTP $code | $(head -c 120 /tmp/body)"
+          }
+          probe "prufer DIRECT       " "https://atlasdev.gg/api/prufer/universe-metric-series/994732206?days=3&bucket=1d"
+          probe "prufer VIA WORKER   " "$W/https://atlasdev.gg/api/prufer/universe-metric-series/994732206?days=3&bucket=1d"
+          probe "analyze DIRECT (html)" "https://atlasdev.gg/analyze/994732206"
+          probe "analyze VIA WORKER   " "$W/https://atlasdev.gg/analyze/994732206"
