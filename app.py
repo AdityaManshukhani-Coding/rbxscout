@@ -23,7 +23,6 @@ import streamlit as st
 from scout_core import (
     DEFAULT_MESSAGE_TEMPLATES,
     DEFAULT_MESSAGE_TEMPLATE,
-    INCREASES_MESSAGE_TEMPLATES,
     DISCORD_FILTER_ALL,
     DISCORD_FILTER_TRUE,
     DISCORD_FILTER_FALSE,
@@ -35,12 +34,25 @@ from scout_core import (
     render_outreach_message,
     truncate,
 )
+import scout_core as _scout_core
 import capacity
 import catalog_fetch
 import gate
 import profile_store
 
 logging.basicConfig(level=logging.INFO)
+
+# Hot-update resilience (2026-10-04 outage): when Streamlit Cloud's git-pull
+# hot-update reruns this script, the running Python process may still hold a
+# scout_core module imported BEFORE the latest pull — the master-only Increates
+# set is then missing from it, and a hard ``from scout_core import`` would
+# crash the whole app with an ImportError until someone reboots the container.
+# Fall back to the classic starters instead: a wedged deploy degrades to the
+# original message set (feature off) instead of a dead site, and the real set
+# activates on the next full app reboot.
+INCREASES_MESSAGE_TEMPLATES = getattr(
+    _scout_core, "INCREASES_MESSAGE_TEMPLATES", DEFAULT_MESSAGE_TEMPLATES
+)
 
 APP_DIR = Path(__file__).resolve().parent
 BRAND_DIR = APP_DIR / "assets" / "brand"
