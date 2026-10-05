@@ -54,18 +54,19 @@ def _gate_state(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _offline_scans():
-    """Fail every scan instantly so the dashboard never attempts the network."""
+def _offline_scans(monkeypatch):
+    """Fail every scan instantly so the dashboard never attempts the network.
+
+    monkeypatch, NOT manual save/restore: the old manual restore put `scan`'s
+    original back into BOTH attributes, permanently aliasing scan_contacts to
+    scan() for the rest of the suite (every later scan_contacts(force=...) call
+    died with "scan() got an unexpected keyword argument 'force'")."""
 
     def _boom(self, *args, **kwargs):
         raise RuntimeError("offline test scan")
 
-    original = scout_core.RobloxPlatformScout.scan
-    scout_core.RobloxPlatformScout.scan = _boom
-    scout_core.RobloxPlatformScout.scan_contacts = _boom
-    yield
-    scout_core.RobloxPlatformScout.scan = original
-    scout_core.RobloxPlatformScout.scan_contacts = original
+    monkeypatch.setattr(scout_core.RobloxPlatformScout, "scan", _boom)
+    monkeypatch.setattr(scout_core.RobloxPlatformScout, "scan_contacts", _boom)
 
 
 def _demo_frame() -> pd.DataFrame:

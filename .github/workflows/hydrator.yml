@@ -52,6 +52,20 @@ env:
   # contacts.bundle sidecar (key matches the laptop's contacts.key and the
   # Streamlit CONTACTS_KEY secret).
   CONTACTS_KEY: ${{ secrets.CONTACTS_KEY || '' }}
+  # ---------------------------------------------------------------------
+  # prufer pre-pass (ATLAS_PRUFER_HYDRATOR_PLAN.md): refresh due games
+  # through Atlas Dev's metric-series API over a freshly-validated
+  # free-proxy pool BEFORE spending the Roblox budget. Fail-open: every
+  # game it skips stays in the tier-due queue below, so the pipeline is
+  # identical to pre-prufer behavior whenever prufer is unhealthy.
+  # Measured 2026-10-04: 9.0% proxy yield (195/2164 from a real runner),
+  # ~4 min pool validation, 96% catalog coverage, hourly snapshots.
+  # ---------------------------------------------------------------------
+  PRUFER_ENABLED: '1'
+  PRUFER_REQUESTS_PER_TICK: '300'   # metric-only repaints per tick (own budget, not Roblox's)
+  PRUFER_MAX_HOURS: '2'             # freshness gate: last Atlas point must be younger
+  PRUFER_POOL_VALIDATION_SAMPLE: '1400'
+  PRUFER_HISTORY_DAYS: '2'
 
 jobs:
   hydrate:

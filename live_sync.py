@@ -73,6 +73,14 @@ def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float, mode: st
     print(f"hydration budget  : {hyd.get('new', 0)} new + {hyd.get('known_due', 0)} known-due "
           f"→ {hyd.get('hydrated', 0)} hydrated, {hyd.get('deferred', 0)} rolled to next sync "
           f"(cap {hyd.get('budget_batches', '?')} batches)")
+    pru = scan.get("prufer") or {}
+    if pru:
+        attempted = int(pru.get("attempted") or 0)
+        accepted = int(pru.get("accepted") or 0)
+        rate = (accepted / attempted * 100) if attempted else 0.0
+        print(f"prufer pre-pass   : {accepted}/{attempted} games served via Atlas Dev "
+              f"({rate:.0f}% acceptance · pool {pru.get('pool_validated', 0)} proxies)"
+              + ("  — ⚠ sustained low acceptance: check atlasdev.gg" if attempted and rate < 50 else ""))
     before_games = before.get("games", 0)
     print(f"catalog           : {before_games:,} → {scan.get('catalog_count', before_games):,} games "
           f"(Δ {scan.get('catalog_count', before_games) - before_games:+,})")

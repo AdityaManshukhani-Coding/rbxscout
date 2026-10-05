@@ -2510,6 +2510,21 @@ class RobloxPlatformScout:
     # ------------------------------------------------------------------ #
 
     def _enqueue_discovery(self, items: Iterable[Tuple[int, str, int]]) -> int:
+        """Insert or ignore a batch of discovery-queue rows (new games to evaluate).
+
+        Each item is (universe_id, source, priority). Dedup is automatic —
+        re-enqueuing an already-seen universe_id is a no-op. Returns the count
+        of newly inserted rows.
+
+        IMPORTANT contract: this enqueues IDs for *later* verification by the
+        queue drain. It does NOT hydrate, validate, or contact-resolve them.
+        In particular, Atlas Dev seeds are enqueued with their pre-filtered
+        metrics (>=20k visits, >=25 CCU) but those numbers are Atlas's third-
+        party prose, not Roblox-verified — the drain's strict gate re-fetches
+        everything from games.roblox.com before the game is admitted to the
+        catalog. Discord contact resolution happens separately, AFTER a game
+        has passed the gate and landed in game_analytics.
+        """
         """Insert candidate universe IDs into the discovery queue (dedup).
 
         ``items`` yields (universe_id, source, priority). Existing rows keep
@@ -3114,6 +3129,51 @@ class RobloxPlatformScout:
         return stats
 
     # ------------------------------------------------------------------ #
+    # prufer pre-pass (ATLAS_PRUFER_HYDRATOR_PLAN.md Phase 2)
+    # ------------------------------------------------------------------ #
+
+    def _prufer_pre_pass(self, hydration_ids: List[int]) -> Dict[str, Any]:
+        """Try to refresh due games through Atlas Dev's prufer API first.
+
+        Fail-open by construction: any problem (feature off, no working
+        proxies, API redesign, all payloads stale/tampered) returns an empty
+        result and the caller hydrates everything via Roblox exactly as
+        before this module existed. Roblox stays the source of truth —
+        accepted prufer numbers are metric-only upserts (last_updated bumps,
+        tier bookkeeping runs on the next real hydration) so a bad Atlas
+        number can only ever be a one-tick repaint, never a catalog change.
+
+        Request budget: prufer traffic is SEPARATE from the Roblox batch
+        budget (PRUFER_REQUESTS_PER_TICK, default 300) — the scheduler's
+        spend assumptions stay valid regardless of prufer health.
+        """
+        import prufer as prufer_mod
+
+        result: Dict[str, Any] = {"attempted": 0, "accepted": 0, "gate_rejected": 0, "stats": {}}
+        if not prufer_mod.PRUFER_ENABLED or not hydration_ids:
+            return result
+        try:
+            client = prufer_mod.PruferClient()
+            stats = client.refresh_batch(list(hydration_ids))
+        except Exception as exc:  # NEVER let prufer break the hydrator
+            log.warning("prufer pre-pass failed (falling back to Roblox): %s", exc)
+            return result
+        result["attempted"] = len(hydration_ids)
+        result["pool_validated"] = client.pool_size
+        result["accepted"] = len(stats)
+        result["gate_rejected"] = max(0, len(hydration_ids) - len(stats))
+        # Shape for upsert_metrics_only: {uid: {ccu, visits, favorites}}
+        result["stats"] = {
+            int(uid): {
+                "ccu": s.get("ccu"),
+                "visits": s.get("visits"),
+                "favorites": s.get("favorites"),
+            }
+            for uid, s in stats.items()
+        }
+        return result
+
+    # ------------------------------------------------------------------ #
     # Full scan orchestration
     # ------------------------------------------------------------------ #
 
@@ -3237,6 +3297,43 @@ class RobloxPlatformScout:
                 "deferred": max(0, len(known_due) - len(hydration_ids)),
                 "budget_batches": HYDRATION_BUDGET_PER_SYNC,
             }
+
+            # ------------------------------------------------------------------
+            # prufer pre-pass (ATLAS_PRUFER_HYDRATOR_PLAN.md): refresh as many
+            # due games as possible through Atlas Dev's metric-series API over
+            # a freshly-validated free-proxy pool, BEFORE spending the Roblox
+            # request budget. Only games whose last series point passes the
+            # freshness gate are accepted; everything else (no series, stale,
+            # tampered, no proxies) STAYS in hydration_ids and is hydrated by
+            # Roblox exactly as before — prufer is purely additive and can
+            # never leave a game worse off. Roblox remains source of truth.
+            # ------------------------------------------------------------------
+            if do_hydrate and hydration_ids:
+                prufer_stats = self._prufer_pre_pass(hydration_ids)
+                if prufer_stats.get("attempted"):
+                    # Record even an all-rejected pass — the health summary
+                    # and the <50%-acceptance alert need the zero counters.
+                    self.last_scan["prufer"] = {
+                        k: v for k, v in prufer_stats.items() if k != "stats"
+                    }
+                if prufer_stats.get("accepted"):
+                    self.upsert_metrics_only(prufer_stats["stats"])
+                    accepted_ids = set(prufer_stats["stats"])
+                    hydration_ids = [u for u in hydration_ids if int(u) not in accepted_ids]
+                    self.last_scan["hydration_budget"]["prufer_served"] = len(accepted_ids)
+                    self.last_scan["hydration_budget"]["hydrated"] = len(hydration_ids)
+                    if not hydration_ids:
+                        # Every due game was served by prufer this tick.
+                        self.last_scan.update({
+                            "status": "complete",
+                            "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "matched_count": 0,
+                            "metrics_count": 0,
+                            "catalog_count": int(self.load_table().shape[0]),
+                        })
+                        self._finish_scan()
+                        report(1.0, f"prufer served all {len(accepted_ids)} due games — Roblox budget untouched.")
+                        return pd.DataFrame()
 
             if not hydration_ids:
                 # Nothing due (or nothing new to hydrate): finish cleanly

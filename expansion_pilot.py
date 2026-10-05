@@ -79,6 +79,10 @@ def record_run(db_path: str, mode: str, run_id: int, scan: dict, diag: dict,
                         "catalog": (scan.get("catalog_count")),
                         "tier_counts": scan.get("tier_counts") or {},
                         "expansion": scan.get("expansion") or None,
+                        # prufer pre-pass telemetry (ATLAS_PRUFER_HYDRATOR_PLAN.md):
+                        # acceptance-rate trending lives here — the <50%/24h
+                        # alert reads these counters.
+                        "prufer": scan.get("prufer") or None,
                     }),
                 ),
             )
