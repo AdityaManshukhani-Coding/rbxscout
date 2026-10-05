@@ -384,7 +384,7 @@ def _run_backfill(args: argparse.Namespace, *, resumed: bool = False) -> int:
         log(f"cookie: attached (.ROBLOSECURITY, {len(cookie):,} chars)")
 
     pool = args.pool
-    with sqlite3.connect(str(DB)) as conn:
+    with sqlite3.connect(str(DB), factory=scout_core._ClosingConnection) as conn:
         qualified_ids = scout.contacts_backfill_due(limit=args.limit or 10 ** 9)
         # --pool fully determines the sweep; --all is the legacy "also do
         # the decayed band" switch (incident 2026-09-25: a shard launched
@@ -404,7 +404,7 @@ def _run_backfill(args: argparse.Namespace, *, resumed: bool = False) -> int:
         qualified_ids = qualified_ids[::-1]
         decayed_ids = decayed_ids[::-1]
 
-    with sqlite3.connect(str(DB)) as conn:
+    with sqlite3.connect(str(DB), factory=scout_core._ClosingConnection) as conn:
         q_total, q_checked, hits = contact_coverage(conn)
     log(f"coverage now: {q_checked:,}/{q_total:,} qualified checked · {hits:,} with Discord")
     log(f"qualified backlog: {len(qualified_ids):,} games"
@@ -450,7 +450,7 @@ def _run_backfill(args: argparse.Namespace, *, resumed: bool = False) -> int:
                     empty_streak = 0
             total_checked += len(chunk)
             total_hits += hits_here
-            with sqlite3.connect(str(DB)) as conn:
+            with sqlite3.connect(str(DB), factory=scout_core._ClosingConnection) as conn:
                 _, q_checked_now, hits_now = contact_coverage(conn)
             log(
                 f"[{label}] {start + len(chunk):,}/{len(ids):,} queued · "
@@ -484,7 +484,7 @@ def _run_backfill(args: argparse.Namespace, *, resumed: bool = False) -> int:
             continue
         break  # only reached via the throttle break
 
-    with sqlite3.connect(str(DB)) as conn:
+    with sqlite3.connect(str(DB), factory=scout_core._ClosingConnection) as conn:
         q_total, q_checked, hits = contact_coverage(conn)
     log(
         f"coverage now: {q_checked:,}/{q_total:,} qualified checked · "

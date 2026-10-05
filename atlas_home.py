@@ -31,7 +31,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
+import json
 import os
 import sqlite3
 import subprocess
@@ -68,6 +70,153 @@ def _acquire_instance_lock() -> bool:
 
 LOG_DIR = APP_DIR / "logs"
 LOG_FILE = LOG_DIR / "atlas_home.log"
+
+# Written when the end-of-run push fails after every retry. The next run sees
+# it and drains the local catalog to the store BEFORE pulling (a pull would
+# otherwise wipe the stranded discoveries — the 2026-10-04 morning run lost
+# its 131 finds exactly this way). Cleared by the next successful push.
+PUSH_FAILED_MARKER = LOG_DIR / "atlas_home_push_failed.json"
+
+
+def _sqlite_open_retry(path: Path, attempts: int = 6) -> sqlite3.Connection:
+    """sqlite3.connect with backoff on transient open failures.
+
+    "unable to open database file" here was EMFILE under the launchd 256-fd
+    cap (incident 2026-10-02..04: every run died at the snapshot/push tail —
+    root cause: `with sqlite3.connect()` never CLOSES, leaking 3 fds per
+    connection) or a transient FS blip; "database is locked" rides out a
+    competing writer's transaction. Caller owns closing. The context-manager
+    flavor is _local_conn (commit + close on exit).
+    """
+    delay = 0.5
+    for attempt in range(1, attempts + 1):
+        try:
+            return sqlite3.connect(str(path))
+        except sqlite3.OperationalError as exc:
+            transient = ("unable to open database file" in str(exc)
+                         or "database is locked" in str(exc))
+            if not transient or attempt == attempts:
+                raise
+            log(f"sqlite open retry {attempt}/{attempts} on {Path(path).name}: {exc}")
+            time.sleep(delay)
+            delay = min(delay * 2, 8.0)
+    raise AssertionError("unreachable")  # attempts >= 1 always returns/raises
+
+
+@contextlib.contextmanager
+def _local_conn(path: Path):
+    """`with _local_conn(db) as conn:` — commit-on-exit semantics kept, plus
+    transient-open retry and a guaranteed close."""
+    conn = _sqlite_open_retry(path)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
+def _pending_atlas_rows(db_path: Path) -> list:
+    """Pending atlas_dev seed rows in the LOCAL catalog — rows the store may
+    never have seen when a previous run's push failed."""
+    if not db_path.exists():
+        return []
+    try:
+        with _local_conn(db_path) as conn:
+            return conn.execute(
+                "SELECT universe_id, source, priority, status, outcome, seen_at, evaluated_at "
+                "FROM discovery_queue WHERE source='atlas_dev' AND status='pending'"
+            ).fetchall()
+    except sqlite3.Error:
+        return []  # no queue table yet / unreadable copy: nothing to preserve
+
+
+def _restore_pending_seeds(db_path: Path, rows: list) -> int:
+    """Re-insert seeds a store pull wiped. INSERT OR IGNORE: rows the fresh
+    copy already knows (processed or pending) are never clobbered."""
+    if not rows:
+        return 0
+    try:
+        with _local_conn(db_path) as conn:
+            cur = conn.executemany(
+                "INSERT OR IGNORE INTO discovery_queue "
+                "(universe_id, source, priority, status, outcome, seen_at, evaluated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+            return max(0, cur.rowcount)
+    except sqlite3.Error as exc:
+        log(f"seed restore failed (non-fatal): {exc}")
+        return 0
+
+
+def _snapshot_db(local: Path, harvest_copy: Path) -> None:
+    """Backup-API snapshot with retry — the exact step every 2026-10-02..04
+    run died on. SQLite backup API, NOT a byte copy: WAL commits live in the
+    -wal file and a byte copy can miss recent writes."""
+    delay = 1.0
+    for attempt in range(1, 6):
+        try:
+            with _local_conn(local) as src, _local_conn(harvest_copy) as dst:
+                src.backup(dst)
+            return
+        except sqlite3.OperationalError as exc:
+            if attempt == 5:
+                raise
+            log(f"snapshot attempt {attempt} failed ({exc}) — retrying in {delay:.0f}s")
+            time.sleep(delay)
+            delay = min(delay * 2, 15.0)
+
+
+def _write_push_marker(reason: str, pending_seeds: int) -> None:
+    try:
+        PUSH_FAILED_MARKER.write_text(
+            json.dumps({
+                "failed_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "reason": reason,
+                "pending_atlas_seeds": pending_seeds,
+            }, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass  # a broken marker must never kill a harvest
+
+
+def _read_push_marker() -> dict | None:
+    try:
+        return json.loads(PUSH_FAILED_MARKER.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _clear_push_marker() -> None:
+    try:
+        PUSH_FAILED_MARKER.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def run_push_tail(local: Path) -> bool:
+    """Snapshot + merge-safe push — the delivery step of every run.
+
+    True on success (marker cleared). On final failure: writes the stranded-
+    work marker (the next run drains BEFORE pulling), logs loudly, returns
+    False — the caller owns the exit code. The local catalog is never rolled
+    back: harvested rows stay safe in it either way.
+    """
+    harvest_copy = local.with_suffix(".db.harvest")
+    try:
+        _snapshot_db(local, harvest_copy)
+        push_with_merge_retry(harvest_copy)
+    except (Exception, SystemExit) as exc:
+        _write_push_marker(str(exc), len(_pending_atlas_rows(local)))
+        log("PUSH FAILED after retries — harvested rows are SAFE in the local "
+            "catalog; the next run drains them before pulling (or run "
+            "`python push_pending.py` now).")
+        return False
+    finally:
+        harvest_copy.unlink(missing_ok=True)
+    _clear_push_marker()
+    return True
 
 # Discovery ONLY: the queue drain must stay a no-op on this machine —
 # hydration and gate evaluation belong to the always-on Actions expander.
@@ -158,15 +307,12 @@ def verify_sole_engine() -> None:
 
 
 def catalog_stats(db: Path) -> dict:
-    conn = sqlite3.connect(str(db))
-    try:
+    with _local_conn(db) as conn:
         games = conn.execute("SELECT COUNT(*) FROM game_analytics").fetchone()[0]
         atlas_pending = conn.execute(
             "SELECT COUNT(*) FROM discovery_queue "
             "WHERE status='pending' AND source='atlas_dev'"
         ).fetchone()[0]
-    finally:
-        conn.close()
     return {"games": games, "atlas_pending": atlas_pending}
 
 
@@ -179,7 +325,7 @@ def merge_harvest_into(target: Path, harvest: Path) -> dict:
     evaluated keep their 'processed' outcome — dedup memory is preserved.
     """
     stats = {t: 0 for t in MERGE_TABLES}
-    conn = sqlite3.connect(str(target))
+    conn = _sqlite_open_retry(target)
     try:
         conn.execute("ATTACH DATABASE ? AS hv", (str(harvest),))
         for table in MERGE_TABLES:
@@ -241,7 +387,7 @@ def backfill_thumbnails(local: Path) -> int:
 
     try:
         scout = scout_core.RobloxPlatformScout(db_path=str(local))
-        with sqlite3.connect(str(local)) as conn:
+        with _local_conn(local) as conn:
             doomed = [int(r[0]) for r in conn.execute(
                 "SELECT universe_id FROM game_analytics "
                 "WHERE (icon_url IS NULL OR icon_url = '') "
@@ -254,7 +400,7 @@ def backfill_thumbnails(local: Path) -> int:
         votes = scout.fetch_vote_totals(doomed)
         scout.upsert_icons(icons)
         scout.upsert_votes(votes)
-        with sqlite3.connect(str(local)) as conn:
+        with _local_conn(local) as conn:
             conn.execute(
                 "INSERT INTO scan_pointers (id, last_universe_id, updated_at) "
                 "VALUES ('home_icon_backfill_at', 0, CURRENT_TIMESTAMP) "
@@ -303,7 +449,7 @@ def contact_sweep(local: Path, stats: dict) -> int:
             log("contact sweep skipped: no RBXSCOUT_COOKIE / local_cookie.txt / "
                 "local_cookie2.txt (game social-links need .ROBLOSECURITY)")
             return 0
-        with sqlite3.connect(str(local)) as conn:
+        with _local_conn(local) as conn:
             already = int((conn.execute(
                 "SELECT last_universe_id FROM scan_pointers WHERE id = 'home_contact_sweep_at'"
             ).fetchone() or (0,))[0])
@@ -354,7 +500,7 @@ def contact_sweep(local: Path, stats: dict) -> int:
             with concurrent.futures.ThreadPoolExecutor(max_workers=lanes) as lane_x:
                 hits = int(sum(lane_x.map(lambda pair: _lane(*pair),
                                           zip(cookies, lane_pools))))
-        with sqlite3.connect(str(local)) as conn:
+        with _local_conn(local) as conn:
             conn.execute(
                 "INSERT INTO scan_pointers (id, last_universe_id, updated_at) "
                 "VALUES ('home_contact_sweep_at', 0, CURRENT_TIMESTAMP) "
@@ -459,12 +605,34 @@ def main() -> int:
     # runs; its end-of-run push carries our writes anyway (one shared local
     # DB), so skip the whole store cycle rather than replace the file under
     # its worker. Everything else proceeds normally against the local DB.
+    local = APP_DIR / "rbx_scout.db"
+
+    # -- 0. stranded-work drain (hardening, 2026-10-02..04 incident) -------
+    # A run whose push failed strands its discoveries in the local catalog.
+    # Deliver them BEFORE the pull — the pull installs the store copy
+    # verbatim and would wipe anything the store has never seen.
+    stranded = _pending_atlas_rows(local)
+    marker = _read_push_marker()
+    if (stranded or marker) and not scout_core_guard():
+        why = f"{len(stranded)} pending seed(s)" + (" + push-failed marker" if marker else "")
+        log(f"stranded work detected ({why}) — draining to the store BEFORE the pull")
+        if run_push_tail(local):
+            log("pre-pull drain: stranded rows delivered to the store")
+        else:
+            log("pre-pull drain failed (non-fatal; the post-harvest push retries)")
+
+    # The pull replaces the local file with the store copy — remember the
+    # pending seeds first and re-enqueue any the pull wiped (the 2026-10-04
+    # morning run lost its 131 finds exactly this way).
+    pre_pull_seeds = _pending_atlas_rows(local)
     if scout_core_guard():
         log("CONTACT BACKFILL RUNNING — skipping pull; working on the local "
             "catalog (the backfill's end-of-run push will carry our results)")
     else:
         db_sync("pull")
-    local = APP_DIR / "rbx_scout.db"
+    restored = _restore_pending_seeds(local, pre_pull_seeds)
+    if restored:
+        log(f"pull protection: re-enqueued {restored} local seed(s) the pull had wiped")
     before = catalog_stats(local)
     log(f"pulled catalog: {before['games']:,} games · {before['atlas_pending']:,} atlas seeds pending")
 
@@ -505,7 +673,7 @@ def main() -> int:
     # -- 3. backfill thumbnails for icon-less rows (24h-throttled) ---------
     # Home IP only: atlasdev.gg 403s runner IPs, and the thumbnail/vote
     # endpoints follow the same pattern. Actions never pays this traffic.
-    with sqlite3.connect(str(local)) as conn:
+    with _local_conn(local) as conn:
         backfill_due = _hours_since_backfill(conn) >= ICON_BACKFILL_HOURS
     if backfill_due:
         backfill_thumbnails(local)
@@ -528,24 +696,13 @@ def main() -> int:
             f"{contact_stats.get('contacts_hits', 0)} with Discord"
         )
 
-    # -- 4. snapshot the post-harvest DB (used only if a push races) -------
-    # SQLite backup API, NOT a raw byte copy: WAL-mode commits live in the
-    # -wal file and a byte copy can produce a snapshot missing recent writes
-    # (exact class of bug that bit the backfill's push-race snapshot).
-    harvest_copy = local.with_suffix(".db.harvest")
-    src = sqlite3.connect(str(local))
-    try:
-        dst = sqlite3.connect(str(harvest_copy))
-        try:
-            src.backup(dst)
-        finally:
-            dst.close()
-    finally:
-        src.close()
-
-    # -- 4. push (merge-retry against Actions races) -----------------------
-    push_with_merge_retry(harvest_copy)
-    harvest_copy.unlink(missing_ok=True)
+    # -- 4. snapshot + push (hardened after the 2026-10-02..04 EMFILE incident)
+    # Backup-API snapshot (NOT a byte copy — WAL commits live in the -wal
+    # file) retried on transient open failures, then the merge-safe push.
+    # A final failure strands NOTHING: the marker makes the next run drain
+    # before pulling, and the local catalog keeps every harvested row.
+    if not run_push_tail(local):
+        return 1
     log(f"DONE in {time.time() - started:.0f}s — Actions will drain + hydrate the new seeds")
     return 0
 

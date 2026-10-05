@@ -30,12 +30,13 @@ def remaining(conn) -> int:
 
 
 def main() -> int:
-    print(f"rows missing icons at start: {remaining(sqlite3.connect(str(DB)))}")
+    with sqlite3.connect(str(DB), factory=scout_core._ClosingConnection) as conn:
+        print(f"rows missing icons at start: {remaining(conn)}")
     scout = scout_core.RobloxPlatformScout(db_path=str(DB))
     total_filled = 0
     empty_streak = 0
     for g in range(MAX_GROUPS):
-        with sqlite3.connect(str(DB)) as conn:
+        with sqlite3.connect(str(DB), factory=scout_core._ClosingConnection) as conn:
             doomed = [
                 int(r[0]) for r in conn.execute(
                     "SELECT universe_id FROM game_analytics "
@@ -66,7 +67,8 @@ def main() -> int:
         else:
             empty_streak = 0
         time.sleep(1.0)
-    left = remaining(sqlite3.connect(str(DB)))
+    with sqlite3.connect(str(DB), factory=scout_core._ClosingConnection) as conn:
+        left = remaining(conn)
     print(f"done: filled {total_filled} this run; rows still icon-less: {left}")
     return 0
 

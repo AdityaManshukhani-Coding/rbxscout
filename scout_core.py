@@ -103,6 +103,40 @@ def _contact_memcache_put(uid: int, record: Dict[str, Any]) -> None:
 # and unlike the file lock, losing that fight means a *silently dropped* write.
 DB_WRITE_LOCK = threading.Lock()
 
+
+class _ClosingConnection(sqlite3.Connection):
+    """Connection whose `with` block CLOSES the connection on exit.
+
+    Plain `with sqlite3.connect(...)` only commits/rolls back — the connection
+    itself stayed open, leaking its db/-wal/-shm file descriptors (3 fds per
+    connection) until the GC felt like collecting them, which under this
+    codebase's workload it effectively never did. The launchd-scheduled home
+    harvest runs under a 256-fd soft cap and opens ~300 short-lived
+    connections per run, so from 2026-10-02 to 2026-10-04 EVERY run hit EMFILE
+    at its tail: "unable to open database file" on the snapshot/push step —
+    plus a flood of misleading "Failed to resolve" DNS errors, because
+    getaddrinfo also needs a spare fd. Closing in __exit__ bounds the process
+    to a handful of live connections no matter how many open.
+    """
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # A nested `with conn:` re-enters __exit__ on the SAME object: the
+        # inner exit commits and closes, so a second super().__exit__() on
+        # the now-closed connection would raise ProgrammingError. Commit
+        # exactly once, close exactly once.
+        if self._closed_once:
+            return None
+        self._closed_once = True
+        try:
+            return super().__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            try:
+                self.close()
+            except sqlite3.ProgrammingError:
+                pass
+
+    _closed_once = False
+
 # --------------------------------------------------------------------------- #
 # Regexes
 # --------------------------------------------------------------------------- #
@@ -709,7 +743,10 @@ class RobloxPlatformScout:
         return status, data
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=15)
+        # _ClosingConnection: commit/rollback semantics unchanged, but the
+        # with-block now also closes — without this, every connection leaks
+        # 3 fds and the daily harvest dies of EMFILE (2026-10-02..04 incident).
+        conn = sqlite3.connect(self.db_path, timeout=15, factory=_ClosingConnection)
         conn.execute("PRAGMA journal_mode=WAL")
         # Wait up to 15 s for a competing writer instead of failing instantly;
         # combined with the process-wide DB_WRITE_LOCK this makes concurrent
@@ -2460,34 +2497,36 @@ class RobloxPlatformScout:
         the state a later prune would forget how to restore.
         """
         with DB_WRITE_LOCK:
+            # One `with` = one transaction = one close. (A nested `with conn:`
+            # here would commit-and-close on the INNER exit and leave the
+            # outer exit operating on a closed connection.)
             with self._connect() as conn:
                 conn.execute("PRAGMA busy_timeout=15000")
-                with conn:
-                    conn.executemany(
-                        "UPDATE game_analytics SET has_discord=?, discord_url=?, "
-                        "status=?, found_via=?, has_social_links=?, contacts_checked_at=?, "
-                        "contact_schema_version=? WHERE universe_id=?",
-                        rows,
-                    )
-                    # Keep the revival memory in step with every persisted
-                    # verdict (same transaction): a row pruned later
-                    # resurrects with this answer already in hand.
-                    conn.executemany(
-                        "INSERT INTO contact_archive ("
-                        "universe_id, has_discord, discord_url, status, found_via, "
-                        "has_social_links, contacts_checked_at, contact_schema_version, "
-                        "title, archived_at) "
-                        "SELECT ?, ?, ?, ?, ?, ?, ?, ?, title, CURRENT_TIMESTAMP "
-                        "FROM game_analytics WHERE universe_id=? "
-                        "ON CONFLICT(universe_id) DO UPDATE SET "
-                        "has_discord=excluded.has_discord, discord_url=excluded.discord_url, "
-                        "status=excluded.status, found_via=excluded.found_via, "
-                        "has_social_links=excluded.has_social_links, "
-                        "contacts_checked_at=excluded.contacts_checked_at, "
-                        "contact_schema_version=excluded.contact_schema_version, "
-                        "title=excluded.title, archived_at=CURRENT_TIMESTAMP",
-                        [(row[-1],) + row for row in rows],
-                    )
+                conn.executemany(
+                    "UPDATE game_analytics SET has_discord=?, discord_url=?, "
+                    "status=?, found_via=?, has_social_links=?, contacts_checked_at=?, "
+                    "contact_schema_version=? WHERE universe_id=?",
+                    rows,
+                )
+                # Keep the revival memory in step with every persisted
+                # verdict (same transaction): a row pruned later
+                # resurrects with this answer already in hand.
+                conn.executemany(
+                    "INSERT INTO contact_archive ("
+                    "universe_id, has_discord, discord_url, status, found_via, "
+                    "has_social_links, contacts_checked_at, contact_schema_version, "
+                    "title, archived_at) "
+                    "SELECT ?, ?, ?, ?, ?, ?, ?, ?, title, CURRENT_TIMESTAMP "
+                    "FROM game_analytics WHERE universe_id=? "
+                    "ON CONFLICT(universe_id) DO UPDATE SET "
+                    "has_discord=excluded.has_discord, discord_url=excluded.discord_url, "
+                    "status=excluded.status, found_via=excluded.found_via, "
+                    "has_social_links=excluded.has_social_links, "
+                    "contacts_checked_at=excluded.contacts_checked_at, "
+                    "contact_schema_version=excluded.contact_schema_version, "
+                    "title=excluded.title, archived_at=CURRENT_TIMESTAMP",
+                    [(row[-1],) + row for row in rows],
+                )
 
     def _ensure_contact_archive(self) -> None:
         """Recreate contact_archive if a pull replaced the catalog with a

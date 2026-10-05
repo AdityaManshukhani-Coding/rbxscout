@@ -47,6 +47,20 @@
     <key>StandardErrorPath</key>
     <string>/Users/adityamanshukhani/Downloads/Open-Cowork-main/Discord Website/logs/atlas_home_run.err</string>
 
+    <!-- Incident 2026-10-02..04: launchd's default 256-file soft cap starved
+         the harvest of file descriptors — leaked WAL connections (3 fds each,
+         since fixed in scout_core._ClosingConnection) pushed the run past the
+         cap mid-flight, and EVERY open then failed: "unable to open database
+         file" on sqlite AND bogus "Failed to resolve" DNS errors (getaddrinfo
+         needs an fd too). Code now closes its connections, but 256 is still
+         tight for pull + harvest + backfill + sweep in one process — raise it
+         so one slow descriptor can never again end the run. -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>2048</integer>
+    </dict>
+
     <key>Nice</key>
     <integer>10</integer>
 </dict>
