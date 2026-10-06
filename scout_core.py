@@ -353,6 +353,7 @@ ATLAS_STAT_PAGES_DEFAULT = 100      # provisional first-paint rows per harvest
 ATLAS_REQUEST_DELAY_DEFAULT = 3.0   # polite per-request delay (seconds)
 ATLAS_USER_AGENT = "UpScaleScoutingTool/1.0 (Roblox game discovery; contact via repo)"
 ATLAS_PROXY_URLS_ENV = "RBXSCOUT_SEARCH_PROXY_URLS"  # flip-ready: shared pool var
+ATLAS_SCRAPE_DO_TOKEN_ENV = "RBXSCOUT_SCRAPE_DO_TOKEN"  # paid-API failover (Scrape.do)
 
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -2831,6 +2832,17 @@ class RobloxPlatformScout:
     # Atlas Dev seed ingestion (ATLAS_PLAN_REVIEW.md) — discovery only.
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _redact_pool_secret(text: str) -> str:
+        """Mask credential query values (token=/key=/api_key=) before logging.
+
+        Pool entries include scraping-API templates that embed the account
+        token in the URL, and requests exception strings embed the full
+        request URL — nothing with a live credential may reach the Actions
+        log or the local harvest log.
+        """
+        return re.sub(r"((?:token|api_?key|key)=)[^&\s]+", r"\1***", text, flags=re.I)
+
     def _atlas_proxy_pool(self) -> List[str]:
         """Flip-ready proxy pool for Atlas fetches (mirrors _search_proxy_urls).
 
@@ -2838,6 +2850,14 @@ class RobloxPlatformScout:
         Atlas ever throttles runner IPs, set RBXSCOUT_SEARCH_PROXY_URLS and
         traffic shifts through the mirrors with zero code change. ``direct``
         is the terminal entry, exactly like the search pool.
+
+        Setting RBXSCOUT_SCRAPE_DO_TOKEN appends the Scrape.do scraping-API
+        template (https://api.scrape.do?token=…&url={url}) as a failover
+        slice immediately BEFORE ``direct`` — but only when the pool already
+        has a real proxy entry to absorb the primary load. A token with no
+        pool stays [direct]: the template must never be the first entry, or
+        every fetch would burn paid credits (the laptop exports no pool, so
+        it keeps its free home-IP behavior even with a token present).
         """
         raw = os.environ.get(ATLAS_PROXY_URLS_ENV, "")
         entries: List[str] = []
@@ -2850,6 +2870,19 @@ class RobloxPlatformScout:
                     entries.append(part)
             else:
                 log.warning("Ignoring malformed Atlas proxy URL: %r", part)
+        token = os.environ.get(ATLAS_SCRAPE_DO_TOKEN_ENV, "").strip()
+        if token and any(entry != "direct" for entry in entries):
+            # No trailing slash before ?token — the template keeps the
+            # ^https?://[^/\s]+$ shape the operator-var parser accepts, and
+            # _atlas_fetch's {url} branch percent-encodes the target into it.
+            template = (
+                f"https://api.scrape.do?token={quote(token, safe='')}&url={{url}}"
+            )
+            if template not in entries:
+                if "direct" in entries:
+                    entries.insert(entries.index("direct"), template)
+                else:
+                    entries.append(template)
         if "direct" not in entries:
             entries.append("direct")
         return entries
@@ -2882,25 +2915,48 @@ class RobloxPlatformScout:
             return None
 
     def _atlas_fetch(self, url: str, delay: float) -> Optional[requests.Response]:
-        """One polite Atlas fetch: honest UA, optional mirror pool, backoff.
+        """One polite Atlas fetch: honest UA, optional pool, backoff.
 
-        Pool entries are ``direct`` or a path-mirror service: a request to
-        ``<mirror>/<target-url>`` must return the target's body (the shape
-        the rbxscout Cloudflare Worker serves). Any single-entry failure —
+        Pool entries are ``direct``, a path-mirror service (``<mirror>/<url>``
+        must return the target's body — the rbxscout Worker shape), an HTTP
+        proxy (``http://host:port``; routed via requests' ``proxies`` — the
+        validated free-proxy pool the prufer pre-pass already uses, because
+        atlasdev.gg 403s many datacenter/runner IP ranges), or a scraping-API
+        template (``…url={url}``; the target URL is percent-encoded into the
+        query — how paid-API free tiers plug in). Any single-entry failure —
         403/404, network error, or repeated 429/5xx — falls through to the
         next entry; ``direct`` is always the terminal fallback so a broken
-        mirror can never abort a sweep. Only when every entry fails does
-        the caller receive None (abort, pointers untouched, next run
-        retries the same range).
+        entry can never abort a sweep. Only when every entry fails does the
+        caller receive None (abort, pointers untouched, next run retries the
+        same range).
         """
         last_status: Optional[int] = None
         for attempt, entry in enumerate(self._atlas_proxy_pool()):
-            target = url if entry == "direct" else f"{entry}/{url}"
+            proxies: Optional[Dict[str, str]] = None
+            if entry == "direct":
+                target = url
+            elif "{url}" in entry:
+                # Scraping-API template (e.g. https://api.scrape.do?token=KEY&url={url}):
+                # the target URL is percent-encoded into the query string.
+                # Paid free tiers (Scrape.do, ScrapFly, …) plug in here — no
+                # code change, just another comma-separated pool entry.
+                target = entry.replace("{url}", quote(url, safe=""))
+            elif re.match(r"^https?://(?:[^/@]+@)?[^/:]+:\d+/?$", entry):
+                # host:port — an HTTP proxy (the prufer-validated free pool
+                # is uniformly ip:port; paid providers add user:key@host).
+                # Routed via requests' proxies.
+                target = url
+                proxies = {"http": entry, "https": entry}
+            else:
+                # Path-mirror (scheme + host [+ path], no port): append the
+                # target URL — the rbxscout Worker shape.
+                target = f"{entry}/{url}"
             try:
                 resp = requests.get(
                     target,
                     headers={"User-Agent": ATLAS_USER_AGENT, "Accept-Language": "en"},
                     timeout=30,
+                    proxies=proxies,
                 )
                 if resp.status_code in (429, 500, 502, 503, 504):
                     last_status = resp.status_code
@@ -2911,11 +2967,18 @@ class RobloxPlatformScout:
                     return resp
                 last_status = resp.status_code
                 log.warning(
-                    "Atlas fetch %s via %s -> HTTP %s", url, entry, resp.status_code
+                    "Atlas fetch %s via %s -> HTTP %s",
+                    url,
+                    self._redact_pool_secret(entry),
+                    resp.status_code,
                 )
             except requests.RequestException as exc:
                 last_status = -1
-                log.warning("Atlas fetch failed via %s: %s", entry, exc)
+                log.warning(
+                    "Atlas fetch failed via %s: %s",
+                    self._redact_pool_secret(entry),
+                    self._redact_pool_secret(str(exc)),
+                )
                 time.sleep(1.0)
         if last_status is not None and last_status > 0:
             log.warning("Atlas pool exhausted (last HTTP %s): %s", last_status, url)
@@ -3018,7 +3081,8 @@ class RobloxPlatformScout:
         - ``throttle_hours``: minimum hours between harvests (0 disables the
           throttle — used by tests and manual forced runs).
         - ``deep_every_days``: a full catch-up sweep (up to ATLAS_DEEP_PAGES)
-          runs this often; 0 = never beyond the page budget.
+          runs this often; 0 = never beyond the page budget. None falls back
+          to the ATLAS_DEEP_EVERY_DAYS env knob (default 30 days).
 
         Freshly harvested IDs go through the existing dedup/trim
         _enqueue_discovery with source='atlas_dev'; the queue drain owns the
@@ -3057,11 +3121,19 @@ class RobloxPlatformScout:
                 throttle = max(0.0, float(os.environ.get("ATLAS_THROTTLE_HOURS", "") or ATLAS_HOURS_DEFAULT))
             except ValueError:
                 pass
-        deep_days = (
-            ATLAS_DEEP_EVERY_DAYS_DEFAULT
-            if deep_every_days is None
-            else max(0, int(deep_every_days))
-        )
+        if deep_every_days is None:
+            # Ops override: the workflow exports ATLAS_DEEP_EVERY_DAYS as a
+            # tuning knob (mirrors the throttle override above) — 0 disables
+            # the catch-up sweep entirely.
+            try:
+                deep_days = max(
+                    0,
+                    int(os.environ.get("ATLAS_DEEP_EVERY_DAYS", "") or ATLAS_DEEP_EVERY_DAYS_DEFAULT),
+                )
+            except ValueError:
+                deep_days = ATLAS_DEEP_EVERY_DAYS_DEFAULT
+        else:
+            deep_days = max(0, int(deep_every_days))
         queue_priority = (
             ATLAS_PRIORITY_DEFAULT if priority is None else max(1, int(priority))
         )

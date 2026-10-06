@@ -360,6 +360,30 @@ def test_deep_sweep_runs_full_index_when_due(scout, monkeypatch):
     assert scout._atlas_pointer("atlas_page") == 1.0  # completed -> head daily
 
 
+def test_deep_sweep_env_zero_disables_catchup(scout, monkeypatch):
+    """The workflow exports ATLAS_DEEP_EVERY_DAYS as an ops knob — with no
+    explicit deep_every_days, 0 must keep the sweep at the page budget
+    (regression guard: the env var used to be silently ignored)."""
+    calls = []
+    _patch_http(monkeypatch, pages={"*": INDEX_HTML}, calls=calls)
+    monkeypatch.setenv("ATLAS_DEEP_EVERY_DAYS", "0")
+    stats = scout.harvest_atlas_seeds(pages=1, stat_pages=0, throttle_hours=0)
+    assert stats["deep_sweep"] is False
+    assert stats["sweep_pages"] == 1
+    assert stats["pages_fetched"] == 1
+
+
+def test_deep_sweep_defaults_on_when_env_unset(scout, monkeypatch):
+    """Env unset (the workflow default) keeps today's behavior: a fresh
+    cursor plus the 30-day default triggers the full-index catch-up."""
+    calls = []
+    _patch_http(monkeypatch, pages={"*": INDEX_HTML}, calls=calls)
+    monkeypatch.delenv("ATLAS_DEEP_EVERY_DAYS", raising=False)
+    stats = scout.harvest_atlas_seeds(pages=1, stat_pages=0, throttle_hours=0)
+    assert stats["deep_sweep"] is True
+    assert stats["pages_fetched"] == scout_core.ATLAS_DEEP_PAGES_DEFAULT
+
+
 # --------------------------------------------------------------------------- #
 # Provisional first-paint rows
 # --------------------------------------------------------------------------- #
@@ -463,6 +487,137 @@ def test_proxy_flip_routes_through_pool(scout, monkeypatch):
     # Pool entries are path-mirrors: the fetch URL is <mirror>/<target-url>.
     assert calls[0]["url"].startswith("http://p1.example/https://atlasdev.gg/")
     assert calls[0]["proxies"] is None
+
+
+def test_host_port_pool_entry_routes_as_http_proxy(scout, monkeypatch):
+    """A host:port entry is an HTTP proxy (the prufer-validated free pool's
+    ip:port shape): the target URL stays direct and requests gets proxies=."""
+    monkeypatch.setenv("RBXSCOUT_SEARCH_PROXY_URLS", "http://10.0.0.1:8080, direct")
+    calls = []
+    _patch_http(monkeypatch, pages={"*": INDEX_HTML}, calls=calls)
+    scout.harvest_atlas_seeds(pages=1, stat_pages=0, throttle_hours=0)
+    assert calls[0]["url"].startswith("https://atlasdev.gg/")
+    assert calls[0]["proxies"] == {
+        "http": "http://10.0.0.1:8080",
+        "https": "http://10.0.0.1:8080",
+    }
+
+
+def test_url_template_entry_routes_as_scraping_api(scout, monkeypatch):
+    """A ``…url={url}`` entry is a scraping-API template (paid free tiers):
+    the target URL is percent-encoded into the query string, no proxies=."""
+    monkeypatch.setenv(
+        "RBXSCOUT_SEARCH_PROXY_URLS",
+        "https://api.scrape.do?token=K&url={url}, direct",
+    )
+    calls = []
+    _patch_http(monkeypatch, pages={"*": INDEX_HTML}, calls=calls)
+    scout.harvest_atlas_seeds(pages=1, stat_pages=0, throttle_hours=0)
+    assert calls[0]["url"].startswith(
+        "https://api.scrape.do?token=K&url=https%3A%2F%2Fatlasdev.gg"
+    )
+    assert calls[0]["proxies"] is None
+    # The template 404s in this fixture; direct must still complete the sweep.
+    assert calls[-1]["url"].startswith("https://atlasdev.gg/")
+
+
+def test_scrape_do_token_inserted_after_pool_before_direct(scout, monkeypatch):
+    """RBXSCOUT_SCRAPE_DO_TOKEN appends the Scrape.do template as a failover
+    slice: after the operator/free pool, immediately before the direct
+    terminal — a credit only burns once every free proxy has failed."""
+    monkeypatch.setenv("RBXSCOUT_SEARCH_PROXY_URLS", "http://10.0.0.1:8080, direct")
+    monkeypatch.setenv("RBXSCOUT_SCRAPE_DO_TOKEN", "tok-123")
+    assert scout._atlas_proxy_pool() == [
+        "http://10.0.0.1:8080",
+        "https://api.scrape.do?token=tok-123&url={url}",
+        "direct",
+    ]
+
+
+def test_scrape_do_token_alone_never_becomes_primary(scout, monkeypatch):
+    """A token with no proxy pool keeps the default [direct] pool: the
+    template must never be the first entry, or every fetch would burn paid
+    credits (the laptop exports no pool and must stay on the home IP)."""
+    monkeypatch.delenv("RBXSCOUT_SEARCH_PROXY_URLS", raising=False)
+    monkeypatch.setenv("RBXSCOUT_SCRAPE_DO_TOKEN", "tok-123")
+    assert scout._atlas_proxy_pool() == ["direct"]
+
+
+def test_scrape_do_token_is_percent_encoded(scout, monkeypatch):
+    """The token lands in a query value — characters like / and space must
+    be encoded, not spliced raw into the URL."""
+    monkeypatch.setenv("RBXSCOUT_SEARCH_PROXY_URLS", "http://10.0.0.1:8080")
+    monkeypatch.setenv("RBXSCOUT_SCRAPE_DO_TOKEN", "a/b c+d")
+    pool = scout._atlas_proxy_pool()
+    assert pool[1] == "https://api.scrape.do?token=a%2Fb%20c%2Bd&url={url}"
+
+
+def test_scrape_do_failover_fires_only_after_proxies_fail(scout, monkeypatch):
+    """Order proof: dead free proxy → scrape.do template (target URL
+    percent-encoded) → direct still completes the sweep when the template
+    403s too. The pool can never be worse than direct."""
+    monkeypatch.setenv("RBXSCOUT_SEARCH_PROXY_URLS", "http://10.0.0.1:8080")
+    monkeypatch.setenv("RBXSCOUT_SCRAPE_DO_TOKEN", "tok-123")
+    calls = []
+    real_get = scout_core.requests.get
+
+    def fake_get(url, timeout=30, proxies=None, **kwargs):
+        calls.append({"url": url, "proxies": proxies})
+        if url.startswith("https://api.scrape.do?"):
+            return FakeResponse("out of credits", status_code=403)
+        if proxies is not None:
+            raise scout_core.requests.exceptions.ConnectionError("dead proxy")
+        if "/analyze?" in url:
+            return FakeResponse(INDEX_HTML)
+        return FakeResponse("", status_code=404)
+
+    monkeypatch.setattr(scout_core.requests, "get", fake_get)
+    assert real_get is not None  # keep linters quiet about the unused capture
+    # deep_every_days=0 bounds the sweep to pages=1 — otherwise the deep
+    # catch-up (default 30d, 275-page ceiling) multiplies the dead-proxy
+    # 1s backoff per page into a minutes-long test.
+    scout.harvest_atlas_seeds(
+        pages=1, stat_pages=0, throttle_hours=0, deep_every_days=0
+    )
+    assert calls[0]["proxies"] is not None  # free proxy tried first
+    assert any(
+        c["url"].startswith(
+            "https://api.scrape.do?token=tok-123&url=https%3A%2F%2Fatlasdev.gg"
+        )
+        for c in calls
+    )  # then the template, target URL-encoded
+    assert calls[-1]["url"].startswith("https://atlasdev.gg/")  # direct finishes
+    assert calls[-1]["proxies"] is None
+
+
+def test_scrape_do_token_never_leaks_into_logs(scout, monkeypatch, caplog):
+    """A failing template logs the pool entry (and requests exceptions embed
+    the full URL) — the token must be masked in every log line."""
+    import logging
+
+    monkeypatch.setenv("RBXSCOUT_SEARCH_PROXY_URLS", "http://10.0.0.1:8080")
+    monkeypatch.setenv("RBXSCOUT_SCRAPE_DO_TOKEN", "SECRETTOKEN")
+    real_get = scout_core.requests.get
+
+    def fake_get(url, timeout=30, proxies=None, **kwargs):
+        if url.startswith("https://api.scrape.do?"):
+            return FakeResponse("nope", status_code=403)
+        if proxies is not None:
+            raise scout_core.requests.exceptions.ConnectionError(
+                "https://api.scrape.do?token=SECRETTOKEN&url=x"
+            )
+        if "/analyze?" in url:
+            return FakeResponse(INDEX_HTML)
+        return FakeResponse("", status_code=404)
+
+    monkeypatch.setattr(scout_core.requests, "get", fake_get)
+    assert real_get is not None
+    with caplog.at_level(logging.WARNING, logger="upscalescouts"):
+        scout.harvest_atlas_seeds(
+            pages=1, stat_pages=0, throttle_hours=0, deep_every_days=0
+        )
+    assert "SECRETTOKEN" not in caplog.text
+    assert "token=***" in caplog.text
 
 
 def test_pool_failover_reaches_direct_after_mirror_error(scout, monkeypatch):

@@ -223,6 +223,20 @@ curl -s "https://rbx-search-proxy.<you>.workers.dev/search-api/omni-search?searc
 
 No proxy variable? The crawler falls back to direct Roblox requests.
 
+### Optional Scrape.do paid failover
+
+The cloud expander routes Atlas harvest traffic through the validated free
+proxy pool first; a failing entry falls through to the next one. To add
+Scrape.do as the last paid fallback (free tier: 1,000 successful
+requests/month — failed requests cost nothing), add a repository **secret**
+`SCRAPE_DO_TOKEN` under **Settings → Secrets and variables → Actions**. The
+expander exports it as `RBXSCOUT_SCRAPE_DO_TOKEN` and `_atlas_proxy_pool`
+appends `https://api.scrape.do?token=…&url={url}` immediately before the
+direct terminal — a credit only burns when every free proxy has failed on a
+fetch. Leave the secret unset and behavior is exactly as before. The token
+never appears in logs (masked as `token=***`), and a token without a proxy
+pool never activates at all (it must not become the primary).
+
 ## Keyword-crawler IP pool (Cloudflare Worker proxy)
 
 GitHub Actions runners share a small egress IP range, so the omni-search

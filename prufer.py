@@ -394,3 +394,39 @@ def backfill_series_to_rows(series: List[Dict[str, Any]]) -> List[Tuple[str, int
                 )
             )
     return rows
+
+
+# ---------------------------------------------------------------------------
+# CLI: export a freshly-validated proxy pool for other Atlas consumers
+# ---------------------------------------------------------------------------
+
+
+def export_proxy_pool(min_size: Optional[int] = None, sample: Optional[int] = None) -> List[str]:
+    """Validate the free public proxy lists; return the working entries.
+
+    Used by the cloud expander (expander.yml) before an Atlas harvest: the
+    runner's datacenter IP range is routinely 403'd by atlasdev.gg, while
+    ~9% of the free public proxies pass (measured 2026-10-04 against the
+    full 2,164-proxy pool, ATLAS_PRUFER_HYDRATOR_PLAN.md §4). Same lists,
+    same validation, same never-cache rule as the prufer pass: the working
+    set churns, so it is rebuilt every run.
+    """
+    global PRUFER_POOL_VALIDATION_SAMPLE
+    if sample is not None:
+        PRUFER_POOL_VALIDATION_SAMPLE = max(1, int(sample))
+    client = PruferClient()
+    client.ensure_pool(min_size)
+    with client._pool_lock:
+        return list(client._pool)
+
+
+if __name__ == "__main__":
+    import sys
+
+    pool = export_proxy_pool()
+    sys.stdout.write("\n".join(pool))
+    if pool:
+        sys.stderr.write(f"prufer: exported {len(pool)} validated proxies\n")
+    else:
+        sys.stderr.write("prufer: proxy pool validation produced nothing\n")
+        raise SystemExit(1)

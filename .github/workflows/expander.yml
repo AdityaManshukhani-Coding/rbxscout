@@ -1,7 +1,8 @@
 # UpScale Scouting Tool expander — Atlas Dev seed harvest + discovery-queue drain (every 30 min).
 #
-# The sole discovery pipeline (ATLAS_PLAN_REVIEW.md): a daily 24h-throttled
-# harvest of atlasdev.gg/analyze enqueues mid-tier universe IDs into the
+# The sole discovery pipeline (ATLAS_PLAN_REVIEW.md): a 3h-throttled
+# harvest of atlasdev.gg/analyze (ATLAS_THROTTLE_HOURS=3 below; the code
+# default stays 23h for local runs) enqueues mid-tier universe IDs into the
 # priority discovery queue; every run then drains a bounded slice of the
 # queue through the strict gate. Only games meeting 20k visits / 25 CCU are
 # stored — everything else is recorded in discovery_queue as dedup memory,
@@ -91,8 +92,46 @@ jobs:
       - name: Run test suite (protects the catalog from bad pushes)
         run: python -m pytest tests -q
 
+      # atlasdev.gg 403s many datacenter/runner IP ranges (2026-10-05 run
+      # #722: the harvest was throttled AND cloud fetches are unreliable from
+      # runner IPs). Validate the same free public proxy pool the prufer
+      # pre-pass uses (~9% yield ≈ 200 working proxies, ~4 min) and route the
+      # harvest through it. direct stays the terminal fallback inside
+      # _atlas_fetch, so an empty pool degrades to today's behavior.
+      # prufer.py exits non-zero when nothing validates — failing the step
+      # aborts the run before wasting a harvest on guaranteed 403s.
+      - name: Validate free-proxy pool for Atlas fetches
+        run: python prufer.py > atlas_proxies.txt
+
       - name: Run expander (Atlas harvest + queue drain)
-        run: python live_sync.py --only expander --min-visits 20000 --min-ccu 25
+        env:
+          ATLAS_THROTTLE_HOURS: "3"   # users get new games every ~3 h, not once a day
+          RBXSCOUT_SEARCH_PROXY_URLS: ${{ vars.RBXSCOUT_SEARCH_PROXY_URLS || '' }}
+          # Scrape.do paid failover (repo secret SCRAPE_DO_TOKEN):
+          # _atlas_proxy_pool appends the template AFTER the validated free
+          # pool, so a credit only burns when every free proxy fails on a
+          # fetch. Unset/empty = no template entry, behavior unchanged.
+          RBXSCOUT_SCRAPE_DO_TOKEN: ${{ secrets.SCRAPE_DO_TOKEN || '' }}
+        run: |
+          POOL=$(grep -c . atlas_proxies.txt || true)
+          echo "validated proxies: ${POOL}"
+          if [ "${POOL}" -ge 20 ]; then
+            # Prepend any operator-configured mirrors (step env); empty parts
+            # and duplicates are filtered by _atlas_proxy_pool.
+            export RBXSCOUT_SEARCH_PROXY_URLS="${RBXSCOUT_SEARCH_PROXY_URLS:+$RBXSCOUT_SEARCH_PROXY_URLS,}$(paste -sd, atlas_proxies.txt)"
+          elif [ -n "${RBXSCOUT_SCRAPE_DO_TOKEN}" ]; then
+            # Degenerate day: fewer than 20 free proxies validated. With a
+            # Scrape.do token configured, route the harvest through it
+            # directly instead of burning ~100+ guaranteed-403 direct
+            # requests: ~3 index pages + stat pages per 3h harvest ≈ tens of
+            # credits — inside the 1,000/mo free tier. An exhausted token's
+            # fetches still fall through to direct inside _atlas_fetch.
+            echo "pool too small (${POOL}); harvesting via Scrape.do failover"
+            export RBXSCOUT_SEARCH_PROXY_URLS="https://api.scrape.do?token=${RBXSCOUT_SCRAPE_DO_TOKEN}&url={url}"
+          else
+            echo "proxy pool too small (${POOL}); harvesting direct as before"
+          fi
+          python live_sync.py --only expander --min-visits 20000 --min-ccu 25
 
       # One-way door: an expansion pass that evaluated IDs but failed to
       # persist would re-evaluate the same seeds next run (the Atlas cursor
