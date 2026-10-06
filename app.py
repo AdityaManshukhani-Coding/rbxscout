@@ -37,6 +37,7 @@ from scout_core import (
 import scout_core as _scout_core
 import capacity
 import catalog_fetch
+from catalog_fetch import floored_targets
 import gate
 import profile_store
 
@@ -605,6 +606,15 @@ def _restore_from_profile() -> bool:
             continue  # this session already has a live value; never clobber
         if field in profile and profile[field] is not None:
             st.session_state[field] = profile[field]
+    # Hard floor (2026-10-05): profiles saved before the UI locked targets to
+    # the pipeline's entry bar can still carry below-bar values; restore must
+    # never surface a target the catalog cannot serve.
+    st.session_state["target_min_visits"], st.session_state["target_min_ccu"] = (
+        floored_targets(
+            st.session_state.get("target_min_visits", DEFAULT_MIN_VISITS),
+            st.session_state.get("target_min_ccu", DEFAULT_MIN_CCU),
+        )
+    )
     return True
 
 
@@ -772,6 +782,7 @@ def initialize_session() -> bool:
 
 
 def set_preset(min_visits: int, min_ccu: int) -> None:
+    min_visits, min_ccu = floored_targets(min_visits, min_ccu)
     st.session_state.target_min_visits = min_visits
     st.session_state.target_min_ccu = min_ccu
     st.session_state.onboard_visits = min_visits
@@ -781,8 +792,14 @@ def set_preset(min_visits: int, min_ccu: int) -> None:
 def _save_onboarding_targets() -> None:
     """Persist the number_input values so they survive when the widgets
     disappear from the render tree on the next rerun."""
-    st.session_state.target_min_visits = st.session_state["onboard_visits"]
-    st.session_state.target_min_ccu = st.session_state["onboard_ccu"]
+    st.session_state.target_min_visits = max(
+        int(st.session_state["onboard_visits"] or 0), DEFAULT_MIN_VISITS
+    )
+    st.session_state.target_min_ccu = max(
+        int(st.session_state["onboard_ccu"] or 0), DEFAULT_MIN_CCU
+    )
+    st.session_state.onboard_visits = st.session_state.target_min_visits
+    st.session_state.onboard_ccu = st.session_state.target_min_ccu
     _profile_save()
 
 
@@ -877,24 +894,26 @@ def render_onboarding() -> bool:
         left, right = st.columns(2)
         left.number_input(
             "Minimum visits",
-            min_value=0,
+            min_value=DEFAULT_MIN_VISITS,
             step=1_000,
             key="onboard_visits",
             on_change=_save_onboarding_targets,
             persist_state="session",
-            help="Games below this lifetime visit count are excluded from the first scan.",
+            help="Hard floor at the pipeline's entry bar — games below this lifetime visit count never enter the catalog.",
         )
         right.number_input(
             "Minimum CCU",
-            min_value=0,
+            min_value=DEFAULT_MIN_CCU,
             step=25,
             key="onboard_ccu",
             on_change=_save_onboarding_targets,
             persist_state="session",
-            help="Games below this current player count are excluded from the first scan.",
+            help="Hard floor at the pipeline's entry bar — games below this current player count never enter the catalog.",
         )
-        if int(st.session_state.target_min_visits) == 0 and int(st.session_state.target_min_ccu) == 0:
-            st.warning("Set at least one target before continuing.")
+        if int(st.session_state.target_min_visits) <= DEFAULT_MIN_VISITS and int(
+            st.session_state.target_min_ccu
+        ) <= DEFAULT_MIN_CCU:
+            st.warning("Both targets are at the entry bar — fine, but you can raise them any time.")
         if st.button("Next", type="primary", width="stretch", key="onb1_next"):
             if int(st.session_state.target_min_visits) or int(st.session_state.target_min_ccu):
                 st.session_state.onboarding_step = 3
@@ -1021,11 +1040,13 @@ def render_onboarding() -> bool:
             # Bulletproof target capture: read the live onboarding widget
             # values at this exact moment and copy them into the canonical
             # keys that the sidebar and the first scan consume.
-            st.session_state.target_min_visits = int(
-                st.session_state.get("onboard_visits", st.session_state.target_min_visits)
+            st.session_state.target_min_visits = max(
+                int(st.session_state.get("onboard_visits", st.session_state.target_min_visits) or 0),
+                DEFAULT_MIN_VISITS,
             )
-            st.session_state.target_min_ccu = int(
-                st.session_state.get("onboard_ccu", st.session_state.target_min_ccu)
+            st.session_state.target_min_ccu = max(
+                int(st.session_state.get("onboard_ccu", st.session_state.target_min_ccu) or 0),
+                DEFAULT_MIN_CCU,
             )
             st.session_state.onboarding_complete = True
             _profile_save()  # completion + targets survive refreshes now
@@ -1092,6 +1113,22 @@ def _warn_stale_catalog() -> None:
     run writes fresh samples, so that timestamp is the true data heartbeat
     (last_updated moves for other reasons, e.g. tier restamps). Never raises.
     """
+    # App-side staleness (2026-10-05 "stats are days old" complaints): when
+    # the freshness check fails, the app pins to its cached copy silently —
+    # _USING_STALE_CATALOG was assigned but never consumed. The banner below
+    # reads the CACHED db's own heartbeat, so a pinned cache always looks
+    # fresh no matter how old the data is. Say it out loud instead.
+    if _USING_STALE_CATALOG:
+        try:
+            st.warning(
+                "📦 **You're viewing a cached copy of the catalog** — the live "
+                "catalog could not be reached from this server just now, so "
+                "stats may be out of date. This usually clears itself within "
+                "minutes; hit Refresh in a bit if it persists."
+            )
+        except Exception:
+            pass  # never block the dashboard on banner rendering
+
     try:
         import sqlite3
 
@@ -1329,21 +1366,25 @@ st.html(_INPUT_GUARD_SCRIPT + _FAVICON_SCRIPT, unsafe_allow_javascript=True)
 with st.sidebar.expander("Current target", expanded=True):
     min_visits = st.number_input(
         "Minimum visits",
-        min_value=0,
+        min_value=DEFAULT_MIN_VISITS,
         step=1_000,
         value=st.session_state.get("target_min_visits", DEFAULT_MIN_VISITS),
         key="target_min_visits",
         persist_state="session",
+        help="Hard floor: the pipeline only stores games at or above this bar, so lower settings would always return nothing.",
     )
     min_ccu = st.number_input(
         "Minimum CCU",
-        min_value=0,
+        min_value=DEFAULT_MIN_CCU,
         step=25,
         value=st.session_state.get("target_min_ccu", DEFAULT_MIN_CCU),
         key="target_min_ccu",
         persist_state="session",
+        help="Hard floor: the pipeline only stores games at or above this bar, so lower settings would always return nothing.",
     )
-    st.caption("Targets filter your results the moment you sync. New games appear as the 24/7 pipeline discovers them.")
+    st.caption(
+        f"Targets filter your results the moment you sync (locked at {DEFAULT_MIN_VISITS // 1000}k visits / {DEFAULT_MIN_CCU} CCU — the pipeline's entry bar). New games appear as the 24/7 pipeline discovers them."
+    )
     if st.button("Apply filters", type="primary", width="stretch", key="apply_filters"):
         st.session_state.contact_page = 1
         st.rerun()

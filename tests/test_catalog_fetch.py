@@ -69,6 +69,13 @@ def test_is_hosted_local_override(monkeypatch, tmp_path):
 
 def test_ensure_catalog_downloads_valid_sqlite(tmp_path, monkeypatch):
     blob = b"SQLite format 3\x00" + b"\x00" * 300_000
+    # HEAD probe is unavailable: ensure_catalog falls back to the API probe.
+    monkeypatch.setattr(
+        catalog_fetch, "_asset_head",
+        lambda timeout=10.0, attempts=2, retry_delay=3.0: (_ for _ in ()).throw(
+            catalog_fetch.CatalogFetchError("no HEAD in test")
+        ),
+    )
     monkeypatch.setattr(
         catalog_fetch, "release_asset_info",
         lambda timeout=15.0: {"size": len(blob), "updated_at": "2026-09-09T12:00:00Z"},
@@ -84,6 +91,12 @@ def test_ensure_catalog_downloads_valid_sqlite(tmp_path, monkeypatch):
 
 
 def test_ensure_catalog_refuses_non_sqlite(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        catalog_fetch, "_asset_head",
+        lambda timeout=10.0, attempts=2, retry_delay=3.0: (_ for _ in ()).throw(
+            catalog_fetch.CatalogFetchError("no HEAD in test")
+        ),
+    )
     monkeypatch.setattr(
         catalog_fetch, "release_asset_info",
         lambda timeout=15.0: {"size": 10, "updated_at": "2026-09-09T12:00:00Z"},
@@ -114,6 +127,13 @@ def test_unchanged_remote_skips_download(tmp_path, monkeypatch):
             "remote": {"size": 200_016, "updated_at": "2026-09-09T00:00:00Z"},
         }
     )
+    # API-path unchanged: HEAD probe fails, API returns the same version.
+    monkeypatch.setattr(
+        catalog_fetch, "_asset_head",
+        lambda timeout=10.0, attempts=2, retry_delay=3.0: (_ for _ in ()).throw(
+            catalog_fetch.CatalogFetchError("no HEAD in test")
+        ),
+    )
     monkeypatch.setattr(
         catalog_fetch, "release_asset_info",
         lambda timeout=15.0: {"size": 200_016, "updated_at": "2026-09-09T00:00:00Z"},
@@ -124,6 +144,63 @@ def test_unchanged_remote_skips_download(tmp_path, monkeypatch):
 
     monkeypatch.setattr(catalog_fetch, "_get_bytes", _boom)
     assert catalog_fetch.ensure_catalog() == catalog_fetch.CACHE_DB_PATH
+
+
+def test_unchanged_remote_head_probe_skips_download_and_api(tmp_path, monkeypatch):
+    """The rate-limit fix: the freshness check HEAD-probes the CDN download
+    URL (no api.github.com quota) and skips the download when the ETag says
+    the asset is unchanged."""
+    _seed_cache(tmp_path)
+    catalog_fetch._save_state(
+        {
+            "checked_at": 0.0,
+            "remote": {"size": 200_016, "etag": "\"etag-1\""},
+        }
+    )
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("rate-limited API must not be in the freshness hot path")
+
+    monkeypatch.setattr(catalog_fetch, "release_asset_info", _boom)
+    monkeypatch.setattr(
+        catalog_fetch, "_asset_head",
+        lambda timeout=10.0, attempts=2, retry_delay=3.0: {
+            "size": 200_016,
+            "etag": "\"etag-1\"",
+        },
+    )
+
+    def _boom_download(*args, **kwargs):
+        raise AssertionError("download should not fire when HEAD says unchanged")
+
+    monkeypatch.setattr(catalog_fetch, "_get_bytes", _boom_download)
+    assert catalog_fetch.ensure_catalog() == catalog_fetch.CACHE_DB_PATH
+
+
+def test_probe_shape_switch_counts_as_changed(tmp_path, monkeypatch):
+    """A HEAD→API (or API→HEAD) probe-path switch must never compare equal:
+    size+etag and size+updated_at describe different identity keys."""
+    _seed_cache(tmp_path)
+    catalog_fetch._save_state(
+        {"checked_at": 0.0, "remote": {"size": 200_016, "etag": "\"e\""}}
+    )
+    monkeypatch.setattr(
+        catalog_fetch, "_asset_head",
+        lambda timeout=10.0, attempts=2, retry_delay=3.0: (_ for _ in ()).throw(
+            catalog_fetch.CatalogFetchError("HEAD down")
+        ),
+    )
+    monkeypatch.setattr(
+        catalog_fetch, "release_asset_info",
+        lambda timeout=15.0: {"size": 200_016, "updated_at": "2026-09-09T00:00:00Z"},
+    )
+
+    downloads = []
+    blob = b"SQLite format 3\x00" + b"\x00" * 400_000
+    monkeypatch.setattr(catalog_fetch, "_get_bytes", lambda url, timeout: downloads.append(blob) or blob)
+
+    assert catalog_fetch.ensure_catalog().read_bytes() == blob
+    assert downloads, "shape switch must look changed and re-download"
 
 
 def test_changed_remote_redownloads(tmp_path, monkeypatch):

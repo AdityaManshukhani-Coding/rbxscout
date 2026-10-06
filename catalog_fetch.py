@@ -91,6 +91,20 @@ CACHE_DB_PATH = CACHE_DIR / ASSET_DB
 CACHE_STATE_PATH = CACHE_DIR / "catalog_state.json"
 
 
+def floored_targets(min_visits: int, min_ccu: int) -> tuple[int, int]:
+    """Clamp user targets UP to the pipeline's entry bar (UI hard floor).
+
+    The catalog only CONTAINS games meeting the bar (db_sync pushes strip
+    below-gate rows), so lower settings can only ever produce an empty
+    dashboard. The UI locks at the bar instead of letting anyone select
+    values that can never match a row. One source of truth with db_sync.
+    """
+    return (
+        max(int(min_visits or 0), TARGET_MIN_VISITS),
+        max(int(min_ccu or 0), TARGET_MIN_CCU),
+    )
+
+
 class CatalogFetchError(RuntimeError):
     """Raised when the hosted catalog cannot be fetched; message is user-facing."""
 
@@ -158,6 +172,55 @@ def _get_bytes(url: str, timeout: float) -> bytes:
         ) from exc
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise CatalogFetchError(f"asset download failed: {exc}") from exc
+
+
+def _same_remote(a: dict, b: dict) -> bool:
+    """True when two probes describe the same asset version.
+
+    Probes come in two shapes: the CDN HEAD probe (``size`` + ``etag``) and
+    the api.github.com metadata fallback (``size`` + ``updated_at``). The
+    shapes must never compare equal across a probe-path switch — a HEAD→API
+    (or API→HEAD) flip would otherwise look like "changed" and trigger a
+    pointless 100 MB re-download. Same-shape comparisons use both fields;
+    different shapes always count as changed.
+    """
+    if a.get("etag") is not None and b.get("etag") is not None:
+        return a["size"] == b["size"] and a["etag"] == b["etag"]
+    if a.get("updated_at") is not None and b.get("updated_at") is not None:
+        return a["size"] == b["size"] and a["updated_at"] == b["updated_at"]
+    return False
+
+
+def _asset_head(timeout: float = 10.0, attempts: int = 2, retry_delay: float = 3.0) -> dict:
+    """HEAD-probe the release download URL — no GitHub API, no rate limit.
+
+    api.github.com allows 60 requests/hour per IP for anonymous callers, and
+    every Streamlit Community Cloud container shares one egress IP: in busy
+    hours the freshness check fails, ``ensure_catalog`` raises, and the app
+    silently serves a days-old cached catalog (the "stats are days old"
+    complaints of 2026-10-05). The download URL sits on a CDN with no such
+    limit (measured 2026-10-05: anonymous HEAD, 200 in ~0.5 s) and
+    Content-Length/ETag answer "did the asset change" just as well.
+    """
+    last_error: CatalogFetchError | None = None
+    for attempt in range(max(1, attempts)):
+        req = urllib.request.Request(
+            _asset_download_url(), method="HEAD", headers=_headers()
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                size = int(resp.headers.get("Content-Length") or 0)
+                etag = str(resp.headers.get("ETag") or "")
+            if size <= 0:
+                raise CatalogFetchError("asset HEAD returned no Content-Length")
+            return {"size": size, "etag": etag}
+        except CatalogFetchError as exc:
+            last_error = exc
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_error = CatalogFetchError(f"asset HEAD failed: {exc}")
+        if attempt + 1 < max(1, attempts):
+            time.sleep(retry_delay)
+    raise last_error
 
 
 def release_asset_info(
@@ -243,12 +306,17 @@ def ensure_catalog(force_refresh: bool = False, timeout: float = 120.0) -> Path:
         # Recently verified fresh enough; skip the metadata request entirely.
         return CACHE_DB_PATH
 
-    info = release_asset_info(timeout=min(timeout, 20.0))
+    # Freshness check: HEAD-probe the CDN download URL first (no API quota);
+    # the api.github.com metadata call is only the fallback.
+    try:
+        info = _asset_head(timeout=10.0)
+    except CatalogFetchError:
+        info = release_asset_info(timeout=min(timeout, 20.0))
     state["checked_at"] = now
     state["remote"] = info
     _save_state(state)
 
-    if info.get("updated_at") and info == remote:
+    if remote and _same_remote(info, remote):
         return CACHE_DB_PATH  # nothing changed upstream
     return _download_and_install(timeout, state)
 
@@ -266,7 +334,12 @@ def _cache_is_valid() -> bool:
 
 
 def _download_and_install(timeout: float, state: dict) -> Path:
-    info = release_asset_info(timeout=min(timeout, 20.0))
+    # Same probe shape as the freshness check (HEAD first, API fallback) so
+    # the next comparison can never spuriously mismatch and re-download.
+    try:
+        info = _asset_head(timeout=10.0)
+    except CatalogFetchError:
+        info = release_asset_info(timeout=min(timeout, 20.0))
     asset = _asset_download_url()
     blob = _get_bytes(asset, timeout)
     if not blob[:16].startswith(b"SQLite format 3\x00"):
