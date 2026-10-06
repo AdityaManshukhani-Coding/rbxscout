@@ -36,7 +36,12 @@ on:
 # bounded slice each run anyway; freshness of stats is the hydrator's job.
   workflow_dispatch:
   schedule:
-    - cron: "0 */3 * * *"   # safety net: every 3 hours
+    # Every 30 min on off-peak minutes — parity with the Cloudflare worker's
+    # :15/:45 cadence (2026-10-05: the worker stopped dispatching ~16:15Z and
+    # the on-the-hour backstop barely fired — GitHub suppresses :00 schedules
+    # under load). Extra triggers no-op through the concurrency group when
+    # the worker is healthy; the Atlas harvest self-throttles to 3h.
+    - cron: "13,43 * * * *"
 
 permissions:
   contents: write   # create/update the catalog-latest release assets

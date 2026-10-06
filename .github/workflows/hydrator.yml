@@ -34,7 +34,15 @@ on:
 # Cloudflare stays the precision clock.
   workflow_dispatch:
   schedule:
-    - cron: "0 * * * *"   # hourly safety net
+    # Every 5 min on off-peak minutes — full parity with the Cloudflare
+    # worker's precision clock. On 2026-10-05 the deployed worker stopped
+    # dispatching (~16:15Z) and the old hourly on-the-hour backstop proved
+    # useless: GitHub suppresses/delays schedule starts under load, worst on
+    # :00 (only 3 fires in 24h). Off-peak minutes fire far more reliably.
+    # Extra triggers no-op through the concurrency group when the worker is
+    # healthy; when it is dead, this schedule IS the clock (worst-case
+    # freshness degrades from 5 min to ~10, not to hours).
+    - cron: "4-59/5 * * * *"
 
 permissions:
   contents: write   # create/update the catalog-latest release assets
