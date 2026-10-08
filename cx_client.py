@@ -210,16 +210,14 @@ class CxClient:
             resp = self.session.get(url, timeout=self.timeout, allow_redirects=True)
         except requests.RequestException as exc:
             # includes ReadTimeout/ConnectTimeout from dead-ID hangs
-            log.debug("cx fetch %s failed: %s", uid, exc)
-            self._note_fail()
+            self._note_fail(uid, f"transport: {type(exc).__name__}")
             return None
         if resp.status_code != 200:
-            log.debug("cx fetch %s: HTTP %s", uid, resp.status_code)
-            self._note_fail()
+            self._note_fail(uid, f"HTTP {resp.status_code}")
             return None
         game = self.parse_game_payload(resp.text or "")
         if not game:
-            self._note_fail()
+            self._note_fail(uid, "parse miss (no initialGameData)")
             return None
         self._consecutive_fails = 0
         out: Dict[str, Any] = {"fetched_at": time.strftime("%Y-%m-%d %H:%M:%S")}
@@ -240,7 +238,16 @@ class CxClient:
         # upstream; keep whatever came back.
         return out
 
-    def _note_fail(self) -> None:
+    def _note_fail(self, uid: int, reason: str) -> None:
+        """Record a miss with its REASON at warning level.
+
+        First cloud run 2026-10-08 (#3090): the circuit opened from a real
+        runner with no visible cause — debug logs don't survive to Actions.
+        The overflow's whole job is fail-open resilience, but diagnosing a
+        403 wall vs dead-ID hangs vs a parser break needs the reason in the
+        run log. Counting + circuit logic is unchanged.
+        """
+        log.warning("cx miss U%s: %s", uid, reason)
         with self._lock:
             self._consecutive_fails += 1
             if self._consecutive_fails >= CX_MAX_CONSECUTIVE_FAILS:
