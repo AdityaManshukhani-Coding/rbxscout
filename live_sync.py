@@ -98,6 +98,26 @@ def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float, mode: st
     metrics = diag.get("metrics") or {}
     print(f"metrics batches   : {metrics.get('successful_batches', 0)}/{metrics.get('batches', 0)} OK "
           f"· breaker: {metrics.get('breaker_tripped', False)}")
+    # Per-source hydration breakdown (HYDRATION_SOURCES.md Phase 5):
+    # complaints become a grep — `grep source_breakdown` in the Actions log.
+    breakdown = scan.get("source_breakdown") or {}
+    if breakdown:
+        print(f"source breakdown : roblox_live {breakdown.get('roblox_live', 0)} · "
+              f"cx_live {breakdown.get('cx_live', 0)} · "
+              f"rolled {breakdown.get('rolled', 0)}")
+    slo = scan.get("slo") or {}
+    if slo:
+        overdue = " · ".join(
+            f"{label} {v['worst_age_hours']}h> {v['slo_cap_hours']:g}h"
+            for label, v in slo.items() if v.get("overdue")
+        )
+        worst = max(slo.values(), key=lambda v: v.get("worst_age_hours", 0)) if slo else None
+        line = (f"staleness SLO    : worst {worst['worst_age_hours']}h"
+                if worst else "staleness SLO    : n/a")
+        if overdue:
+            print(f"{line} · ⚠ tier overdue: {overdue}")
+        else:
+            print(f"{line} · within cadence×3 ✓")
 
     # Catalog-expansion summary — only on expander runs, where
     # scan['expansion'] is populated.

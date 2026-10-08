@@ -2154,6 +2154,42 @@ def _momentum_cell(value) -> str:
     return "<span class='ss-none'>0</span>"
 
 
+def _earnings_cell(row: pd.Series) -> str:
+    """Earnings-rank cell (HYDRATION_SOURCES.md Phase 3): a Rotrends
+    revenue proxy Roblox never exposes — '#N' with a source caption, '-'
+    when the sweep hasn't reached this game yet."""
+    try:
+        rank = row.get("earning_rank")
+        if rank is None or pd.isna(rank):
+            return "-"
+        return f"#{int(rank)}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _rank_cell(row: pd.Series) -> str:
+    """Creator Exchange globalRank cell (Phase 3 enrichment)."""
+    try:
+        rank = row.get("cx_global_rank")
+        if rank is None or pd.isna(rank):
+            return "-"
+        return f"#{int(rank)}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _momentum_flag(row: pd.Series) -> str:
+    """CE momentum tag (Surging/Fading/Stable) for game detail tooltips.
+    Empty string when absent — never a false signal."""
+    try:
+        val = row.get("momentum")
+        if val is None or pd.isna(val):
+            return ""
+        return str(val)
+    except (TypeError, ValueError):
+        return ""
+
+
 def _is_blowup_row(row: pd.Series) -> bool:
     """True when a watchlist row carries the blow-up signal class.
 
@@ -2199,6 +2235,7 @@ def render_table(frame: pd.DataFrame) -> None:
     head = [
         "Game", "Genre", "Total visits", "CCU", "Discord", "Message",
         "Avg CCU (1d)", "Avg CCU (3d)", "Momentum (1d)", "Rating",
+        "Earnings", "Global rank",
     ]
     rows = []
     for _, row in frame.iterrows():
@@ -2217,6 +2254,8 @@ def render_table(frame: pd.DataFrame) -> None:
             f"<td class='ss-num'>{_ccu_cell(row.get('avg_ccu_3d'))}</td>"
             f"<td class='ss-num'>{_momentum_cell(row.get('momentum_1d'))}</td>"
             f"<td class='ss-num'>{_rating_cell(row)}</td>"
+            f"<td class='ss-num'>{_earnings_cell(row)}</td>"
+            f"<td class='ss-num'>{_rank_cell(row)}</td>"
             + "</tr>"
         )
     # st.html with unsafe_allow_javascript=True is required for the copy

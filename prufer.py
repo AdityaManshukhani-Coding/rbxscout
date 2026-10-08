@@ -62,7 +62,18 @@ PRUFER_USER_AGENT = "UpScaleScoutingTool/1.0 (Roblox game discovery; contact via
 DEFAULT_PROXY_LISTS = [
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    # 2026-10-08 pool repair (HYDRATION_SOURCES.md Phase 4): the two GitHub
+    # lists alone yielded pool=0 on real runs (run #7789). Both extra
+    # sources below are live, anonymous-HTTP proxies lists (verified 200
+    # with fresh IPs); more candidates = more validated survivors per pass.
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=8000&country=all",
+    "https://www.proxy-list.download/api/v1/get?type=http",
 ]
+# Phase-4 escalation: when the first validation sample yields fewer than
+# PRUFER_POOL_MIN_SIZE working proxies, the validator re-runs over the FULL
+# deduped candidate list once (the measured per-run churn means a random
+# 1,400 slice can miss every healthy proxy even when the pool is fine).
+PRUFER_POOL_ESCALATE = os.environ.get("PRUFER_POOL_ESCALATE", "1") not in ("0", "false", "no")
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
     try:
@@ -178,13 +189,35 @@ class PruferClient:
             return False
 
         good: List[str] = []
-        with ThreadPoolExecutor(PRUFER_VALIDATION_THREADS) as ex:
-            for result in ex.map(self._validate_one, sample):
-                if result:
-                    good.append(result)
+        validated = sample
+
+        def _validate_batch(batch: List[str]) -> List[str]:
+            out: List[str] = []
+            with ThreadPoolExecutor(PRUFER_VALIDATION_THREADS) as ex:
+                for result in ex.map(self._validate_one, batch):
+                    if result:
+                        out.append(result)
+            return out
+
+        good = _validate_batch(sample)
+        # Phase-4 escalation (HYDRATION_SOURCES.md §4/Phase 4): a short first
+        # pass over a random slice is NOT proof the pool is dead — proxy
+        # churn means the healthy ones may sit outside the slice. One full
+        # sweep of every deduped candidate (validated entries skipped) costs
+        # ~2× the sample pass and recovers the degraded-pool days that
+        # produced 'pool 0 proxies' in run #7789.
+        if len(good) < want and PRUFER_POOL_ESCALATE and len(proxies) > len(sample):
+            rest = [p for p in proxies if p not in set(sample)]
+            log.info(
+                "prufer pool escalation: %d/%d in sample, validating the "
+                "remaining %d candidates",
+                len(good), len(sample), len(rest),
+            )
+            good = list(dict.fromkeys(good + _validate_batch(rest)))
+            validated = proxies
         with self._pool_lock:
             self._pool = good
-        log.info("prufer pool validated: %d/%d working", len(good), len(sample))
+        log.info("prufer pool validated: %d/%d working", len(good), len(validated))
         return len(good) >= want
 
     def _next_proxy(self) -> Optional[str]:

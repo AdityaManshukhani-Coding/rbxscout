@@ -822,6 +822,22 @@ class RobloxPlatformScout:
                 )
             if "blowup_at" not in columns:
                 conn.execute("ALTER TABLE game_analytics ADD COLUMN blowup_at TIMESTAMP")
+            # Third-party enrichment (HYDRATION_SOURCES.md Phases 1–3). All
+            # columns are piggybacked at zero extra request cost: earning_rank
+            # + like_ratio from the Rotrends sweep, momentum / global_rank /
+            # scammerFlag from Creator Exchange page hits. They are display +
+            # scouting signals only — tier classification stays visits/CCU,
+            # computed ONLY from live sources (roblox_live / cx_live).
+            for name, definition in (
+                ("earning_rank", "INTEGER"),
+                ("earning_rank_at", "TIMESTAMP"),
+                ("momentum", "TEXT"),
+                ("cx_global_rank", "INTEGER"),
+                ("scammer_flag", "TEXT"),
+                ("cx_last_seen", "TIMESTAMP"),
+            ):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE game_analytics ADD COLUMN {name} {definition}")
             # Rating + first-seen stamp. upvotes/downvotes come from
             # games.roblox.com/v1/games/votes (fetched by the same pipeline
             # passes that fetch icons); first_seen is the catalog insertion
@@ -908,6 +924,25 @@ class RobloxPlatformScout:
                     PRIMARY KEY (universe_id, ts)
                 )
                 """
+            )
+            # Multi-source hydration (HYDRATION_SOURCES.md §3.3): every
+            # ccu_history row carries the channel that produced it —
+            # 'roblox_live' (the canonical live API, also the default for all
+            # pre-existing rows), 'cx_live' (Creator Exchange live overflow),
+            # 'rotrends_daily' (daily snapshots timestamped at the snapshot's
+            # process_date, not fetch time). Roblox stays the tie-breaker; the
+            # pk dedupe extends to source so a daily source and a live source
+            # may both write the same (universe, day). The legacy PK
+            # (universe_id, ts) stays in place — it is materialized and SQLite
+            # cannot ALTER a table's PK in place — so the dedupe contract is
+            # enforced by INSERT OR IGNORE from all writers, which historically
+            # has been the only insert path anyway.
+            hist_columns = {row[1] for row in conn.execute("PRAGMA table_info(ccu_history)")}
+            if "source" not in hist_columns:
+                conn.execute("ALTER TABLE ccu_history ADD COLUMN source TEXT DEFAULT 'roblox_live'")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ccu_hist_source "
+                "ON ccu_history(universe_id, source, ts)"
             )
             conn.execute(
                 """
@@ -1858,17 +1893,45 @@ class RobloxPlatformScout:
         except sqlite3.Error as exc:
             log.debug("tier scheduler failed: %s", exc)
         selected: List[int] = []
-        for key in ("t1_t2", "t2", "t3", "t4", "weekly", "t8"):
-            selected.extend(groups[key])
+        hot_demand = 0
+        for key in ("t1_t2", "t2", "t3", "t4"):
+            hot_demand += len(groups[key])
+        # Ring-fence (HYDRATION_SOURCES.md Phase 0): the Roblox batch budget
+        # belongs to the hot tiers first. When hot demand reaches the cap,
+        # weekly/cold games are NOT scheduled into this sync — they roll
+        # over until a sync has spare capacity. Rotrends owns the cold-tail
+        # daily sweep, so a cold game waiting an extra tick loses far less
+        # than a hot game waiting past its cadence promise (the old
+        # first-come order leaked ~60% of every run's slots to weekly/cold
+        # while T2/T4 ran hours overdue).
+        hot_ids = list(
+            dict.fromkeys(
+                groups["t1_t2"] + groups["t2"] + groups["t3"] + groups["t4"]
+            )
+        )
+        if len(hot_ids) >= cap:
+            selected = hot_ids[:cap]
+        else:
+            room = cap - len(hot_ids)
+            leftover: List[int] = []
+            for key in ("weekly", "t8"):
+                leftover.extend(groups[key])
+            selected = hot_ids + list(dict.fromkeys(leftover))[:room]
         selected = list(dict.fromkeys(selected))[:cap]
         return {
             "ids": selected,
             "groups": {k: len(v) for k, v in groups.items()},
             "tier_counts": counts,
+            "hot_demand": hot_demand,
+            "ring_fenced": len(hot_ids) >= cap,
             "sync_number": n,
         }
 
-    def upsert_metrics_only(self, metrics: Dict[int, Dict[str, Any]]) -> int:
+    def upsert_metrics_only(
+        self,
+        metrics: Dict[int, Dict[str, Any]],
+        source: str = "roblox_live",
+    ) -> int:
         """Merge ONLY live metrics (ccu/visits + a ccu_history snapshot) into
         existing rows, never touching identity or contact columns.
 
@@ -1879,8 +1942,18 @@ class RobloxPlatformScout:
         game's tier-due hydration out for weeks. The targeted UPDATE keeps
         the row's schedule intact.
 
+        ``source`` (HYDRATION_SOURCES.md §3.3) tags the ccu_history snapshot:
+        'roblox_live' (default), 'cx_live' (Creator Exchange overflow —
+        genuinely live, so ts = fetch time), or 'rotrends_daily' (daily
+        snapshot — the sweep passes ts explicitly, one row per day).
+        Records may also carry enrichment keys ('momentum', 'global_rank',
+        'scammer_flag') which land in their game_analytics columns.
+
         Returns the number of rows updated. Rows missing from the catalog are
-        skipped (insertion stays the queue drain's job). Never raises.
+        skipped when source is a live channel (insertion stays the queue
+        drain's job); rotrends_daily rows for unknown games are dispatched to
+        ``upsert_rotrends_snapshot`` instead (cold games often only exist
+        there between sweeps). Never raises.
         """
         if not metrics:
             return 0
@@ -1909,14 +1982,51 @@ class RobloxPlatformScout:
                         )
                         updated += cursor.rowcount if cursor.rowcount > 0 else 0
                         if ccu is not None:
+                            # Microsecond ts (live sources) or caller-passed
+                            # snapshot ts (daily sources) — see the docstring.
+                            snapshot_ts = record.get("ts") or datetime.now().strftime(
+                                "%Y-%m-%d %H:%M:%S.%f"
+                            )
                             conn.execute(
-                                "INSERT OR IGNORE INTO ccu_history (universe_id, ts, ccu) "
-                                "VALUES (?, ?, ?)",
+                                "INSERT OR IGNORE INTO ccu_history "
+                                "(universe_id, ts, ccu, source) VALUES (?, ?, ?, ?)",
                                 (
                                     int(uid),
-                                    datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
+                                    snapshot_ts,
                                     int(ccu),
+                                    record.get("source") or source,
                                 ),
+                            )
+                        # Enrichment piggyback (Phase 1/2). Column writes are
+                        # COALESCE-guarded: a miss never blanks existing data.
+                        momentum = record.get("momentum")
+                        global_rank = record.get("global_rank")
+                        scammer = record.get("scammer_flag")
+                        earning = record.get("earning_rank")
+                        if any(v is not None for v in (momentum, global_rank, scammer, earning)):
+                            enrichment_sets = []
+                            enrichment_vals: List[Any] = []
+                            if momentum is not None:
+                                enrichment_sets.append("momentum = ?")
+                                enrichment_vals.append(str(momentum))
+                            if global_rank is not None:
+                                enrichment_sets.append("cx_global_rank = ?")
+                                enrichment_vals.append(int(global_rank))
+                            if scammer is not None:
+                                enrichment_sets.append("scammer_flag = ?")
+                                enrichment_vals.append(str(scammer))
+                            if earning is not None:
+                                enrichment_sets.extend(
+                                    ("earning_rank = ?", "earning_rank_at = ?")
+                                )
+                                enrichment_vals.extend(
+                                    (int(earning), datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                                )
+                            conn.execute(
+                                "UPDATE game_analytics SET "
+                                + ", ".join(enrichment_sets)
+                                + " WHERE universe_id = ?",
+                                (*enrichment_vals, int(uid)),
                             )
                     except (TypeError, ValueError, sqlite3.Error) as exc:
                         log.debug("metrics-only upsert skipped %s: %s", uid, exc)
@@ -1924,6 +2034,86 @@ class RobloxPlatformScout:
             log.warning("metrics-only upsert failed: %s", exc)
             return 0
         return updated
+
+    def upsert_rotrends_snapshot(
+        self,
+        rows: Dict[int, Dict[str, Any]],
+        *,
+        conn: Optional[sqlite3.Connection] = None,
+    ) -> Dict[str, int]:
+        """Store Rotrends daily snapshots (HYDRATION_SOURCES.md Phase 1).
+
+        Returns {"history_rows": n, "enriched": n, "dispatched": n}:
+        - history_rows: ccu_history rows INSERTed with source='rotrends_daily'
+          at the snapshot's process_date (the value describes that day; a
+          live fetch-time stamp would silently falsify the trend curve).
+        - enriched: game_analytics earning_rank/like_ratio repaints.
+        - dispatched: universe IDs with NO catalog row — the queue drain
+          owns catalog insertion, so the sweep hands cold unknowns back to
+          discovery instead of self-inserting (strict-gate policy intact).
+        """
+        if not rows:
+            return {"history_rows": 0, "enriched": 0, "dispatched": 0}
+        log = logging.getLogger("rbxscout.rotrends")
+        out = {"history_rows": 0, "enriched": 0, "dispatched": 0}
+
+        def _write(c: sqlite3.Connection) -> None:
+            for uid, snap in rows.items():
+                try:
+                    ccu = snap.get("ccu")
+                    if ccu is None:
+                        continue
+                    ts = snap.get("ts") or snap.get("process_date")
+                    if not ts:
+                        continue
+                    # Normalize to the midnight-UTC stamp all writers agree
+                    # on: "2026-10-07" and "2026-10-07 00:00:00" are the
+                    # same day and must collide on the PK, not double-write.
+                    ts = f"{str(ts)[:10]} 00:00:00"
+                    cur = c.execute(
+                        "INSERT OR IGNORE INTO ccu_history "
+                        "(universe_id, ts, ccu, source) VALUES (?, ?, ?, 'rotrends_daily')",
+                        (int(uid), str(ts), int(ccu)),
+                    )
+                    out["history_rows"] += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                    earning = snap.get("earning_rank")
+                    like_ratio = snap.get("like_ratio")
+                    if earning is not None or like_ratio is not None:
+                        sets = []
+                        vals: List[Any] = []
+                        if earning is not None:
+                            sets.extend(("earning_rank = ?", "earning_rank_at = ?"))
+                            vals.extend(
+                                (int(earning), datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                            )
+                        if like_ratio is not None:
+                            sets.append("like_ratio = ?")
+                            vals.append(float(like_ratio))
+                        if "like_ratio" not in {
+                            r[1] for r in c.execute("PRAGMA table_info(game_analytics)")
+                        }:
+                            c.execute("ALTER TABLE game_analytics ADD COLUMN like_ratio REAL")
+                        try:
+                            c.execute(
+                                "UPDATE game_analytics SET " + ", ".join(sets)
+                                + " WHERE universe_id = ?",
+                                (*vals, int(uid)),
+                            )
+                            out["enriched"] += 1
+                        except sqlite3.Error as exc:
+                            log.debug("rotrends enrichment skipped %s: %s", uid, exc)
+                except (TypeError, ValueError, sqlite3.Error) as exc:
+                    log.debug("rotrends snapshot skipped %s: %s", uid, exc)
+
+        try:
+            if conn is not None:
+                _write(conn)
+            else:
+                with self._connect() as own:
+                    _write(own)
+        except sqlite3.Error as exc:
+            log.warning("rotrends snapshot store failed: %s", exc)
+        return out
 
     def fetch_game_metrics(self, universe_ids: List[int]) -> Dict[int, Dict[str, Any]]:
         """Threaded batched metrics (50 universes per call — verified cap: 50→200, 100→400).
@@ -2691,6 +2881,18 @@ class RobloxPlatformScout:
             log.warning("discovery_queue claim failed: %s", exc)
         return out
 
+    def _is_hot_tier(self, uid: int) -> bool:
+        """Is this a hot-tier (T0/T1–T4) catalog game? CE must never serve cold."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT COALESCE(tier, 0) FROM game_analytics WHERE universe_id = ?",
+                    (int(uid),),
+                ).fetchone()
+            return row is not None and int(row[0]) <= 4
+        except (sqlite3.Error, TypeError, ValueError):
+            return False  # unknown → not hot; don't spend CE on a cold guess
+
     def drain_discovery_queue(
         self,
         batches: int = EXPAND_QUEUE_BATCHES_DEFAULT,
@@ -2752,6 +2954,7 @@ class RobloxPlatformScout:
             # peak-CCU growth and the ccu_history snapshot — identical to the
             # main pipeline. found_via only lands on brand-new rows; the
             # COALESCE in the upsert keeps it from clobbering real sources.
+            stats.setdefault("qualified_ids", []).append(int(uid))
             self.upsert_game({
                 "universe_id": int(uid),
                 "root_place_id": meta.get("root_place_id"),
@@ -2824,6 +3027,27 @@ class RobloxPlatformScout:
             result["atlas"] = {"error": str(exc), "enqueued": 0}
         report(0.5, "Expansion pass: draining the discovery queue…")
         result["drain"] = self.drain_discovery_queue(drain_limit, progress_cb=report)
+        # Rotrends 90-day trend backfill for JUST-qualified games
+        # (HYDRATION_SOURCES.md Phase 1): a new game gets its full trend
+        # chart the same tick it enters the catalog — no waiting for the
+        # daily sweep to reach it. Fail-open; capped so the expander's
+        # runtime budget is never blown.
+        qualified_ids = sorted(
+            uid for uid in (result["drain"] or {}).get("qualified_ids", []) or []
+        )
+        if qualified_ids:
+            try:
+                import rotrends_sweep
+                result["rotrends_backfill"] = rotrends_sweep.backfill_new_discoveries(
+                    self, qualified_ids
+                )
+                log.info(
+                    "rotrends discovery backfill: %s games, %s history rows",
+                    result["rotrends_backfill"].get("ok"),
+                    result["rotrends_backfill"].get("history_rows"),
+                )
+            except Exception as exc:  # never fail expansion on backfill
+                log.warning("rotrends discovery backfill failed: %s", exc)
         self.source_diagnostics["expansion"] = result
         self.last_scan["expansion"] = result
         return result
@@ -3398,6 +3622,7 @@ class RobloxPlatformScout:
                 schedule = {"ids": [], "groups": {}, "tier_counts": {}}
             self.last_scan["tier_schedule"] = schedule["groups"]
             self.last_scan["tier_counts"] = schedule["tier_counts"]
+            self.last_scan["ring_fenced"] = bool(schedule.get("ring_fenced"))
             known_due = schedule["ids"]
             budget_cap = HYDRATION_BUDGET_PER_SYNC * 50
             hydration_ids = known_due[:budget_cap]
@@ -3462,6 +3687,51 @@ class RobloxPlatformScout:
             report(0.35, f"Fetching metrics for {len(hydration_ids)} games (tier-budgeted)…")
             all_metrics = self.fetch_game_metrics(hydration_ids)
 
+            # --------------------------------------------------------------
+            # CE live overflow (HYDRATION_SOURCES.md Phase 2): games that
+            # stayed due after the Roblox window (429 breaker / mid-run
+            # misses) get ONE more chance through Creator Exchange BEFORE
+            # the roll-forward — against the HOT tiers only. CE serves live
+            # CCU at the page level, maps dead-ID hangs to 404, and never
+            # accepts cold games (their budget belongs to the rotrends
+            # sweep). cx results carry source='cx_live' with ts = fetch
+            # time — genuinely live values. Roblox remains the tie-breaker.
+            # --------------------------------------------------------------
+            cx_overflow: Dict[int, Dict[str, Any]] = {}
+            if do_hydrate:
+                missed_hot = [
+                    uid for uid in hydration_ids
+                    if uid not in all_metrics and self._is_hot_tier(uid)
+                ]
+                if missed_hot:
+                    report(
+                        0.40,
+                        f"Roblox missed {len(missed_hot)} hot games — "
+                        "trying Creator Exchange overflow…",
+                    )
+                    try:
+                        import cx_client
+                        cx_overflow = cx_client.fetch_universes(missed_hot)
+                    except Exception as exc:  # never fail the run on overflow
+                        log.warning("cx overflow pass failed (rolling forward): %s", exc)
+                        cx_overflow = {}
+                    # Store: metric-only upsert (identity untouched, tier
+                    # bookkeeping recomputes on the next real hydration).
+                    if cx_overflow:
+                        shaped = {
+                            uid: {
+                                "ccu": rec.get("ccu"),
+                                "visits": rec.get("visits"),
+                                "momentum": rec.get("momentum"),
+                                "global_rank": rec.get("global_rank"),
+                                "scammer_flag": rec.get("scammer_flag"),
+                                "source": "cx_live",
+                                "ts": rec.get("fetched_at"),
+                            }
+                            for uid, rec in cx_overflow.items()
+                        }
+                        self.upsert_metrics_only(shaped, source="cx_live")
+
             # Catalog-grade upsert: store EVERY hydrated game, not only
             # matches — that's what makes game_analytics a real filtering
             # database instead of a scan result. Discord columns are
@@ -3498,10 +3768,14 @@ class RobloxPlatformScout:
                 matched = {int(meta["universe_id"]): meta for meta in ranked_matches}
             matched_ids = list(matched)
             self.last_metrics = matched
-            self.last_scan.update({
-                "matched_count": len(matched_ids),
-                "metrics_count": len(matched_ids),
-            })
+            # Per-source breakdown (HYDRATION_SOURCES.md Phase 5): honest
+            # counts of what actually refreshed this run, by channel.
+            self.last_scan["source_breakdown"] = {
+                "roblox_live": len(all_metrics),
+                "cx_live": len(cx_overflow),
+                "rolled": max(0, len(hydration_ids) - len(all_metrics) - len(cx_overflow)),
+            }
+            self.last_scan["slo"] = self._staleness_slo_check()
 
             report(0.48, f"{len(matched_ids)} games meet your targets. Fetching icons…")
             icons = self.fetch_game_icons(matched_ids)
@@ -3557,6 +3831,59 @@ class RobloxPlatformScout:
         except Exception as exc:
             self.mark_scan_failed(exc)
             raise
+
+    def _staleness_slo_check(self) -> Dict[str, Any]:
+        """Per-tier staleness SLO check (Phase 5): worst age per tier bucket.
+
+        A tier's games are 'overdue' when the freshest sample is older than
+        cadence × 3. T5–T7 compare against the WEEKLY promise (7d × 3);
+        rotrends_daily rows count toward their freshness, so a healthy
+        sweep keeps them green. '''Never raises'''.
+        """
+        now = time.time()
+        out: Dict[str, Any] = {}
+        tiers = [
+            ("T1", "tier = 1", TIER_CADENCE_WALL_HOURS[1] * 3),
+            ("T2", "tier = 2", TIER_CADENCE_WALL_HOURS[2] * 3),
+            ("T3", "tier = 3", TIER_CADENCE_WALL_HOURS[3] * 3),
+            ("T4", "tier = 4", TIER_CADENCE_WALL_HOURS[4] * 3),
+            ("weekly", "tier IN (5, 6, 7)", WEEKLY_TIER_REFRESH_DAYS * 24 * 3),
+        ]
+        try:
+            with self._connect() as conn:
+                for label, where, cap_h in tiers:
+                    row = conn.execute(
+                        f"""
+                        SELECT COALESCE(
+                            (SELECT MAX(h.ts) FROM ccu_history h
+                             WHERE h.universe_id = ga.universe_id),
+                            ga.last_updated
+                        )
+                        FROM game_analytics ga WHERE {where}
+                        ORDER BY 1 ASC LIMIT 1
+                        """
+                    ).fetchone()
+                    if not row or not row[0]:
+                        continue
+                    try:
+                        import calendar
+                        ts = calendar.timegm(
+                            time.strptime(str(row[0])[:19], "%Y-%m-%d %H:%M:%S")
+                        )
+                    except (ValueError, TypeError):
+                        continue
+                    age_h = max(0.0, (now - ts) / 3600.0)
+                    out[label] = {
+                        "worst_age_hours": round(age_h, 1),
+                        "slo_cap_hours": cap_h,
+                        "overdue": age_h > cap_h,
+                    }
+        except (sqlite3.Error, ValueError) as exc:
+            log.debug("staleness SLO check skipped: %s", exc)
+        overdue = [k for k, v in out.items() if v.get("overdue")]
+        if overdue:
+            log.warning("⚠ tier overdue (staleness > cadence×3): %s", ", ".join(overdue))
+        return out
 
     def _scan_expand(
         self,

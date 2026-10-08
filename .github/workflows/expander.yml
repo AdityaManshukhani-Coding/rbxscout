@@ -138,6 +138,24 @@ jobs:
           fi
           python live_sync.py --only expander --min-visits 20000 --min-ccu 25
 
+      # ------------------------------------------------------------------
+      # Rotrends daily sweep + shallow backfill (HYDRATION_SOURCES.md
+      # Phase 1): the cold tail (T5-T7, ~23k games) gets its daily CCU
+      # snapshot from api.rotrends.com instead of spending the Roblox
+      # batch budget. Sliced: each expander run does a bounded slice
+      # (ROTRENDS_SWEEP_MAX_GAMES + ROTRENDS_BACKFILL_MAX_GAMES); the
+      # next :13/:43 run continues the rotation. Fail-open: a rotrends
+      # outage must not fail the expansion push (|| true).
+      # ------------------------------------------------------------------
+      - name: Rotrends daily sweep slice (cold tail T5-T7)
+        if: always()
+        env:
+          ROTRENDS_RPS: '8'
+          ROTRENDS_SWEEP_MAX_GAMES: ${{ vars.ROTRENDS_SWEEP_MAX_GAMES || '6000' }}
+          ROTRENDS_BACKFILL_MAX_GAMES: ${{ vars.ROTRENDS_BACKFILL_MAX_GAMES || '400' }}
+        run: |
+          python rotrends_sweep.py || echo "rotrends sweep failed (fail-open; next run continues)"
+
       # One-way door: an expansion pass that evaluated IDs but failed to
       # persist would re-evaluate the same seeds next run (the Atlas cursor
       # only advances after a successful DB write). Fail visibly.

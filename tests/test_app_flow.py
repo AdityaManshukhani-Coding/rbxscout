@@ -368,8 +368,10 @@ def test_store_outage_shows_banner_instead_of_crashing(monkeypatch):
 
 
 def test_table_column_order_discord_before_averages():
-    """Column order (user request 2026-09-23): Game, Genre, Total visits,
-    CCU, Discord, Message, Avg CCU (1d), Avg CCU (3d), Momentum, Rating."""
+    """Column order (user request 2026-09-23; extended by
+    HYDRATION_SOURCES.md Phase 3): Game, Genre, Total visits,
+    CCU, Discord, Message, Avg CCU (1d), Avg CCU (3d), Momentum, Rating,
+    Earnings (rotrends), Global rank (Creator Exchange)."""
     at = _render_dashboard()
     assert not at.exception
 
@@ -380,6 +382,7 @@ def test_table_column_order_discord_before_averages():
     assert headers == [
         "Game", "Genre", "Total visits", "CCU", "Discord", "Message",
         "Avg CCU (1d)", "Avg CCU (3d)", "Momentum (1d)", "Rating",
+        "Earnings", "Global rank",
     ], headers
 
 

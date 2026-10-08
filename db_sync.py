@@ -363,6 +363,23 @@ def stats_payloads(db: Path) -> dict[str, dict]:
                 ).fetchone()[0]
             except sqlite3.Error:
                 pass
+            # Per-source hydration breakdown (HYDRATION_SOURCES.md Phase 5):
+            # counts of ccu_history rows written in the last 15 min by each
+            # source — a rolling window that stays meaningful between pushes.
+            try:
+                import time as _t
+                window = _t.strftime(
+                    "%Y-%m-%d %H:%M:%S", _t.gmtime(_t.time() - 900)
+                )
+                breakdown = {
+                    str(src): int(n) for src, n in conn.execute(
+                        "SELECT source, COUNT(*) FROM ccu_history "
+                        "WHERE ts >= ? GROUP BY source",
+                        (window,),
+                    ).fetchall()
+                }
+            except sqlite3.Error:
+                breakdown = {}
         finally:
             conn.close()
     except sqlite3.Error:
@@ -382,6 +399,7 @@ def stats_payloads(db: Path) -> dict[str, dict]:
             # Self-describing extras for humans and other consumers.
             "games": int(games),
             "last_sync_utc": last or "",
+            "last_source_breakdown": breakdown,
         },
     }
     if passing is not None:
