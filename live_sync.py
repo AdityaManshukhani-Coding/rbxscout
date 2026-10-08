@@ -105,6 +105,10 @@ def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float, mode: st
         print(f"source breakdown : roblox_live {breakdown.get('roblox_live', 0)} · "
               f"cx_live {breakdown.get('cx_live', 0)} · "
               f"rolled {breakdown.get('rolled', 0)}")
+    ib = scan.get("icon_backfill") or {}
+    if ib.get("attempted"):
+        print(f"icon backfill    : {ib.get('filled', 0)}/{ib.get('attempted', 0)} "
+              "thumbnails filled (Blocked games retry each run)")
     slo = scan.get("slo") or {}
     if slo:
         overdue = " · ".join(

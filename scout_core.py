@@ -2242,6 +2242,49 @@ class RobloxPlatformScout:
                     continue
         return out
 
+    def backfill_missing_icons(self, limit: int = 50) -> Dict[str, int]:
+        """Fill thumbnails for icon-less catalog rows (cloud-side backfill).
+
+        The catalog's only thumbnail source used to be the LAPTOP's nightly
+        pass (atlas_home.backfill_thumbnails) — every game entering via the
+        cloud expander between laptop runs rendered the 🎮 placeholder
+        indefinitely. This bounded step runs inside the 5-minute hydrator:
+        ONE batched thumbnails call (+ one votes call for the Rating cell)
+        per run keeps the catalog permanently thumbnailed regardless of
+        whether the laptop is awake.
+
+        Roblox states decoded (verified 2026-10-08 over the 42 then-missing
+        games): 'Completed' rows return a URL and fill immediately;
+        'Blocked' rows are moderation-removed and will NEVER render — they
+        stay icon-less and are retried each run (they share the same single
+        batch call, so the waste is zero extra requests, just batch slots).
+        Never raises: a failed pass only postpones thumbnails by one tick.
+        """
+        out = {"attempted": 0, "filled": 0}
+        try:
+            with self._connect() as conn:
+                doomed = [
+                    int(r[0]) for r in conn.execute(
+                        "SELECT universe_id FROM game_analytics "
+                        "WHERE (icon_url IS NULL OR icon_url = '') "
+                        "ORDER BY last_updated ASC, universe_id ASC LIMIT ?",
+                        (max(0, int(limit)),),
+                    ).fetchall()
+                ]
+        except sqlite3.Error as exc:
+            log.debug("icon backfill selection failed: %s", exc)
+            return out
+        if not doomed:
+            return out
+        out["attempted"] = len(doomed)
+        try:
+            icons = self.fetch_game_icons(doomed)
+            self.upsert_icons(icons)
+            out["filled"] = len(icons)
+        except Exception as exc:  # never fail the hydrator on thumbnails
+            log.warning("icon backfill failed: %s", exc)
+        return out
+
     def upsert_icons(self, icons: Dict[int, str]) -> None:
         """Persist icon URLs without touching the game rows' metrics.
 
@@ -3801,6 +3844,17 @@ class RobloxPlatformScout:
                     "description": meta.get("description"),
                     "icon_url": meta.get("icon_url"),
                 })
+
+            # Thumbnail backfill (cloud-side): any catalog row still missing
+            # an icon gets ONE batched attempt per run. Keeps the dashboard
+            # fully thumbnailed even for games that entered via the cloud
+            # expander while the laptop (the previous backfill source) was
+            # offline. Roblox 'Blocked' games can never render and simply
+            # retry each tick inside the same batch call.
+            try:
+                self.last_scan["icon_backfill"] = self.backfill_missing_icons()
+            except Exception as exc:  # never fail the run on thumbnails
+                log.warning("icon backfill skipped: %s", exc)
 
             self.last_scan["catalog_count"] = int(self.load_table().shape[0])
             self.last_scan["pruned_stale"] = self.prune_catalog()
