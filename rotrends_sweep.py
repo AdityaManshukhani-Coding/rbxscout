@@ -203,7 +203,6 @@ class RotrendsClient:
         uid = int(universe_id)
         if uid <= 0:
             return []
-        self._emit_pace()
         params = urlencode({
             "fields": ROTRENDS_FIELDS,
             "start": f"{start}T00:00:00.000Z",
@@ -211,13 +210,23 @@ class RotrendsClient:
             "include_previous_period": "false",
         })
         url = f"{ROTRENDS_BASE_URL}/{uid}/metrics/1d?{params}"
-        try:
-            resp = self.session.get(url, timeout=self.timeout)
-        except requests.RequestException as exc:
-            raise RotrendsFetchError(f"U{uid}: transport error {exc}") from exc
-        if resp.status_code == 429:
-            self._on_429()
-            raise RotrendsFetchError(f"U{uid}: 429 (token bucket)")
+        # 429 retry-once: the request that trips the penalty box is retried
+        # AFTER the measured box clears (first cloud run 2026-10-08: the
+        # un-retried in-flight request plus box-time trickle losses accounted
+        # for 225/6,000 errored games). _on_429 sleeps the box inside the
+        # first thread that hits it; this attempt loop re-emits once after.
+        for attempt in range(2):
+            self._emit_pace()
+            try:
+                resp = self.session.get(url, timeout=self.timeout)
+            except requests.RequestException as exc:
+                raise RotrendsFetchError(f"U{uid}: transport error {exc}") from exc
+            if resp.status_code == 429:
+                self._on_429()
+                if attempt == 0:
+                    continue  # box handled; re-emit once at the (halved) rate
+                raise RotrendsFetchError(f"U{uid}: 429 persists after box")
+            break
         if resp.status_code != 200:
             raise RotrendsFetchError(f"U{uid}: HTTP {resp.status_code}")
         try:

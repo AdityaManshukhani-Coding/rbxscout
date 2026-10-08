@@ -151,8 +151,13 @@ jobs:
         if: always()
         env:
           ROTRENDS_RPS: '8'
-          ROTRENDS_SWEEP_MAX_GAMES: ${{ vars.ROTRENDS_SWEEP_MAX_GAMES || '6000' }}
-          ROTRENDS_BACKFILL_MAX_GAMES: ${{ vars.ROTRENDS_BACKFILL_MAX_GAMES || '400' }}
+          # Slice sized to keep the whole expander under ~10 min: the run
+          # holds the rbxscout-sync mutex, so a long sweep starves the
+          # 5-min hydrator (first run 2026-10-08: a 6,000-game slice took
+          # 22 min of sweep alone and queued 6 hydrator ticks).
+          # 2,000 games ≈ 4-5 min of sweep at 8 req/s.
+          ROTRENDS_SWEEP_MAX_GAMES: ${{ vars.ROTRENDS_SWEEP_MAX_GAMES || '2000' }}
+          ROTRENDS_BACKFILL_MAX_GAMES: ${{ vars.ROTRENDS_BACKFILL_MAX_GAMES || '200' }}
         run: |
           python rotrends_sweep.py || echo "rotrends sweep failed (fail-open; next run continues)"
 
