@@ -834,6 +834,32 @@ def test_rotrends_snapshot_tier_bump_never_demotes_and_quiet_steps_stay_quiet(tm
     assert int(row["blowup_flag"]) == 0  # one step, 2.8x — below every trigger
 
 
+def test_rotrends_snapshot_escalates_in_tier_3x_gap_without_climb(tmp_path):
+    """Second escalation trigger (2026-10-09 review): a T7 game whose stored
+    ccu sits at 260 while the daily says 550 no longer classifies higher, so
+    a climb-only trigger would leave it stuck forever — the current cloud
+    store holds 533 such T7 games. A 3x+ gap over a >=10-CCU stored value
+    with the daily at T5-scale (>=250) escalates WITHOUT moving the tier
+    (the tier stamp stays Roblox's; escalation only schedules the refresh)."""
+    scout = RobloxPlatformScout(db_path=str(tmp_path / "me.db"))
+    scout.upsert_game({"universe_id": 31, "title": "Stuck Giant", "ccu": 150, "visits": 1_500_000})
+    assert int(scout.load_table().set_index("universe_id").loc[31]["tier"]) == 7
+
+    out = scout.upsert_rotrends_snapshot({31: {"ts": "2026-10-09", "ccu": 550}})
+    assert out["tier_bumps"] == 1  # same counter, escalation included
+    row = scout.load_table().set_index("universe_id").loc[31]
+    assert int(row["tier"]) == 7  # UNCHANGED — no climb to stamp
+    assert int(row["blowup_flag"]) == 1  # 550 >= 3 * 150 → watchlist signal
+    assert 31 in scout.blowup_watch_events
+
+    # Board-line noise never escalates: daily < 3x, or daily < 250.
+    out = scout.upsert_rotrends_snapshot({31: {"ts": "2026-10-09", "ccu": 440}})
+    assert out["tier_bumps"] == 0  # 440 < 3 * 150 → not 3x
+    scout.upsert_game({"universe_id": 32, "title": "Small", "ccu": 900, "visits": 50_000})
+    out = scout.upsert_rotrends_snapshot({32: {"ts": "2026-10-09", "ccu": 950}})
+    assert out["tier_bumps"] == 0  # 950 < 3 * 900
+
+
 def test_hot_refresh_batch_restores_canonical_stats_after_bump(tmp_path, monkeypatch):
     """The stale-stats repair's end-to-end: sweep bumps the tier from the
     daily signal, hot_refresh_batch immediately re-fetches from Roblox, and

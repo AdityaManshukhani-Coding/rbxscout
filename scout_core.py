@@ -2142,69 +2142,81 @@ class RobloxPlatformScout:
     def _restamp_tier_from_daily(
         self, c: sqlite3.Connection, universe_id: int, daily_ccu: int
     ) -> bool:
-        """Re-stamp a game's tier UP when the daily CCU signal outclasses it.
+        """Flag a game for hot re-hydration when the daily CCU outclasses it.
 
         The stale-stats repair (2026-10-09): a T5–T7 game can multiply its
         CCU while its stored live values sit days old — the ring-fenced
         Roblox budget reaches the weekly bucket only as leftover, so the
         game stays stuck under an outdated stamp and the dashboard renders
         weeks-old numbers. The sweep already carries the fresh daily CCU at
-        zero extra request cost; using it to reclassify (pure DB logic, no
-        stats written) escalates the game into the hot scheduler, whose
-        next tick restores canonical Roblox ccu/visits and re-stamps canonically.
+        zero extra request cost; escalation (pure DB logic, no stats written)
+        flags the game for the sweep's immediate hot refresh, which restores
+        canonical Roblox ccu/visits and re-stamps the tier canonically.
+
+        Two escalation triggers (both measured against the same cloud store,
+        2026-10-09: 123 + 629 games caught):
+          * tier climb — the daily value classifies on a HIGHER axis
+            (Grow a Plant: T5 stored ccu 496, daily 1198 → T7);
+          * in-tier multiplication — even with no tier change, a 3×+ CCU
+            gap over a ≥10-CCU stored value with the daily at T5-scale
+            (≥250) proves the row is stale. The T7 tail holds 533 such
+            games that a climb-only trigger would leave stuck forever.
 
         Contraction is deliberately not done here (a pool dip may be a
         snapshot quirk; demotion before Roblox confirms would wrongly
-        silence hot games). Only a tier CLIMB acts; bookkeeping follows the
-        same rules as _tier_stamp_for: tier_since resets on a change,
-        prev_tier keeps the old stamp, and a 2+ tier climb or a 3× CCU jump
-        (floored at 10) raises blowup_flag for the New and Upcoming watchlist.
+        silence hot games) and the tier stamp itself stays Roblox's: the
+        trigger only ESCALATES. blowup_flag follows the same rules as
+        _tier_stamp_for — a 2+ tier climb or a 3× CCU jump (floored at 10).
 
-        Returns True when the row was re-stamped. Never raises.
+        Returns True when the row was escalated. Never raises.
         """
         try:
             row = c.execute(
-                "SELECT COALESCE(tier, 0), visits FROM game_analytics "
-                "WHERE universe_id = ?",
+                "SELECT COALESCE(tier, 0), visits, COALESCE(ccu, 0) "
+                "FROM game_analytics WHERE universe_id = ?",
                 (int(universe_id),),
             ).fetchone()
             if not row:
                 return False  # unknown ID: the queue drain owns insertion
-            old_tier = int(row[0] or 0)
+            old_tier, visits, old_ccu = int(row[0] or 0), row[1], int(row[2] or 0)
             if daily_ccu <= 0:
                 return False
-            new_tier = classify_tier(row[1], daily_ccu)
-            if new_tier <= old_tier:
+            new_tier = classify_tier(visits, daily_ccu)
+            climbed = new_tier > old_tier
+            multiplied = old_ccu >= 10 and daily_ccu >= 3 * old_ccu and daily_ccu >= 250
+            if not climbed and not multiplied:
                 return False
             now = time.strftime("%Y-%m-%d %H:%M:%S")
-            # Blowup rules identical to _tier_stamp_for. old_ccu here is the
-            # stored LIVE ccu (the right base for 'did it multiply'); the
-            # daily value is the evidence, the live row is the reference.
-            old_ccu = int(
-                c.execute(
-                    "SELECT COALESCE(ccu, 0) FROM game_analytics WHERE universe_id = ?",
-                    (int(universe_id),),
-                ).fetchone()[0]
-            )
             blowup = (old_tier > 0 and new_tier - old_tier >= 2) or (
                 old_ccu >= 10 and daily_ccu >= 3 * old_ccu
             )
             if blowup:
                 # In-memory diagnostics event feeds the per-sync counters —
-                # the DB flag above is what survives restarts.
+                # the DB flag below is what survives restarts.
                 self._note_blowup_event(
                     int(universe_id), old_tier, new_tier, old_ccu, daily_ccu
                 )
+            if climbed:
+                c.execute(
+                    "UPDATE game_analytics SET tier = ?, prev_tier = ?, "
+                    "tier_since = ? WHERE universe_id = ?",
+                    (int(new_tier), int(old_tier), now, int(universe_id)),
+                )
+            else:
+                # In-tier escalation: touch tier_since so the hot scheduler
+                # sees the row as freshly re-stamped (its ordering key) even
+                # though the tier itself will be re-stamped canonically by
+                # the Roblox refresh this call triggers.
+                c.execute(
+                    "UPDATE game_analytics SET tier_since = ? WHERE universe_id = ?",
+                    (now, int(universe_id)),
+                )
             c.execute(
-                "UPDATE game_analytics SET tier = ?, prev_tier = ?, "
-                "tier_since = ?, "
+                "UPDATE game_analytics SET "
                 "blowup_flag = CASE WHEN ? = 1 THEN 1 ELSE COALESCE(blowup_flag, 0) END, "
                 "blowup_at = CASE WHEN ? = 1 THEN ? ELSE blowup_at END "
                 "WHERE universe_id = ?",
                 (
-                    int(new_tier),
-                    int(old_tier),
-                    now,
                     1 if blowup else 0,
                     1 if blowup else 0,
                     now if blowup else None,
@@ -2212,8 +2224,9 @@ class RobloxPlatformScout:
                 ),
             )
             log.info(
-                "tier bump from daily signal: U%s %s→T%s (daily ccu %s, "
+                "%s from daily signal: U%s %s→T%s (daily ccu %s, "
                 "stored ccu %s)%s",
+                "tier bump" if climbed else "in-tier escalation",
                 universe_id,
                 old_tier,
                 new_tier,
