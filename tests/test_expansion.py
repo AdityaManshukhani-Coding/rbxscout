@@ -128,9 +128,14 @@ def test_drain_stores_only_qualifiers_and_marks_outcomes(tmp_path):
         catalog = {r[0] for r in conn.execute("SELECT universe_id FROM game_analytics").fetchall()}
         outcomes = dict(conn.execute(
             "SELECT universe_id, outcome FROM discovery_queue").fetchall())
-    assert catalog == {801}                      # THE strict gate
+    # Strict gate admits ONLY 801 into the visible catalog; the paid-for
+    # below-gate game data (802/803) is KEPT as hidden rows (the waste-free
+    # policy: re-checks are free, re-discovery is not) with found_via
+    # 'expansion_hidden' and hidden=1. Deleted game 804 leaves nothing.
+    assert catalog == {801, 802, 803}
     assert outcomes == {
-        801: "qualified", 802: "below_gate", 803: "below_gate", 804: "metrics_failed",
+        801: "qualified", 802: "below_gate_hidden", 803: "below_gate_hidden",
+        804: "metrics_failed",
     }
     # The qualifier carries expansion provenance and full tier stamping.
     with sqlite3.connect(db) as conn:
@@ -138,6 +143,20 @@ def test_drain_stores_only_qualifiers_and_marks_outcomes(tmp_path):
             "SELECT found_via, tier, ccu FROM game_analytics WHERE universe_id=801"
         ).fetchone()
     assert row[0] == "expansion" and row[1] >= 1 and row[2] == 40
+    # Hidden rows keep their verified data but carry the hidden flag and
+    # provenance — the dashboard hides them from filtered views.
+    with sqlite3.connect(db) as conn:
+        h = conn.execute(
+            "SELECT found_via, hidden FROM game_analytics WHERE universe_id=803"
+        ).fetchone()
+    assert h == ("expansion_hidden", 1)
+    # A below-gate row that RECOVERS on a later touch unhides automatically.
+    scout.upsert_game({"universe_id": 803, "ccu": 40, "visits": 100_000})
+    with sqlite3.connect(db) as conn:
+        h = conn.execute(
+            "SELECT hidden FROM game_analytics WHERE universe_id=803"
+        ).fetchone()[0]
+    assert h == 0
 
 
 def test_drain_skips_ids_already_in_catalog(tmp_path):

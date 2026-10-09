@@ -405,6 +405,13 @@ TIER_CADENCE_WALL_HOURS: Dict[int, float] = {
     3: 4.0,
     4: 6.0,
 }
+# Beyond-gate hidden section (2026-10-09): a catalog game that fell below the
+# strict gate keeps its row (it paid for qualification — re-checking it every
+# "did it recover?" is FREE compared to re-discovering it) but consumes zero
+# hydration budget while hidden. Unhidden automatically the moment a Roblox
+# or overflow update shows it back above the gate.
+HIDDEN_GATE_VISITS = EXPANSION_TARGET_VISITS
+HIDDEN_GATE_CCU = EXPANSION_TARGET_CCU
 WEEKLY_TIER_REFRESH_DAYS = 7
 TIER8_ROTATION_DAYS = 2  # cold games all revisited within ~2 days
 TIER8_STALE_PRUNE_DAYS = 14  # unobserved 0-CCU fallback prune age
@@ -822,6 +829,18 @@ class RobloxPlatformScout:
                 )
             if "blowup_at" not in columns:
                 conn.execute("ALTER TABLE game_analytics ADD COLUMN blowup_at TIMESTAMP")
+            # The DEYOND-GATE hidden section (2026-10-09, user policy): once a
+            # game qualified into the catalog it stays — but when its live
+            # stats fall below the gate (wobbly CCU), it stops consuming
+            # hydration budget (there is no point refreshing a game you
+            # wouldn't contact at this CCU) and disappears from the dashboard
+            # whenever the user filters at the target thresholds. Hidden rows
+            # unhide automatically the moment the live stats recover. The
+            # flag is recomputed on EVERY catalog-grade upsert (write-side):
+            # hidden is the last-known state, never a permanent stamp.
+            if "hidden" not in columns:
+                conn.execute("ALTER TABLE game_analytics ADD COLUMN hidden INTEGER DEFAULT 0")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_ga_hidden ON game_analytics(hidden)")
             # Third-party enrichment (HYDRATION_SOURCES.md Phases 1–3). All
             # columns are piggybacked at zero extra request cost: earning_rank
             # + like_ratio from the Rotrends sweep, momentum / global_rank /
@@ -1162,8 +1181,7 @@ class RobloxPlatformScout:
                         "first_seen": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     }
         except (sqlite3.Error, TypeError, ValueError):
-            pass
-        # 25 bind values + a strike update + CURRENT_TIMESTAMP.
+            pass            # 25 bind values + a strike update + CURRENT_TIMESTAMP.
         # zero_ccu_strikes counts CONSECUTIVE observed 0-CCU visits: reset to 0
         # whenever the game has players, +1 when it is seen empty. This is what
         # makes prune_catalog work under the fast T8 rotation — a game dies from
@@ -1177,8 +1195,12 @@ class RobloxPlatformScout:
                     genre, creator_name, creator_type, creator_id, description, icon_url,
                     has_discord, discord_url, status, found_via,
                     has_social_links, contacts_checked_at, tier, prev_tier,
-                    tier_since, blowup_flag, blowup_at, first_seen, last_updated
-                ) VALUES ({placeholders}, CURRENT_TIMESTAMP)
+                    tier_since, blowup_flag, blowup_at, first_seen, hidden,
+                    last_updated
+                ) VALUES ({placeholders},
+                    CASE WHEN COALESCE(?, 0) >= ? AND COALESCE(?, 0) >= ?
+                         THEN 0 ELSE 1 END,
+                    CURRENT_TIMESTAMP)
                 ON CONFLICT(universe_id) DO UPDATE SET
                     root_place_id   = excluded.root_place_id,
                     title           = excluded.title,
@@ -1209,6 +1231,11 @@ class RobloxPlatformScout:
                     zero_ccu_strikes = CASE WHEN COALESCE(excluded.ccu, 0) = 0
                                             THEN COALESCE(game_analytics.zero_ccu_strikes, 0) + 1
                                             ELSE 0 END,
+                    hidden = CASE
+                        WHEN COALESCE(excluded.visits, 0) >= ? AND COALESCE(excluded.ccu, 0) >= ?
+                        THEN 0
+                        ELSE 1
+                    END,
                     last_updated    = CURRENT_TIMESTAMP
                 """,
                 (
@@ -1237,6 +1264,17 @@ class RobloxPlatformScout:
                     record.get("blowup_flag", 0),
                     record.get("blowup_at"),
                     record.get("first_seen"),
+                    # hidden for a BRAND-NEW row: the same gate evaluated on
+                    # the inserting values, so below-gate games never enter
+                    # the visible catalog in the first place.
+                    record.get("visits"),
+                    int(HIDDEN_GATE_VISITS),
+                    record.get("ccu"),
+                    int(HIDDEN_GATE_CCU),
+                    # hidden re-eval for a CONFLICTING row: upsert-time gate
+                    # on the incoming (excluded) stats.
+                    int(HIDDEN_GATE_VISITS),
+                    int(HIDDEN_GATE_CCU),
                 ),
             )
             if record.get("ccu") is not None and record_ccu_history:
@@ -1376,6 +1414,13 @@ class RobloxPlatformScout:
         limit = max(0, int(limit)) if limit is not None else None
         where = ["COALESCE(visits, 0) >= ?", "COALESCE(ccu, 0) >= ?"]
         params: List[int] = [min_visits, min_ccu]
+        # Beyond-gate hidden section: when the user filters at ANY real
+        # threshold (the normal scouting state), below-gate games stay out —
+        # that's the whole "hidden until it recovers" policy. Only a full
+        # zero-filter browse (Show everything) surfaces them, so the data
+        # remains inspectable without pretending the game is a live target.
+        if min_visits > 0 or min_ccu > 0:
+            where.append("COALESCE(hidden, 0) = 0")
         if discord is True:
             where.append("COALESCE(has_discord, 0) = 1")
         elif discord is False:
@@ -1848,6 +1893,10 @@ class RobloxPlatformScout:
                 # T1–T4 go stale on wall-clock hours, not sync counts, so the
                 # scheduler stays correct whether hydration runs every 5
                 # minutes or every 30. Most-stale game hydrates first.
+                # Hidden games (beyond-gate section) are EXCLUDED from every
+                # group: they keep their catalog row but cost zero budget.
+                HIDE = """ AND COALESCE(hidden, 0) = 0 """
+
                 def _stale(hours: float) -> str:
                     return time.strftime(
                         "%Y-%m-%d %H:%M:%S",
@@ -1855,18 +1904,21 @@ class RobloxPlatformScout:
                     )
 
                 groups["t1_t2"] = ids_for(
-                    "tier = 1 AND COALESCE(last_updated, '1970-01-01') <= ?",
+                    "tier = 1" + HIDE
+                    + " AND COALESCE(last_updated, '1970-01-01') <= ?",
                     (_stale(TIER_CADENCE_WALL_HOURS[1]),),
                     "last_updated ASC, universe_id ASC",
                 )
                 groups["t2"] = ids_for(
-                    "tier = 2 AND COALESCE(last_updated, '1970-01-01') <= ?",
+                    "tier = 2" + HIDE
+                    + " AND COALESCE(last_updated, '1970-01-01') <= ?",
                     (_stale(TIER_CADENCE_WALL_HOURS[2]),),
                     "last_updated ASC, universe_id ASC",
                 )
                 for key, tier in (("t3", 3), ("t4", 4)):
                     groups[key] = ids_for(
-                        f"tier = {tier} AND COALESCE(last_updated, '1970-01-01') <= ?",
+                        f"tier = {tier}" + HIDE
+                        + " AND COALESCE(last_updated, '1970-01-01') <= ?",
                         (_stale(TIER_CADENCE_WALL_HOURS[tier]),),
                         "last_updated ASC, universe_id ASC",
                     )
@@ -1875,7 +1927,8 @@ class RobloxPlatformScout:
                     time.gmtime(time.time() - WEEKLY_TIER_REFRESH_DAYS * 86400),
                 )
                 groups["weekly"] = ids_for(
-                    "tier IN (5, 6, 7) AND COALESCE(last_updated, '1970-01-01') < ?",
+                    "tier IN (5, 6, 7)" + HIDE
+                    + " AND COALESCE(last_updated, '1970-01-01') < ?",
                     (weekly_cutoff,),
                     "last_updated ASC, universe_id ASC",
                 )
@@ -1886,7 +1939,7 @@ class RobloxPlatformScout:
                 epoch_days = int(time.time() // 86400)
                 bucket = epoch_days // bucket_count % bucket_count
                 groups["t8"] = ids_for(
-                    "COALESCE(tier, 0)=0 AND (universe_id % ?) = ?",
+                    "COALESCE(tier, 0)=0" + HIDE + " AND (universe_id % ?) = ?",
                     (bucket_count, bucket),
                     "last_updated ASC, universe_id ASC",
                 )
@@ -3039,8 +3092,11 @@ class RobloxPlatformScout:
     def _qualified_only(self, metas: Dict[int, Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
         """Strict gate: keep ONLY games meeting the 20k-visits / 25-CCU target.
 
-        Everything else must never reach game_analytics (the agreed catalog
-        policy — no graveyard rows); the queue records the discard instead.
+        Everything else is NOT QUALIFIED for the visible catalog. Since the
+        2026-10-09 hidden-section policy, the drain still lands below-gate
+        rows in game_analytics — as hidden rows (found_via='expansion_hidden')
+        that cost zero hydration budget — so their paid-for verified data is
+        retained and recovery is detectable without a fresh Atlas discovery.
         """
         return {
             uid: meta
@@ -3216,11 +3272,42 @@ class RobloxPlatformScout:
             # Revived decayers/dead giants among the new qualifiers get their
             # archived Discord verdict restored for free (revival memory).
             self._revive_archived_contacts(list(qualified))
+        # Below-gate candidates (2026-10-09 hidden-section policy): a game
+        # that fails the strict gate still cost real Roblox metric calls.
+        # Discarding it throws that data away and guarantees Atlas rediscovery
+        # pays for it AGAIN next harvest (15,657 rows already went through
+        # this loop historically). Instead the row lands in the catalog AS
+        # HIDDEN: it keeps its verified stats, disappears from filtered
+        # dashboard views, costs ZERO hydration budget while it stays below
+        # the gate (the hidden CASE in upsert_game re-evaluates every touch),
+        # and un-hides automatically the moment a future re-check shows it
+        # recovered. Above-gate or not, the row pays its way once.
+        below_gate = {
+            uid: meta for uid, meta in all_metas.items()
+            if uid not in qualified and int(meta.get("visits") or 0) >= 0
+        }
+        for uid, meta in below_gate.items():
+            if meta.get("visits") is None or meta.get("ccu") is None:
+                continue  # placeholder stubs carry no data; nothing to keep
+            self.upsert_game({
+                "universe_id": int(uid),
+                "root_place_id": meta.get("root_place_id"),
+                "title": meta.get("title"),
+                "ccu": meta.get("ccu"),
+                "peak_ccu": meta.get("ccu"),
+                "visits": meta.get("visits"),
+                "favorites": meta.get("favorites"),
+                "genre": meta.get("genre"),
+                "creator_name": meta.get("creator_name"),
+                "creator_type": meta.get("creator_type"),
+                "creator_id": meta.get("creator_id"),
+                "description": meta.get("description"),
+                "found_via": "expansion_hidden",
+            })
+            self._mark_discovery_outcome(int(uid), "below_gate_hidden")
         for uid in to_check:
-            if uid not in qualified:
-                self._mark_discovery_outcome(
-                    uid, "below_gate" if uid in all_metas else "metrics_failed"
-                )
+            if uid not in qualified and uid not in below_gate:
+                self._mark_discovery_outcome(uid, "metrics_failed")
         if qualified:
             # Thumbnails for the new qualifiers: the drain used to store rows
             # without icons, so every Atlas-discovered game rendered the
