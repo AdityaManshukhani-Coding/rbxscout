@@ -31,7 +31,7 @@ Every claim below was verified by direct probe on **2026-10-07/08** from the loc
 
 ### 2.1 Roblox API (games.roblox.com) — the existing primary
 
-- Endpoints already in use: `/v1/games` (50 IDs/batch), `/games/votes`, tier rotation `TIER_CADENCE_WALL_HOURS` (scout_core.py ~L402): T1=1h, T2=2h, T3=4h, T4=6h, weekly 7d for T5–T6, ~2d rotation for cold/T8.
+- Endpoints already in use: `/v1/games` (50 IDs/batch), `/games/votes`, tier rotation `TIER_CADENCE_WALL_HOURS` (scout_core.py ~L402): T1=0.5h, T2=1h, T3=2h, T4=3h (tightened 2026-10-09 — post-hidden demand ≈ 42 games/tick vs the 7,500/tick budget), weekly 3d for T5–T7, ~2d rotation for cold/T8.
 - **Measured wall** (live evidence 2026-09-03, comment in scout_core.py; reproduced by run logs): ~11 metric batches each window → hard 429s, **no Retry-After**. Hydrator adapts with a token-bucket pacer (`BATCH_EMIT_INTERVAL=0.2`, stretch-to-6s on 429).
 - **Per-run reality** (hydrator run #7789 log, 2026-10-08): 542 games due → 412 hydrated + 130 prufer offloads; 9/9 metric batches; budget line "0 new + 542 known-due → 412 hydrated" (some due games rolled).
 - **Serialization**: workflow `concurrency: rbxscout-sync, queue: max` with the expander — one run at a time, ~4.2 min execution (setup 2.6 min + hydrate 3.4 min overlapped + release push 15 s). 5-min dispatch interval is thinner than actual runtime, so dispatches queue; the cloudflare worker dispatches precisely, GitHub backstop schedule (off-peak `4-59/5`) covers worker loss.
@@ -194,6 +194,15 @@ Phased so each step ships value alone. All phases are additive; the Roblox hydra
   - `fields=playing,like_ratio,earning_rank`; window = yesterday→today (the ≤90-day cap only constrains *backfill*, not daily sweeps).
   - Insert with `source='rotrends_daily'`, `ts = process_date`.
 - **Escalation from the daily signal (stale-stats repair, 2026-10-09):** the sweep carries each cold game's fresh daily CCU at zero extra request cost, but the original contract (history + enrichment only) left fast-growing T5–T7 games stuck under a weeks-old tier stamp with days-old rendered stats — the ring-fenced Roblox budget reaches the weekly bucket only as leftover. Fix: `upsert_rotrends_snapshot` ESCALATES a stale row on two triggers — (a) tier climb: `classify_tier(stored_visits, daily_ccu)` classifies higher than the stored stamp (`tier`/`prev_tier`/`tier_since` re-stamped, blowup rules identical to `_tier_stamp_for`) — measured 123 games on the cloud store; (b) in-tier multiplication: stored CCU ≥ 10 with the daily ≥ 3× it and ≥ 250 (T5-scale floor) — measured 560 more games, mostly the T7 tail a climb-only trigger would never touch. Escalated IDs go into the sweep summary (`tier_bumps` / `bumped_ids`) and the sweep immediately hot-refreshes up to 100 of them per pass through Roblox batched metrics (`hot_refresh_batch`), restoring canonical `ccu`/`visits` the same run instead of waiting for the hot scheduler. Rotrends still never writes `game_analytics.ccu/visits` itself, never DEMOTES (a daily pool dip can be a snapshot quirk; demotion before Roblox confirms would wrongly silence hot games), and never re-stamps the tier on an in-tier escalation — the tier stamp stays Roblox's, escalation only schedules the refresh.
+
+- **Hidden-recovery watch (2026-10-09 cadence audit):** hidden (below-gate) rows are excluded from every
+  scheduler group, so before this watch a quiet recovery — a wobbly game steadying at 40 CCU, no tier climb,
+  below the 250 multiplication floor — was undetectable forever (the only other unhide path, Atlas
+  re-enqueue, has been 403-blocked from runners since Oct 8). The sweep already touches hidden rows (they
+  are T5–T7 rows with ccu_history staleness); now `_restamp_tier_from_daily` escalates a hidden row as soon
+  as its freshest daily CCU crosses `HIDDEN_RECOVERY_MIN_CCU` (= the 25 gate floor) — `hot_refresh_batch`
+  live-refreshes it, `upsert_game` re-evaluates the merged gate, and the row unhides itself within ~1 day of
+  a real recovery, at near-zero marginal cost.
 - Backfill pass (same module, second callable): for any game lacking ≥5 history rows, fetch up to 90 days and insert backdated rows. Run for newly discovered games inside the expander's landing path (`_enqueue_discovery`/expander success path), and for the 8,930 currently shallow games (≤5 samples) in a slow catch-up.
 - Orchestration: extend `expander.yml` (already shares the `rbxscout-sync` mutex) with a step gated at `:45` runs, or a new workflow file dispatched by the Cloudflare worker once daily (`wrangler.toml` cron variants). Daily, not per-5-min.
 - Add `schema_patch` for `ccu_history.source` (default `'roblox_live'` for existing rows; new index) consistent with how past schema versions were migrated in `_init_sqlite`.

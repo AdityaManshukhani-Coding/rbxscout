@@ -980,6 +980,64 @@ def test_rotrends_snapshot_escalates_in_tier_3x_gap_without_climb(tmp_path):
     assert out["tier_bumps"] == 0  # 950 < 3 * 900
 
 
+def test_hidden_recovery_watch_escalates_quiet_gate_crossing(tmp_path):
+    """Hidden-recovery watch (2026-10-09 cadence audit): a hidden row's quiet
+    recovery — no tier climb, daily CCU below the 250 multiplication floor —
+    must still escalate. Without this watch a hidden game steadying at 40 CCU
+    stays buried forever (hidden rows are excluded from every scheduler
+    group; both other triggers need big jumps)."""
+    scout = RobloxPlatformScout(db_path=str(tmp_path / "hrv.db"))
+    # Below-gate row: stored ccu=3, visits below the 20k gate → hidden=1.
+    scout.upsert_game({"universe_id": 41, "title": "Wobbly", "ccu": 3, "visits": 500})
+    import sqlite3
+    with sqlite3.connect(scout.db_path) as conn:
+        assert conn.execute(
+            "SELECT hidden, tier FROM game_analytics WHERE universe_id=41"
+        ).fetchone()[0] == 1
+
+    # A daily value under the gate floor (25) never escalates.
+    out = scout.upsert_rotrends_snapshot({41: {"ts": "2026-10-09", "ccu": 10}})
+    assert out["tier_bumps"] == 0
+
+    # A quiet crossing — 40 CCU, below the 250 floor, no tier climb — MUST.
+    out = scout.upsert_rotrends_snapshot({41: {"ts": "2026-10-09", "ccu": 40}})
+    assert out["tier_bumps"] == 1
+    assert 41 in out["bumped_ids"]
+
+
+def test_hidden_recovery_end_to_end_hot_refresh_unhides(tmp_path, monkeypatch):
+    """The watch's full loop: sweep escalates a hidden row crossing the gate,
+    hot_refresh_batch live-refreshes it via Roblox, and upsert_game's merged
+    gate re-evaluation unhides the row when the live numbers confirm."""
+    scout = RobloxPlatformScout(db_path=str(tmp_path / "hre.db"))
+    scout.upsert_game({"universe_id": 42, "title": "Recoverer", "ccu": 2, "visits": 900})
+    out = scout.upsert_rotrends_snapshot({42: {"ts": "2026-10-09", "ccu": 30}})
+    assert out["tier_bumps"] == 1
+
+    # Roblox confirms: live metrics show the game back above the gate.
+    monkeypatch.setattr(
+        scout, "fetch_game_metrics",
+        lambda ids: {
+            42: {"universe_id": 42, "title": "Recoverer", "ccu": 33,
+                 "visits": 30_000, "genre": "Adventure"},
+        },
+    )
+    assert scout.hot_refresh_batch([42]) == 1
+    row = scout.load_table().set_index("universe_id").loc[42]
+    assert int(row["hidden"]) == 0            # merged gate unhid it
+    assert int(row["ccu"]) == 33              # canonical stats restored
+
+    # And once unhidden, the row re-enters the normal tier scheduler.
+    schedule = scout.load_tier_refresh_ids(batch_size=50, budget_batches=10)
+    # classified from live visits=30k/ccu=33 → visits axis T*, whatever tier;
+    # what matters: it's no longer invisible to every scheduler group.
+    with sqlite3.connect(scout.db_path) as conn:
+        t = conn.execute(
+            "SELECT tier FROM game_analytics WHERE universe_id=42"
+        ).fetchone()[0]
+    assert t in (1, 2, 3)  # 30k visits / 33 ccu → warm tier, schedulable
+
+
 def test_hot_refresh_batch_restores_canonical_stats_after_bump(tmp_path, monkeypatch):
     """The stale-stats repair's end-to-end: sweep bumps the tier from the
     daily signal, hot_refresh_batch immediately re-fetches from Roblox, and
@@ -1155,10 +1213,10 @@ def test_scheduler_picks_tiers_by_cadence_and_orders_first_in_line(tmp_path):
 
     with sqlite3.connect(db) as conn:
         for uid, tier, hours_ago in [
-            (1, 1, 2.0),        # T1 stale past 1h -> due
-            (2, 2, 1.5),        # T2 stale under 2h -> NOT due yet
-            (3, 3, 3.0),        # T3 stale under 4h -> NOT due yet
-            (4, 4, 7.0),        # T4 stale past 6h -> due
+            (1, 1, 2.0),        # T1 stale past 0.5h -> due
+            (2, 2, 1.5),        # T2 stale past 1h -> due (tightened cadence)
+            (3, 3, 1.5),        # T3 stale under 2h -> NOT due yet
+            (4, 4, 3.5),        # T4 stale past 3h -> due
             (5, 5, 2.0),        # T5–T7: weekly cutoff governs, fresh -> not due
             (6, 6, 2.0),
             (7, 7, 2.0),
@@ -1172,8 +1230,8 @@ def test_scheduler_picks_tiers_by_cadence_and_orders_first_in_line(tmp_path):
             )
 
     due = set(scout.load_tier_refresh_ids(batch_size=50, budget_batches=10)["ids"])
-    assert {1, 4, t8_in}.issubset(due)      # stale T1 + T4 + the T8 slice
-    assert 2 not in due and 3 not in due    # under their staleness line yet
+    assert {1, 2, 4, t8_in}.issubset(due)   # stale T1 + T2 + T4 + the T8 slice
+    assert 3 not in due                     # under its 2h staleness line yet
     assert 5 not in due and 6 not in due and 7 not in due
     assert t8_out not in due                # outside this rotation bucket
 
@@ -1189,11 +1247,12 @@ def test_scheduler_picks_tiers_by_cadence_and_orders_first_in_line(tmp_path):
 
 
 def test_scheduler_weekly_bucket_and_t8_rotation(tmp_path):
-    """T5–T7 rehydrate only after the 7-day wall-clock cutoff; tier-0 rows
-    rotate through the T8 slice by universe_id mod bucket count."""
+    """T5–T7 rehydrate only after the 3-day wall-clock cutoff (tightened
+    from 7d, 2026-10-09); tier-0 rows rotate through the T8 slice by
+    universe_id mod bucket count."""
     db = str(tmp_path / "t.db")
     scout = RobloxPlatformScout(db_path=db)
-    stale = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 8 * 86400))
+    stale = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 4 * 86400))
     fresh = time.strftime("%Y-%m-%d %H:%M:%S")
     with sqlite3.connect(db) as conn:
         conn.execute(

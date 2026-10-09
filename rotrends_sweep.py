@@ -284,6 +284,12 @@ def select_due_universe_ids(
     Staleness is read from ccu_history (ANY source — a rotrends_daily row
     from today already satisfies the daily promise). T0–T4 are excluded:
     their cadence is measured in HOURS and belongs to the live channels.
+
+    Hidden (below-gate) rows are deliberately NOT excluded: the sweep is
+    their only cheap observation channel, and hidden-recovery watch lives
+    in the sweep's store path (_restamp_tier_from_daily) — a hidden row
+    whose daily CCU crosses the gate escalates straight into a live
+    Roblox re-check and unhides itself.
     """
     cutoff = time.strftime(
         "%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - max_hours * 3600)

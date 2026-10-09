@@ -400,10 +400,14 @@ TIER_CADENCE_SYNC: Dict[int, Optional[int]] = {
 # 5-minute hydrator can subdivide. Semantics: a tier's games enter the refresh
 # queue when last_updated is older than the tier's hours (most-stale first).
 TIER_CADENCE_WALL_HOURS: Dict[int, float] = {
-    1: 1.0,   # hot watchlist: refreshed within the hour
-    2: 2.0,
-    3: 4.0,
-    4: 6.0,
+    # Tightened 2026-10-09 (cadence-utilization audit): the hidden section
+    # freed ~90% of the demand pool, so steady-state hydration even at these
+    # faster cadences stays ~42 games/tick — under 1% of the 7,500/tick
+    # budget and a fraction of the per-IP 429 headroom (~1 req/s sustained).
+    1: 0.5,   # hot watchlist: refreshed within the half hour
+    2: 1.0,
+    3: 2.0,
+    4: 3.0,
 }
 # Beyond-gate hidden section (2026-10-09): a catalog game that fell below the
 # strict gate keeps its row (it paid for qualification — re-checking it every
@@ -412,11 +416,32 @@ TIER_CADENCE_WALL_HOURS: Dict[int, float] = {
 # or overflow update shows it back above the gate.
 HIDDEN_GATE_VISITS = EXPANSION_TARGET_VISITS
 HIDDEN_GATE_CCU = EXPANSION_TARGET_CCU
-WEEKLY_TIER_REFRESH_DAYS = 7
+# Weekly tier refresh (T5–T7) wall-clock promise. Tightened 7d → 3d
+# (2026-10-09 cadence audit): with the hidden section excluding ~12.5K
+# below-gate rows, the above-gate weekly population (11.4K) drains at
+# ~3,807 refills/day ≈ 13/tick — trivially schedulable, and a scout sees
+# a week-old number at most 3 days after a game's last live touch instead
+# of 7. The rotrends daily sweep keeps them fresh anyway (20h staleness
+# target), so this is the cold path's worst case, not its norm.
+WEEKLY_TIER_REFRESH_DAYS = 3
 TIER8_ROTATION_DAYS = 2  # cold games all revisited within ~2 days
 TIER8_STALE_PRUNE_DAYS = 14  # unobserved 0-CCU fallback prune age
 ZERO_CCU_STRIKES_TO_PRUNE = 4  # consecutive observed 0-CCU visits = dead (~8d under 2d rotation)
 NEW_TIER = 0  # never-hydrated (no stats yet); always first in line
+
+# Hidden-recovery watch (2026-10-09, cadence audit): a hidden (below-gate) row
+# is excluded from every scheduler tier group, so without this watch a quiet
+# recovery — the common kind, e.g. a wobbly 3-CCU game steadying at 40 CCU —
+# is undetectable forever: no trigger of _restamp_tier_from_daily fires and
+# the only other unhide path (Atlas re-enqueue → queue drain) has been
+# 403-blocked since Oct 8. The rotrends daily sweep already fetches these
+# rows (select_due_universe_ids NEVER excluded hidden) — it just had no spec
+# for what to DO with a quiet crossing. Now it does: HIDDEN_RECOVERY_MIN_CCU
+# is the live-gate floor; a hidden row whose freshest daily CCU meets it is
+# escalated into hot_refresh_batch (≤100/row cap, same as tier bumps),
+# upsert_game re-evaluates the merged
+# gate, and the row unhides itself — at near-zero marginal cost.
+HIDDEN_RECOVERY_MIN_CCU = EXPANSION_TARGET_CCU  # 25: the live gate's CCU floor
 
 
 def _visits_axis_tier(visits: Optional[int]) -> int:
@@ -2107,9 +2132,10 @@ class RobloxPlatformScout:
         - dispatched: universe IDs with NO catalog row — the queue drain
           owns catalog insertion, so the sweep hands cold unknowns back to
           discovery instead of self-inserting (strict-gate policy intact).
-        Also returned: tier_bumps / bumped_ids — cold games whose tier
-        re-stamped UP from the daily CCU signal (see _restamp_tier_from_daily);
-        the sweep spends a slice of Roblox budget refreshing exactly these.
+        Also returned: tier_bumps / bumped_ids — cold games escalated by the
+        daily CCU signal (see _restamp_tier_from_daily): tier climbs, in-tier
+        3× multiplications, and hidden rows crossing the recovery gate; the
+        sweep spends a slice of Roblox budget refreshing exactly these.
         """
         if not rows:
             return {"history_rows": 0, "enriched": 0, "dispatched": 0,
@@ -2224,19 +2250,43 @@ class RobloxPlatformScout:
         trigger only ESCALATES. blowup_flag follows the same rules as
         _tier_stamp_for — a 2+ tier climb or a 3× CCU jump (floored at 10).
 
+        Hidden-recovery watch (2026-10-09): a HIDDEN row escalates the
+        moment its daily CCU meets HIDDEN_RECOVERY_MIN_CCU (25) — no
+        climb/multiplication required. Hidden rows are excluded from every
+        scheduler group, so the daily sample is their only cheap observation:
+        without this watch a quiet recovery (a wobbly game steadying at
+        40 CCU — no tier climb, the multiplication trigger floors at 250)
+        stays buried forever. The escalation routes the row into
+        hot_refresh_batch; Roblox restores canonical stats, upsert_game
+        re-evaluates the merged gate, and the row unhides itself.
+
         Returns True when the row was escalated. Never raises.
         """
         try:
             row = c.execute(
-                "SELECT COALESCE(tier, 0), visits, COALESCE(ccu, 0) "
-                "FROM game_analytics WHERE universe_id = ?",
+                "SELECT COALESCE(tier, 0), visits, COALESCE(ccu, 0), "
+                "COALESCE(hidden, 0) FROM game_analytics WHERE universe_id = ?",
                 (int(universe_id),),
             ).fetchone()
             if not row:
                 return False  # unknown ID: the queue drain owns insertion
-            old_tier, visits, old_ccu = int(row[0] or 0), row[1], int(row[2] or 0)
+            old_tier, visits, old_ccu, hidden = (
+                int(row[0] or 0), row[1], int(row[2] or 0), int(row[3] or 0)
+            )
             if daily_ccu <= 0:
                 return False
+            # Hidden-recovery watch FIRST: a hidden row crossing the live
+            # gate is news no matter how its stored tier/stats look (the
+            # stored values are exactly the stale reason it got hidden).
+            if hidden:
+                if daily_ccu < HIDDEN_RECOVERY_MIN_CCU:
+                    return False
+                log.info(
+                    "hidden-recovery watch: U%s daily ccu %s crosses the "
+                    "gate (stored ccu %s) — escalating for live re-check",
+                    universe_id, daily_ccu, old_ccu,
+                )
+                return True
             new_tier = classify_tier(visits, daily_ccu)
             climbed = new_tier > old_tier
             multiplied = old_ccu >= 10 and daily_ccu >= 3 * old_ccu and daily_ccu >= 250
