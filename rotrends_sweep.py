@@ -540,24 +540,34 @@ def sweep_tiers(
     result["enriched"] = _sweep_store_totals.get("enriched", 0)
     result["dispatched"] = _sweep_store_totals.get("dispatched", 0)
     result["tier_bumps"] = _sweep_store_totals.get("tier_bumps", 0)
+    bumped_ids = _sweep_store_totals.get("bumped_ids", [])
+    result["bumped_ids"] = bumped_ids
     report(1.0, "Rotrends sweep done: "
                 f"{result['ok']:,}/{result['due']:,} games · "
                 f"{result['history_rows']:,} history rows · "
-                f"{result['tier_bumps']:,} tier bumps → hot scheduler")
+                f"{result['tier_bumps']:,} tier bumps → hot refresh"
+                + (f" ({', '.join(str(u) for u in bumped_ids[:10])}"
+                   f"{'…' if len(bumped_ids) > 10 else ''})" if bumped_ids else ""))
     return result
 
 
-def _note_store_totals(totals: Dict[str, int]) -> None:
+def _note_store_totals(totals: Dict[str, Any]) -> None:
     global _sweep_store_totals
-    _sweep_store_totals = {
+    # bumped_ids ACCUMULATES (list concat) instead of summing ints — the
+    # summary prints which universes were escalated into hot refresh.
+    merged = {
         k: _sweep_store_totals.get(k, 0) + int(totals.get(k, 0))
         for k in ("history_rows", "enriched", "dispatched", "tier_bumps")
     }
+    merged["bumped_ids"] = (
+        _sweep_store_totals.get("bumped_ids", []) + list(totals.get("bumped_ids") or [])
+    )
+    _sweep_store_totals = merged
 
 
 # Module-level accumulator so batched storage totals flow into the sweep's
 # summary without threading a mutable dict through the executor.
-_sweep_store_totals: Dict[str, int] = {}
+_sweep_store_totals: Dict[str, Any] = {"bumped_ids": []}
 
 
 def backfill_shallow(
@@ -722,6 +732,24 @@ def main() -> int:
             f"{result['sweep'].get('tier_bumps', 0)} tier bumps · "
             f"({time.time() - started:.0f}s)"
         )
+        # Stale-stats repair (2026-10-09): a tier bump proves the STORED live
+        # stats are wrong by definition (the daily value classified higher).
+        # Don't make those games wait for the hot scheduler's next tick —
+        # refresh them right here with a few Roblox batches so ccu/visits
+        # recover this run (the tie-breaker contract says Roblox is the one
+        # who writes live stats; this step makes that confirmation immediate).
+        bumped = list((result["sweep"] or {}).get("bumped_ids") or [])
+        if bumped:
+            try:
+                refreshed = scout.hot_refresh_batch(bumped)
+                result["hot_refresh"] = refreshed
+            except Exception as exc:  # fail-open: the sweep already landed
+                log.warning("post-sweep hot refresh failed: %s", exc)
+            print(
+                f"hot refresh: {refreshed if bumped else 0} tier-bumped games re-hydrated live "
+                f"({', '.join(str(u) for u in bumped[:10])}"
+                f"{'…' if len(bumped) > 10 else ''})"
+            )
     if args.backfill or args.backfill_only:
         n = args.backfill or ROTRENDS_BACKFILL_MAX_GAMES
         result["backfill"] = backfill_shallow(scout, max_games=n)

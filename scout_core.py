@@ -2051,13 +2051,16 @@ class RobloxPlatformScout:
         - dispatched: universe IDs with NO catalog row — the queue drain
           owns catalog insertion, so the sweep hands cold unknowns back to
           discovery instead of self-inserting (strict-gate policy intact).
-        Also returned: tier_bumps — cold games whose tier re-stamped UP
-        from the daily CCU signal (see _restamp_tier_from_daily).
+        Also returned: tier_bumps / bumped_ids — cold games whose tier
+        re-stamped UP from the daily CCU signal (see _restamp_tier_from_daily);
+        the sweep spends a slice of Roblox budget refreshing exactly these.
         """
         if not rows:
-            return {"history_rows": 0, "enriched": 0, "dispatched": 0}
+            return {"history_rows": 0, "enriched": 0, "dispatched": 0,
+                    "tier_bumps": 0, "bumped_ids": []}
         log = logging.getLogger("rbxscout.rotrends")
-        out = {"history_rows": 0, "enriched": 0, "dispatched": 0, "tier_bumps": 0}
+        out = {"history_rows": 0, "enriched": 0, "dispatched": 0,
+               "tier_bumps": 0, "bumped_ids": []}
 
         def _write(c: sqlite3.Connection) -> None:
             for uid, snap in rows.items():
@@ -2122,6 +2125,7 @@ class RobloxPlatformScout:
                     # Roblox confirms would wrongly silence hot games.
                     if self._restamp_tier_from_daily(c, int(uid), int(ccu)):
                         out["tier_bumps"] = out.get("tier_bumps", 0) + 1
+                        out.setdefault("bumped_ids", []).append(int(uid))
                 except (TypeError, ValueError, sqlite3.Error) as exc:
                     log.debug("rotrends snapshot skipped %s: %s", uid, exc)
 
@@ -2221,6 +2225,51 @@ class RobloxPlatformScout:
         except (sqlite3.Error, TypeError, ValueError) as exc:
             log.debug("tier re-stamp skipped U%s: %s", universe_id, exc)
             return False
+
+    def hot_refresh_batch(self, universe_ids: List[int]) -> int:
+        """Immediately live-refresh a small list of games through Roblox.
+
+        Built for the rotrends sweep's tier bumps (2026-10-09): a bump proves
+        the STORED live stats misclassify the game, so waiting for the
+        scheduler risks days of rendered stale numbers. A handful of batched
+        metric calls (cap ~100 games = 2 requests) restores canonical
+        ccu/visits this run, via the catalog-grade upsert path so tier
+        bookkeeping re-stamps with Roblox as the tie-breaker.
+
+        Returns the number of games refreshed. Never raises (fail-open —
+        the sweep already landed its history rows before this ran).
+        """
+        ids = [int(u) for u in (universe_ids or [])][:100]  # 2 batched calls
+        if not ids:
+            return 0
+        try:
+            metrics = self.fetch_game_metrics(ids)
+            refreshed = 0
+            for meta in metrics.values():
+                try:
+                    self.upsert_game({
+                        "universe_id": int(meta["universe_id"]),
+                        "root_place_id": meta.get("root_place_id"),
+                        "title": meta.get("title"),
+                        "ccu": meta.get("ccu"),
+                        "peak_ccu": max(
+                            int(meta.get("ccu") or 0),
+                            int(meta.get("peak_ccu") or 0),
+                        ),
+                        "visits": meta.get("visits"),
+                        "favorites": meta.get("favorites"),
+                        "genre": meta.get("genre"),
+                        "creator_name": meta.get("creator_name"),
+                        "creator_type": meta.get("creator_type"),
+                        "creator_id": meta.get("creator_id"),
+                    })
+                    refreshed += 1
+                except (KeyError, TypeError, ValueError, sqlite3.Error) as exc:
+                    log.debug("hot refresh upsert skipped: %s", exc)
+            return refreshed
+        except Exception as exc:  # Roblox outage: the sweep must still succeed
+            log.warning("hot refresh batch failed (fail-open): %s", exc)
+            return 0
 
     def fetch_game_metrics(self, universe_ids: List[int]) -> Dict[int, Dict[str, Any]]:
         """Threaded batched metrics (50 universes per call — verified cap: 50→200, 100→400).

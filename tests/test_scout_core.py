@@ -834,15 +834,57 @@ def test_rotrends_snapshot_tier_bump_never_demotes_and_quiet_steps_stay_quiet(tm
     assert int(row["blowup_flag"]) == 0  # one step, 2.8x — below every trigger
 
 
+def test_hot_refresh_batch_restores_canonical_stats_after_bump(tmp_path, monkeypatch):
+    """The stale-stats repair's end-to-end: sweep bumps the tier from the
+    daily signal, hot_refresh_batch immediately re-fetches from Roblox, and
+    the upsert restores canonical ccu/visits (the tie-breaker contract).
+    Roblox outage → fail-open (0 refreshed, no raise)."""
+    scout = RobloxPlatformScout(db_path=str(tmp_path / "hr.db"))
+    scout.upsert_game({"universe_id": 21, "title": "Grower", "ccu": 496, "visits": 38_568})
+    out = scout.upsert_rotrends_snapshot(
+        {21: {"ts": "2026-10-09", "ccu": 1198}}
+    )
+    assert int(scout.load_table().set_index("universe_id").loc[21]["tier"]) == 7
+    assert out["tier_bumps"] == 1
+
+    def fake_metrics(ids):
+        return {
+            21: {"universe_id": 21, "title": "Grower", "ccu": 1467,
+                 "visits": 173_200, "favorites": 4200},
+        }
+
+    monkeypatch.setattr(scout, "fetch_game_metrics", fake_metrics)
+    assert scout.hot_refresh_batch([21]) == 1
+    row = scout.load_table().set_index("universe_id").loc[21]
+    assert int(row["ccu"]) == 1467        # canonical Roblox value restored
+    assert int(row["visits"]) == 173_200
+    assert int(row["tier"]) == 7          # Roblox confirms the daily signal
+
+
+    # Fail-open: a Roblox outage must not take the sweep down.
+    def broken_metrics(ids):
+        raise RuntimeError("429 storm")
+
+    monkeypatch.setattr(scout, "fetch_game_metrics", broken_metrics)
+    assert scout.hot_refresh_batch([21]) == 0
+    # An empty list is a no-op without touching Roblox at all.
+    assert scout.hot_refresh_batch([]) == 0
+
+
 def test_backfill_shallow_paths_pass_tier_bump_accumulator(tmp_path, monkeypatch):
     """_note_store_totals accumulates tier_bumps so the sweep summary and
     the CLI line surface them (Phase 5 sized the reporting contract)."""
     import rotrends_sweep
-    rotrends_sweep._note_store_totals({"history_rows": 3, "tier_bumps": 2})
-    rotrends_sweep._note_store_totals({"tier_bumps": 1})
+    rotrends_sweep._note_store_totals({"history_rows": 3, "tier_bumps": 2,
+                                       "bumped_ids": [11, 12]})
+    rotrends_sweep._note_store_totals({"tier_bumps": 1, "bumped_ids": [13]})
     totals = rotrends_sweep._sweep_store_totals
-    assert totals == {"history_rows": 3, "tier_bumps": 3,
-                      "enriched": 0, "dispatched": 0}
+    assert totals["history_rows"] == 3
+    assert totals["tier_bumps"] == 3
+    assert totals["enriched"] == 0
+    assert totals["dispatched"] == 0
+    # bumped_ids concatenates: the summary prints which games were escalated.
+    assert totals["bumped_ids"] == [11, 12, 13]
 
 
 def test_blowup_flag_is_sticky_and_watchlist_reads_db(tmp_path):
