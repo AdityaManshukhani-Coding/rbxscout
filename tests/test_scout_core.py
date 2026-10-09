@@ -774,6 +774,39 @@ def test_blowup_flag_on_ccu_multiplication_even_without_tier_jump(tmp_path):
     assert int(scout.load_table().set_index("universe_id").loc[3]["blowup_flag"]) == 0
 
 
+def test_hidden_gate_uses_merged_state_not_partial_upsert(tmp_path):
+    """The hidden flag must evaluate the FINAL merged row state, not just the
+    incoming record: a partial refresh (ccu-only, visits=None — the shape the
+    CE overflow and several upsert paths emit) must NOT hide a row whose
+    STORED visits pass the gate. Caught in the 2026-10-09 completion check."""
+    scout = RobloxPlatformScout(db_path=str(tmp_path / "hg.db"))
+    import sqlite3
+    scout.upsert_game({"universe_id": 22, "ccu": 40, "visits": 30_000})
+    with sqlite3.connect(scout.db_path) as conn:
+        assert conn.execute(
+            "SELECT hidden FROM game_analytics WHERE universe_id=22"
+        ).fetchone()[0] == 0
+    # ccu-only touch (visits=None): visits falls back to the stored value.
+    scout.upsert_game({"universe_id": 22, "ccu": 50})
+    with sqlite3.connect(scout.db_path) as conn:
+        # visits=30,000 AND ccu=50 both pass -> still visible.
+        assert conn.execute(
+            "SELECT ccu, visits, hidden FROM game_analytics WHERE universe_id=22"
+        ).fetchone() == (50, 30000, 0)
+    # A full below-gate observation hides it again...
+    scout.upsert_game({"universe_id": 22, "ccu": 10, "visits": 30_000})
+    with sqlite3.connect(scout.db_path) as conn:
+        assert conn.execute(
+            "SELECT hidden FROM game_analytics WHERE universe_id=22"
+        ).fetchone()[0] == 1
+    # ...and recovery unhides.
+    scout.upsert_game({"universe_id": 22, "ccu": 60, "visits": 30_000})
+    with sqlite3.connect(scout.db_path) as conn:
+        assert conn.execute(
+            "SELECT hidden FROM game_analytics WHERE universe_id=22"
+        ).fetchone()[0] == 0
+
+
 def test_rotrends_snapshot_restamps_tier_up_for_stale_cold_game(tmp_path):
     """The stale-stats repair (2026-10-09): the sweep sees the daily CCU of a
     T5/T6 weekly game blow up, but by contract never writes ccu/visits —

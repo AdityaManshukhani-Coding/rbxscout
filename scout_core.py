@@ -1232,7 +1232,8 @@ class RobloxPlatformScout:
                                             THEN COALESCE(game_analytics.zero_ccu_strikes, 0) + 1
                                             ELSE 0 END,
                     hidden = CASE
-                        WHEN COALESCE(excluded.visits, 0) >= ? AND COALESCE(excluded.ccu, 0) >= ?
+                        WHEN COALESCE(excluded.visits, game_analytics.visits, 0) >= ?
+                             AND COALESCE(excluded.ccu, game_analytics.ccu, 0) >= ?
                         THEN 0
                         ELSE 1
                     END,
@@ -1272,7 +1273,9 @@ class RobloxPlatformScout:
                     record.get("ccu"),
                     int(HIDDEN_GATE_CCU),
                     # hidden re-eval for a CONFLICTING row: upsert-time gate
-                    # on the incoming (excluded) stats.
+                    # on the MERGED final state — an incoming None falls back
+                    # to the stored column so a ccu-only touch can never
+                    # wrongly hide a row whose stored visits pass the gate.
                     int(HIDDEN_GATE_VISITS),
                     int(HIDDEN_GATE_CCU),
                 ),
