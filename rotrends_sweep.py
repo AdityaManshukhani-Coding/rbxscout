@@ -567,6 +567,8 @@ def _note_store_totals(totals: Dict[str, Any]) -> None:
 
 # Module-level accumulator so batched storage totals flow into the sweep's
 # summary without threading a mutable dict through the executor.
+# bumped_ids holds a LIST (concatenated by _note_store_totals) of universes
+# escalated into hot refresh; every other key is an int counter.
 _sweep_store_totals: Dict[str, Any] = {"bumped_ids": []}
 
 
@@ -744,6 +746,7 @@ def main() -> int:
                 refreshed = scout.hot_refresh_batch(bumped)
                 result["hot_refresh"] = refreshed
             except Exception as exc:  # fail-open: the sweep already landed
+                refreshed = 0
                 log.warning("post-sweep hot refresh failed: %s", exc)
             print(
                 f"hot refresh: {refreshed if bumped else 0} tier-bumped games re-hydrated live "
