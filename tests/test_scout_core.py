@@ -834,6 +834,93 @@ def test_rotrends_snapshot_tier_bump_never_demotes_and_quiet_steps_stay_quiet(tm
     assert int(row["blowup_flag"]) == 0  # one step, 2.8x — below every trigger
 
 
+def test_stuck_hidden_row_gets_ce_rescue_not_just_hot_tiers(tmp_path, monkeypatch):
+    """Hidden-game rescue (2026-10-09 deep dive): content-restricted universes
+    return an ID-less '[TITLE UNAVAILABLE]' stub from the batch API — the
+    parser drops them, last_updated freezes, and the row sits first in every
+    most-stale-first queue, re-consuming real Roblox budget every sync since
+    Sept 3 while other games roll. The overflow pass must extend CE rescue to
+    such stuck rows, not hot tiers alone."""
+    scout = RobloxPlatformScout(db_path=str(tmp_path / "hidden.db"))
+    import sqlite3
+    with sqlite3.connect(scout.db_path) as conn:
+        conn.execute(
+            "INSERT INTO game_analytics (universe_id, title, ccu, visits, tier, "
+            "last_updated, found_via) VALUES (?, 'Hidden Giant', 2042, 18185603, "
+            "7, '2026-09-03 17:41:05', 'atlas_dev')",
+            (10408282469,),
+        )
+        # A hot-tier row that Roblox missed too.
+        conn.execute(
+            "INSERT INTO game_analytics (universe_id, title, ccu, visits, tier, "
+            "last_updated, found_via) VALUES (?, 'Hot Miss', 300, 40000, "
+            "2, '2026-10-09 16:00:00', 'atlas_dev')",
+            (99900000001,),
+        )
+    assert scout._is_stuck_row(10408282469) is True
+    assert scout._is_stuck_row(99900000001) is False  # 21-day window not met
+
+    # scan(): overflow selection = hot misses + stuck rows. Mock plumbing.
+    calls = {}
+    import cx_client
+
+    def fake_fetch(ids):
+        calls["ids"] = list(ids)
+        return {u: {"ccu": 5, "visits": 1, "fetched_at": "2026-10-09 17:00:00"} for u in ids}
+
+    monkeypatch.setattr(cx_client, "fetch_universes", fake_fetch)
+    monkeypatch.setattr(
+        scout, "load_tier_refresh_ids",
+        lambda **kw: {"ids": [10408282469, 99900000001], "groups": {"weekly": 2},
+                      "tier_counts": {}, "ring_fenced": False},
+    )
+    monkeypatch.setattr(scout, "fetch_game_metrics", lambda ids: {})  # BOTH missed
+    scout.scan(min_visits=1, min_ccu=1, deep_contacts=False,
+               phases=["hydrate"])
+    assert set(calls["ids"]) == {10408282469, 99900000001}
+
+
+def test_ce_burst_cooldown_and_miss_retry(tmp_path, monkeypatch):
+    """CE soft-throttle defense: after CX_BURST_LIMIT requests the pacer
+    rests CX_BURST_COOLDOWN once, and a payloadless page gets ONE retry
+    before counting toward the circuit."""
+    import cx_client
+    sleeps = []
+    monkeypatch.setattr(cx_client.time, "sleep", lambda s: sleeps.append(s))
+    c = cx_client.CxClient(rps=1000.0)  # no pacing wait; burst logic still fires
+    for _ in range(cx_client.CX_BURST_LIMIT):
+        c._emit_pace()
+    assert any(abs(s - cx_client.CX_BURST_COOLDOWN) < 1e-9 for s in sleeps), sleeps
+
+    # Miss → retry path: serve a payloadless 200 (the soft-throttle signature).
+    class FakeResp:
+        status_code = 200
+        text = "<html>no marker here</html>"
+
+    class FakeSession:
+        def __init__(self, responses):
+            self.responses = responses
+            self.i = 0
+            self.headers = {}
+        def get(self, url, timeout=None, allow_redirects=True):
+            r = self.responses[min(self.i, len(self.responses) - 1)]
+            self.i += 1
+            return r
+
+    monkeypatch.setattr(cx_client.time, "sleep", lambda s: None)
+    c2 = cx_client.CxClient()
+    c2.session = FakeSession([FakeResp(), FakeResp()])  # miss then hit-200-but-still-missing
+    assert c2.fetch_universe(42) is None
+
+    class GoodResp(FakeResp):
+        text = 'x self.__next_f.push(...initialGameData\\":{\\"ok\\":true,"game":{"playing":7,"visits":9}})'
+
+    c3 = cx_client.CxClient()
+    c3.session = FakeSession([FakeResp(), GoodResp()])  # miss then payload
+    rec = c3.fetch_universe(43)
+    assert rec and rec["ccu"] == 7 and rec["visits"] == 9
+
+
 def test_rotrends_snapshot_escalates_in_tier_3x_gap_without_climb(tmp_path):
     """Second escalation trigger (2026-10-09 review): a T7 game whose stored
     ccu sits at 260 while the daily says 550 no longer classifies higher, so

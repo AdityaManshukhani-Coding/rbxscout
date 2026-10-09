@@ -63,7 +63,18 @@ CX_USER_AGENT = (
 )
 CX_TIMEOUT = 10.0       # HARD total timeout — dead IDs hang forever without it
 CX_MIN_INTERVAL = 0.5   # ≥0.5 s between calls (≤2 req/s sustained, honest politeness)
-CX_MAX_CONSECUTIVE_FAILS = 2   # abort the batch after this many back-to-back misses
+CX_MAX_CONSECUTIVE_FAILS = 4   # abort the batch after this many back-to-back misses
+# Soft-throttle calibration (2026-10-09 deep dive): CE serves an intangible
+# throttle at sustained ≥~0.5-1 req/s — HTTP 200, full-length template shell,
+# but the RSC payload (initialGameData) is MISSING. ~12 rapid requests buy
+# a wall that lasts ≥15 min (observed up to 40+). At 2 s + request spacing
+# clean runs are 100%; at 0.5-0.7 s the wall starts after ~4-12 requests.
+# Production pacing (2 rps) therefore sits exactly ON the tripwire and the
+# measured soft-miss rate was ~40%+, tripping the 2-miss circuit within a
+# dozen games and silently disabling the overflow for the rest of the sync.
+CX_BURST_LIMIT = 12          # requests before a mandatory cool-down (measured)
+CX_BURST_COOLDOWN = 75.0     # seconds; wall builds in ~4-12 requests at speed
+CX_MISS_RETRY_DELAY = 4.0    # one immediate, spaced retry for a parse miss
 
 
 def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
@@ -73,7 +84,9 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
         return default
 
 
-CX_RPS = _env_float("CX_RPS", 2.0, minimum=0.2)   # sustained-cap knob
+CX_RPS = _env_float("CX_RPS", 2.0, minimum=0.2)   # sustained-cap knob —
+# Effective spacing feeds the burst counter: CE's real limiter is ~12 rapid
+# requests, not a clean rps budget (see CX_BURST_LIMIT calibration notes).
 
 
 class CxClient:
@@ -92,6 +105,8 @@ class CxClient:
         self._next_emit = 0.0
         self._lock = threading.Lock()
         self._consecutive_fails = 0
+        self._burst_count = 0        # requests since the last mandatory rest
+        self._cooldown_guard: bool = False
         self.session = requests.Session()
         self.session.headers["User-Agent"] = CX_USER_AGENT
         self.session.headers["Accept"] = (
@@ -109,12 +124,31 @@ class CxClient:
     # Pacing
     # ------------------------------------------------------------------ #
     def _emit_pace(self) -> None:
+        """Token-pacer PLUS a burst counter (soft-throttle defense).
+
+        CE's measured limiter (2026-10-09)serves ~12 rapid requests clean,
+        then builds a multi-minute wall of payload-less pages that look like
+        HTTP 200. Every paced emit checks the rolling count: after
+        CX_BURST_LIMIT requests the process sleeps CX_BURST_COOLDOWN once
+        (counting resets), which measurably avoids the wall entirely.
+        """
         with self._lock:
             now = time.monotonic()
             wait = max(0.0, self._next_emit - now)
             self._next_emit = max(now, self._next_emit) + 1.0 / self.rps
+            self._burst_count += 1
+            force_rest = 0.0
+            if self._burst_count >= CX_BURST_LIMIT:
+                force_rest = CX_BURST_COOLDOWN
+                self._burst_count = 0
         if wait:
             time.sleep(wait)
+        if force_rest:
+            log.info(
+                "cx burst cool-down: %ds after %d requests (soft-throttle defense)",
+                int(force_rest), CX_BURST_LIMIT,
+            )
+            time.sleep(force_rest)
 
     @property
     def rps(self) -> float:
@@ -217,8 +251,24 @@ class CxClient:
             return None
         game = self.parse_game_payload(resp.text or "")
         if not game:
-            self._note_fail(uid, "parse miss (no initialGameData)")
-            return None
+            # Soft-throttle signature (2026-10-09 calibration): HTTP 200 with
+            # a full-length shell but NO payload happens under sustained fast
+            # pacing and clears in seconds-to-minutes. One spacing-limited
+            # retry turns the measured ~40% soft-miss rate into ~0 without
+            # touching the burst budget much; a real dead/unrenderable ID
+            # still misses twice and counts both times toward the circuit.
+            time.sleep(CX_MISS_RETRY_DELAY)
+            self._emit_pace()
+            try:
+                resp2 = self.session.get(url, timeout=self.timeout, allow_redirects=True)
+            except requests.RequestException as exc:
+                self._note_fail(uid, f"retry transport: {type(exc).__name__}")
+                return None
+            if resp2.status_code == 200:
+                game = self.parse_game_payload(resp2.text or "")
+            if not game:
+                self._note_fail(uid, "parse miss (no initialGameData, retried)")
+                return None
         self._consecutive_fails = 0
         out: Dict[str, Any] = {"fetched_at": time.strftime("%Y-%m-%d %H:%M:%S")}
         for src, dst in (

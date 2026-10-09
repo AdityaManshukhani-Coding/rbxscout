@@ -3105,6 +3105,35 @@ class RobloxPlatformScout:
         except (sqlite3.Error, TypeError, ValueError):
             return False  # unknown → not hot; don't spend CE on a cold guess
 
+    STUCK_ROW_MIN_DAYS = 21  # a weekly-tier row 3+ weeks past its cadence
+
+    def _is_stuck_row(self, uid: int) -> bool:
+        """Is this catalog row past-repair stale (the hidden-game signature)?
+
+        The batch parser drops ID-less stub responses, so a content-restricted
+        universe NEVER gets an upsert: its last_updated freezes while the row
+        sits first in every most-stale-first queue. Real data loss for the
+        dashboard (weeks-old numbers), budget drain for the pipeline (the
+        same games re-fetched every sync). 21 days — well past the weekly
+        cadence and the rotrends sweep's daily touch — selects exactly those
+        rows. One indexed PK read per missed game: negligible.
+        """
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT last_updated FROM game_analytics WHERE universe_id = ?
+                    """,
+                    (int(uid),),
+                ).fetchone()
+            if not row or not row[0]:
+                return False
+            import calendar as _calendar
+            ts = _calendar.timegm(time.strptime(str(row[0])[:19], "%Y-%m-%d %H:%M:%S"))
+            return (time.time() - ts) > self.STUCK_ROW_MIN_DAYS * 86400
+        except (sqlite3.Error, TypeError, ValueError):
+            return False
+
     def drain_discovery_queue(
         self,
         batches: int = EXPAND_QUEUE_BATCHES_DEFAULT,
@@ -3911,19 +3940,37 @@ class RobloxPlatformScout:
             # --------------------------------------------------------------
             cx_overflow: Dict[int, Dict[str, Any]] = {}
             if do_hydrate:
-                missed_hot = [
-                    uid for uid in hydration_ids
-                    if uid not in all_metrics and self._is_hot_tier(uid)
+                # Hidden-game rescue (2026-10-09 deep dive): 30 catalog rows —
+                # some of themlarge, high-CCU games — return an ID-less
+                # '[TITLE UNAVAILABLE]' stub from the batch metrics API
+                # (isContentRestricted universes; Roblox hides them from
+                # anonymous batch calls). The parser drops the stub, the row
+                # never upserts, last_updated never moves, the row stays
+                # first in the most-stale-first queue, and every sync has
+                # re-spent real Roblox budget on the same ~30 games since
+                # Sept 3 — while OTHER games rolled. CE serves these ids
+                # fine (visits + rank but ccu always 0), so any missed game
+                # gets ONE overflow attempt — hot tiers were already the
+                # rule; the rescue extends it to the stuck tail. CE never
+                # becomes a bulk channel: the per-sync overflow set is
+                # bounded by the missed set, which for a healthy pipeline
+                # remains small.
+                missed = [uid for uid in hydration_ids if uid not in all_metrics]
+                missed_hot = [u for u in missed if self._is_hot_tier(u)]
+                rescue = [
+                    uid for uid in missed
+                    if not self._is_hot_tier(uid) and self._is_stuck_row(uid)
                 ]
-                if missed_hot:
+                overflow_ids = list(dict.fromkeys(missed_hot + rescue))
+                if overflow_ids:
                     report(
                         0.40,
-                        f"Roblox missed {len(missed_hot)} hot games — "
+                        f"Roblox missed {len(missed_hot)} hot + {len(rescue)} stuck games — "
                         "trying Creator Exchange overflow…",
                     )
                     try:
                         import cx_client
-                        cx_overflow = cx_client.fetch_universes(missed_hot)
+                        cx_overflow = cx_client.fetch_universes(overflow_ids)
                     except Exception as exc:  # never fail the run on overflow
                         log.warning("cx overflow pass failed (rolling forward): %s", exc)
                         cx_overflow = {}
