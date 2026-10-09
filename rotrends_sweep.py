@@ -539,9 +539,11 @@ def sweep_tiers(
     result["history_rows"] = _sweep_store_totals.get("history_rows", 0)
     result["enriched"] = _sweep_store_totals.get("enriched", 0)
     result["dispatched"] = _sweep_store_totals.get("dispatched", 0)
+    result["tier_bumps"] = _sweep_store_totals.get("tier_bumps", 0)
     report(1.0, "Rotrends sweep done: "
                 f"{result['ok']:,}/{result['due']:,} games · "
-                f"{result['history_rows']:,} history rows")
+                f"{result['history_rows']:,} history rows · "
+                f"{result['tier_bumps']:,} tier bumps → hot scheduler")
     return result
 
 
@@ -549,7 +551,7 @@ def _note_store_totals(totals: Dict[str, int]) -> None:
     global _sweep_store_totals
     _sweep_store_totals = {
         k: _sweep_store_totals.get(k, 0) + int(totals.get(k, 0))
-        for k in ("history_rows", "enriched", "dispatched")
+        for k in ("history_rows", "enriched", "dispatched", "tier_bumps")
     }
 
 
@@ -586,7 +588,8 @@ def backfill_shallow(
     )
     if not targets:
         return {"due": 0, "ok": 0, "errored": 0, "history_rows": 0,
-                "enriched": 0, "dispatched": 0, "window": f"{start_date}..{end_date}",
+                "enriched": 0, "dispatched": 0, "tier_bumps": 0,
+                "window": f"{start_date}..{end_date}",
                 **client.stats}
     report(0.05, f"rotrends backfill: {len(targets):,} shallow games, {days}d window")
     ok = err = rows_n = 0
@@ -608,15 +611,15 @@ def backfill_shallow(
         futures = [pool.submit(_fetch, uid) for uid in targets]
         for i, fut in enumerate(as_completed(futures), start=1):
             rows = fut.result()
-            for r in rows:
-                results[str(r["universe_id"])] = {
-                    "universe_id": r["universe_id"],
-                    "ts": r["process_date"],
-                    "ccu": r["ccu"],
-                    "like_ratio": r.get("like_ratio"),
-                    "earning_rank": r.get("earning_rank"),
-                }
-            if i % 200 == 0 or i == len(futures):
+        for r in rows:
+            results[str(r["universe_id"])] = {
+                "universe_id": r["universe_id"],
+                "ts": r["process_date"],
+                "ccu": r["ccu"],
+                "like_ratio": r.get("like_ratio"),
+                "earning_rank": r.get("earning_rank"),
+            }
+        if i % 200 == 0 or i == len(futures):
                 totals = store_day_snapshots(scout, dict(results))
                 _note_store_totals(totals)
                 results.clear()
@@ -716,6 +719,7 @@ def main() -> int:
             f"{result['sweep'].get('history_rows', 0):,} history rows · "
             f"{result['sweep'].get('errored', 0):,} errored · "
             f"{result['sweep'].get('client_429s', 0)} penalty boxes · "
+            f"{result['sweep'].get('tier_bumps', 0)} tier bumps · "
             f"({time.time() - started:.0f}s)"
         )
     if args.backfill or args.backfill_only:

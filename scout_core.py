@@ -2043,7 +2043,7 @@ class RobloxPlatformScout:
     ) -> Dict[str, int]:
         """Store Rotrends daily snapshots (HYDRATION_SOURCES.md Phase 1).
 
-        Returns {"history_rows": n, "enriched": n, "dispatched": n}:
+        Returns {"history_rows": n, "enriched": n, "dispatched": n, "tier_bumps": n}:
         - history_rows: ccu_history rows INSERTed with source='rotrends_daily'
           at the snapshot's process_date (the value describes that day; a
           live fetch-time stamp would silently falsify the trend curve).
@@ -2051,11 +2051,13 @@ class RobloxPlatformScout:
         - dispatched: universe IDs with NO catalog row — the queue drain
           owns catalog insertion, so the sweep hands cold unknowns back to
           discovery instead of self-inserting (strict-gate policy intact).
+        Also returned: tier_bumps — cold games whose tier re-stamped UP
+        from the daily CCU signal (see _restamp_tier_from_daily).
         """
         if not rows:
             return {"history_rows": 0, "enriched": 0, "dispatched": 0}
         log = logging.getLogger("rbxscout.rotrends")
-        out = {"history_rows": 0, "enriched": 0, "dispatched": 0}
+        out = {"history_rows": 0, "enriched": 0, "dispatched": 0, "tier_bumps": 0}
 
         def _write(c: sqlite3.Connection) -> None:
             for uid, snap in rows.items():
@@ -2086,13 +2088,13 @@ class RobloxPlatformScout:
                             vals.extend(
                                 (int(earning), datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
                             )
-                        if like_ratio is not None:
-                            sets.append("like_ratio = ?")
-                            vals.append(float(like_ratio))
                         if "like_ratio" not in {
                             r[1] for r in c.execute("PRAGMA table_info(game_analytics)")
                         }:
                             c.execute("ALTER TABLE game_analytics ADD COLUMN like_ratio REAL")
+                        if like_ratio is not None:
+                            sets.append("like_ratio = ?")
+                            vals.append(float(like_ratio))
                         try:
                             c.execute(
                                 "UPDATE game_analytics SET " + ", ".join(sets)
@@ -2102,6 +2104,24 @@ class RobloxPlatformScout:
                             out["enriched"] += 1
                         except sqlite3.Error as exc:
                             log.debug("rotrends enrichment skipped %s: %s", uid, exc)
+                    # Tier re-stamp from the daily signal (stale-stats repair,
+                    # 2026-10-09): a cold/weekly game can blow up while its
+                    # stored live stats sit days old — the sweep sees the real
+                    # CCU but, by contract, never wrote ccu/visits/tier, so the
+                    # game stayed in its old tier and the ring-fenced Roblox
+                    # budget (which the weekly bucket only gets as leftover)
+                    # never reached it. classify_tier is pure DB logic, so
+                    # re-stamp it here from (stored visits, fresh daily CCU);
+                    # if the daily signal classifies HIGHER than the stamp,
+                    # bump the tier. The next hydrator tick then schedules the
+                    # universe as a hot game (freshest-first) and Roblox
+                    # restores canonical ccu/visits — the tie-breaker contract
+                    # is untouched because rotrends never writes stats itself.
+                    # Reclassified DOWN is not done from a daily value: a
+                    # pool dip could be a snapshot quirk, and demotion before
+                    # Roblox confirms would wrongly silence hot games.
+                    if self._restamp_tier_from_daily(c, int(uid), int(ccu)):
+                        out["tier_bumps"] = out.get("tier_bumps", 0) + 1
                 except (TypeError, ValueError, sqlite3.Error) as exc:
                     log.debug("rotrends snapshot skipped %s: %s", uid, exc)
 
@@ -2114,6 +2134,93 @@ class RobloxPlatformScout:
         except sqlite3.Error as exc:
             log.warning("rotrends snapshot store failed: %s", exc)
         return out
+
+    def _restamp_tier_from_daily(
+        self, c: sqlite3.Connection, universe_id: int, daily_ccu: int
+    ) -> bool:
+        """Re-stamp a game's tier UP when the daily CCU signal outclasses it.
+
+        The stale-stats repair (2026-10-09): a T5–T7 game can multiply its
+        CCU while its stored live values sit days old — the ring-fenced
+        Roblox budget reaches the weekly bucket only as leftover, so the
+        game stays stuck under an outdated stamp and the dashboard renders
+        weeks-old numbers. The sweep already carries the fresh daily CCU at
+        zero extra request cost; using it to reclassify (pure DB logic, no
+        stats written) escalates the game into the hot scheduler, whose
+        next tick restores canonical Roblox ccu/visits and re-stamps canonically.
+
+        Contraction is deliberately not done here (a pool dip may be a
+        snapshot quirk; demotion before Roblox confirms would wrongly
+        silence hot games). Only a tier CLIMB acts; bookkeeping follows the
+        same rules as _tier_stamp_for: tier_since resets on a change,
+        prev_tier keeps the old stamp, and a 2+ tier climb or a 3× CCU jump
+        (floored at 10) raises blowup_flag for the New and Upcoming watchlist.
+
+        Returns True when the row was re-stamped. Never raises.
+        """
+        try:
+            row = c.execute(
+                "SELECT COALESCE(tier, 0), visits FROM game_analytics "
+                "WHERE universe_id = ?",
+                (int(universe_id),),
+            ).fetchone()
+            if not row:
+                return False  # unknown ID: the queue drain owns insertion
+            old_tier = int(row[0] or 0)
+            if daily_ccu <= 0:
+                return False
+            new_tier = classify_tier(row[1], daily_ccu)
+            if new_tier <= old_tier:
+                return False
+            now = time.strftime("%Y-%m-%d %H:%M:%S")
+            # Blowup rules identical to _tier_stamp_for. old_ccu here is the
+            # stored LIVE ccu (the right base for 'did it multiply'); the
+            # daily value is the evidence, the live row is the reference.
+            old_ccu = int(
+                c.execute(
+                    "SELECT COALESCE(ccu, 0) FROM game_analytics WHERE universe_id = ?",
+                    (int(universe_id),),
+                ).fetchone()[0]
+            )
+            blowup = (old_tier > 0 and new_tier - old_tier >= 2) or (
+                old_ccu >= 10 and daily_ccu >= 3 * old_ccu
+            )
+            if blowup:
+                # In-memory diagnostics event feeds the per-sync counters —
+                # the DB flag above is what survives restarts.
+                self._note_blowup_event(
+                    int(universe_id), old_tier, new_tier, old_ccu, daily_ccu
+                )
+            c.execute(
+                "UPDATE game_analytics SET tier = ?, prev_tier = ?, "
+                "tier_since = ?, "
+                "blowup_flag = CASE WHEN ? = 1 THEN 1 ELSE COALESCE(blowup_flag, 0) END, "
+                "blowup_at = CASE WHEN ? = 1 THEN ? ELSE blowup_at END "
+                "WHERE universe_id = ?",
+                (
+                    int(new_tier),
+                    int(old_tier),
+                    now,
+                    1 if blowup else 0,
+                    1 if blowup else 0,
+                    now if blowup else None,
+                    int(universe_id),
+                ),
+            )
+            log.info(
+                "tier bump from daily signal: U%s %s→T%s (daily ccu %s, "
+                "stored ccu %s)%s",
+                universe_id,
+                old_tier,
+                new_tier,
+                daily_ccu,
+                old_ccu,
+                " · blowup flagged" if blowup else "",
+            )
+            return True
+        except (sqlite3.Error, TypeError, ValueError) as exc:
+            log.debug("tier re-stamp skipped U%s: %s", universe_id, exc)
+            return False
 
     def fetch_game_metrics(self, universe_ids: List[int]) -> Dict[int, Dict[str, Any]]:
         """Threaded batched metrics (50 universes per call — verified cap: 50→200, 100→400).

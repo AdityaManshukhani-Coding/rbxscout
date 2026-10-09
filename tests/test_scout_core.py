@@ -774,6 +774,77 @@ def test_blowup_flag_on_ccu_multiplication_even_without_tier_jump(tmp_path):
     assert int(scout.load_table().set_index("universe_id").loc[3]["blowup_flag"]) == 0
 
 
+def test_rotrends_snapshot_restamps_tier_up_for_stale_cold_game(tmp_path):
+    """The stale-stats repair (2026-10-09): the sweep sees the daily CCU of a
+    T5/T6 weekly game blow up, but by contract never writes ccu/visits —
+    the game stayed under its old stamp and the dashboard rendered days-old
+    numbers until the ring-fenced Roblox budget reached the weekly bucket.
+    The snapshot must therefore re-stamp the tier UP from the daily signal
+    (pure DB logic) so the hot scheduler picks the game on the next tick
+    and Roblox restores canonical stats. Stats columns stay untouched."""
+    scout = RobloxPlatformScout(db_path=str(tmp_path / "rs.db"))
+    scout.upsert_game({"universe_id": 11, "title": "Grower", "ccu": 496, "visits": 38_568})
+    assert int(scout.load_table().set_index("universe_id").loc[11]["tier"]) == 5
+    row0 = scout.load_table().set_index("universe_id").loc[11]
+    # A T5 game that 2.4x'd while sitting in the weekly bucket.
+    result = scout.upsert_rotrends_snapshot({
+        11: {"ts": "2026-10-09", "ccu": 1198, "like_ratio": 0.95, "earning_rank": 17},
+    })
+    assert result["tier_bumps"] == 1
+    assert result["history_rows"] == 1
+    row = scout.load_table().set_index("universe_id").loc[11]
+    assert int(row["tier"]) == 7        # ccu-axis 1,198 clears T7's 1,000
+    assert int(row["prev_tier"]) == 5
+    assert row["tier_since"] is not None  # refreshed on the re-stamp
+    assert int(row["blowup_flag"]) == 1  # 2+ tier climb
+    assert 11 in scout.blowup_watch_events
+    # The whole point: rotrends NEVER writes live stats itself.
+    assert int(row["ccu"]) == 496
+    assert int(row["visits"]) == 38_568
+    # But the daily sample landed in history with the daily source tag.
+    with sqlite3.connect(scout.db_path) as conn:
+        hist = conn.execute(
+            "SELECT ccu, source FROM ccu_history WHERE universe_id=11 "
+            "AND source='rotrends_daily'"
+        ).fetchall()
+    assert hist == [(1198, "rotrends_daily")]
+
+
+def test_rotrends_snapshot_tier_bump_never_demotes_and_quiet_steps_stay_quiet(tmp_path):
+    """Reclassification from the daily signal only CLIMBS: a pool dip may be
+    a snapshot quirk, and demotion before Roblox confirms would wrongly
+    silence hot games. A one-step climb without a 3x jump re-stamps quietly."""
+    scout = RobloxPlatformScout(db_path=str(tmp_path / "rd.db"))
+    # T4 (ccu-axis 200, visits-axis 75k); stored above-day historical peak is fine.
+    scout.upsert_game({"universe_id": 12, "title": "Bubbler", "ccu": 200, "visits": 100_000})
+    assert int(scout.load_table().set_index("universe_id").loc[12]["tier"]) == 4
+
+    # A small dip changes nothing.
+    out = scout.upsert_rotrends_snapshot({12: {"ts": "2026-10-09", "ccu": 150}})
+    assert out["tier_bumps"] == 0
+    assert int(scout.load_table().set_index("universe_id").loc[12]["tier"]) == 4
+
+    # Same-day second pass at a one-step-up CCU (300 → T5 axis, below
+    # T6's 550): quiet climb.
+    out = scout.upsert_rotrends_snapshot({12: {"ts": "2026-10-09", "ccu": 300}})
+    assert out["tier_bumps"] == 1
+    row = scout.load_table().set_index("universe_id").loc[12]
+    assert int(row["tier"]) == 5
+    assert int(row["prev_tier"]) == 4
+    assert int(row["blowup_flag"]) == 0  # one step, 2.8x — below every trigger
+
+
+def test_backfill_shallow_paths_pass_tier_bump_accumulator(tmp_path, monkeypatch):
+    """_note_store_totals accumulates tier_bumps so the sweep summary and
+    the CLI line surface them (Phase 5 sized the reporting contract)."""
+    import rotrends_sweep
+    rotrends_sweep._note_store_totals({"history_rows": 3, "tier_bumps": 2})
+    rotrends_sweep._note_store_totals({"tier_bumps": 1})
+    totals = rotrends_sweep._sweep_store_totals
+    assert totals == {"history_rows": 3, "tier_bumps": 3,
+                      "enriched": 0, "dispatched": 0}
+
+
 def test_blowup_flag_is_sticky_and_watchlist_reads_db(tmp_path):
     """Once flagged, a row stays on the New and Upcoming watchlist until the
     flag is explicitly cleared — even after a quiet re-hydration."""
