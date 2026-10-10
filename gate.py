@@ -84,7 +84,90 @@ def _expected_password() -> str:
     return value
 
 
-# --- user access passwords (friend keys) ----------------------------------- #
+# --- one-time (temp) access passwords --------------------------------------- #
+#
+# Trial keys: hand one to a visitor, they sign in once, the key burns itself
+# so a second login with the SAME plaintext fails ("used") — exactly the
+# try-demo-once flow. Storage mirrors the user keys: a committed manifest of
+# SHA-256(salt+password) hashes (plaintexts live with the owner) plus per-key
+# bookkeeping in the local state file. Burned keys stay in the state file
+# (marked "used") so the state file remains the single audit trail; the
+# manifest never changes, so deprovisioning a batch is regeneration alone.
+
+TEMP_HASH_SALT = "rbxscout-temp-v1:"
+
+
+def _temp_hashes_path() -> Path:
+    """Where the temp-key hash manifest lives (env-overridable for tests)."""
+    override = os.environ.get("SS_TEMP_HASHES_FILE")
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parent / "temp_access_passwords.json"
+
+
+def _temp_hash(candidate: str) -> str:
+    return hashlib.sha256((TEMP_HASH_SALT + candidate).encode("utf-8")).hexdigest()
+
+
+def _load_temp_hashes() -> set:
+    """Temp-key hashes from the manifest; missing file -> no temp keys active."""
+    try:
+        data = json.loads(_temp_hashes_path().read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    if isinstance(data, dict):
+        data = data.get("passwords") or []
+    if not isinstance(data, list):
+        return set()
+    return {str(item).strip().lower() for item in data if str(item).strip()}
+
+
+def temp_password_status(candidate: str) -> str:
+    """Classify a candidate against the temp-key manifest: ``temp``/``none``."""
+    return "temp" if _temp_hash(candidate) in _load_temp_hashes() else "none"
+
+
+def check_temp_password(candidate: str, ref: str | None, ip: str | None) -> str:
+    """Validate one temp-key attempt; returns ``ok``/``used``/``wrong``.
+
+    On the FIRST successful login the key is burned in the state file. A
+    later login with the same plaintext returns ``used`` and burns NO
+    attempts — the holder guessed right, the key is just spent, so the
+    message should say "this key is one-time" rather than "wrong password".
+    Because the manifest is never edited by the burn, the same plaintext
+    keeps classifying as a temp key forever — the state entry is what says
+    it is spent.
+    """
+    key = _temp_hash(candidate)
+    if key not in _load_temp_hashes():
+        return "wrong"
+    with _STATE_LOCK:
+        state = _load_user_state()
+        entry = state.get(key) if isinstance(state.get(key), dict) else {}
+        if entry.get("kind") == "temp" and entry.get("used"):
+            return "used"  # already burned — do not touch its bookkeeping
+        device = _ref_key(ref)
+        now = time.time()
+        # Record the single successful use for the audit trail, then burn.
+        ips = [str(x) for x in entry.get("ips", []) if x]
+        refs = [str(x) for x in entry.get("refs", []) if x]
+        if ip and ip != "unknown":
+            if ip not in ips:
+                ips = (ips + [ip])[-_MAX_TRACKED:]
+            if device and device not in refs:
+                refs = (refs + [device])[-_MAX_TRACKED:]
+        state[key] = {
+            "kind": "temp",
+            "used": True,
+            "used_at": now,
+            "ips": ips,
+            "refs": refs,
+        }
+        _save_user_state(state)
+    return "ok"
+
+
+# --- user access passwords (friend keys) ------------------------------------ #
 
 # Fixed application-side salt: domain-separates these hashes from other
 # sha256 uses and makes off-the-shelf rainbow tables useless. The generated
@@ -128,6 +211,25 @@ def _load_user_hashes() -> set:
     return {str(item).strip().lower() for item in data if str(item).strip()}
 
 
+def _load_terminated_hashes() -> set:
+    """Hashes explicitly terminated by the owner, from the manifest audit list.
+
+    This makes termination a MANIFEST fact too, not only a state-file flag:
+    a deployment whose state file was never synced (fresh container) still
+    refuses these plaintexts, because user_password_status keeps them in the
+    user-key namespace while check_user_password rejects them up front.
+    """
+    try:
+        data = json.loads(_user_hashes_path().read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    if isinstance(data, dict):
+        data = data.get("terminated_hashes") or []
+    if not isinstance(data, list):
+        return set()
+    return {str(item).strip().lower() for item in data if str(item).strip()}
+
+
 def _load_user_state() -> dict:
     try:
         data = json.loads(_user_state_path().read_text(encoding="utf-8"))
@@ -149,8 +251,18 @@ def _save_user_state(state: dict) -> None:
 
 
 def user_password_status(candidate: str) -> str:
-    """Classify a candidate against the user-key manifest: ``user``/``none``."""
-    return "user" if _user_hash(candidate) in _load_user_hashes() else "none"
+    """Classify a candidate against the user-key manifest: ``user``/``none``.
+
+    Terminated keys STILL classify as ``user`` — their hash lives either in
+    the manifest's ``terminated_hashes`` audit list or in the state file —
+    so check_password routes them to check_user_password and the visitor
+    gets "terminated by the owner" instead of a plain wrong password (which
+    would burn attempts for someone holding a dead-but-real key).
+    """
+    key = _user_hash(candidate)
+    if key in _load_user_hashes() or key in _load_terminated_hashes():
+        return "user"
+    return "none"
 
 
 def check_user_password(candidate: str, ref: str | None, ip: str | None) -> str:
@@ -187,6 +299,10 @@ def check_user_password(candidate: str, ref: str | None, ip: str | None) -> str:
     """
     key = _user_hash(candidate)
     if key not in _load_user_hashes():
+        # Not in the ACTIVE set. Might still be a known terminated key: the
+        # manifest audit list answers without any state file (fresh deploys).
+        if key in _load_terminated_hashes():
+            return "terminated"
         return "wrong"
     device = _ref_key(ref)
     now = time.time()
@@ -194,6 +310,11 @@ def check_user_password(candidate: str, ref: str | None, ip: str | None) -> str:
     with _STATE_LOCK:
         state = _load_user_state()
         entry = state.get(key) if isinstance(state.get(key), dict) else {}
+        # Owner-terminated keys (see terminate_user_passwords) are dead for
+        # everyone and stay dead — no login can wipe the flag, because this
+        # branch returns before any bookkeeping is written.
+        if entry.get("terminated"):
+            return "terminated"
         if entry.get("banned"):
             # A key banned under the OLD two-IP+two-device rule locked out
             # returning scouts who had done nothing wrong. Someone presenting
@@ -252,6 +373,89 @@ def check_user_password(candidate: str, ref: str | None, ip: str | None) -> str:
         _revoke_unlocks_for(refs)
         return "banned"
     return "ok"
+
+
+def terminate_user_passwords(plaintexts: list) -> list:
+    """Permanently disable user keys by plaintext; returns the ones hit.
+
+    Owner action "terminate these passwords": each named key is flagged in
+    the state file (never with the plaintext, only its hash) so every future
+    login with it returns ``terminated``. Written state travels with
+    deployments that sync the gate state dir; deployments that do NOT carry
+    the state file still stop working the moment the key hash is dropped
+    from the committed manifest instead — ``revoked_hashes`` are written
+    there too so both enforcement paths agree.
+
+    Returns the plaintexts that actually matched a manifest key, so the
+    caller can report typos instead of silently doing nothing.
+    """
+    hash_to_plaintext = {_user_hash(pt): pt for pt in plaintexts}
+    manifest = _load_user_hashes()
+    hit = [pt for key, pt in hash_to_plaintext.items() if key in manifest]
+    if not hit:
+        return []
+    with _STATE_LOCK:
+        state = _load_user_state()
+        now = time.time()
+        refs_to_kick: list[str] = []
+        for pt in hit:
+            key = _user_hash(pt)
+            entry = state.get(key) if isinstance(state.get(key), dict) else {}
+            entry["terminated"] = True
+            entry["terminated_at"] = now
+            entry["terminated_reason"] = "owner revoke_access_passwords.py"
+            refs_to_kick.extend(str(r) for r in (entry.get("refs") or []) if r)
+            state[key] = entry
+        _save_user_state(state)
+    # Belt-and-braces enforcement for deployments that never sync the state
+    # file: the manifest itself moves the hash from the active list to the
+    # ``terminated_hashes`` audit list, so check_user_password refuses the
+    # plaintext even on a fresh state (as "terminated", not "wrong").
+    _remove_hashes_from_manifest(manifest, set(hash_to_plaintext) & manifest)
+    # Unlock revocation happens OUTSIDE _STATE_LOCK (non-reentrant lock —
+    # see check_user_password): any device that remembered its unlock via
+    # this key lands back on the password screen next load.
+    _revoke_unlocks_for(refs_to_kick)
+    return hit
+
+
+def _remove_hashes_from_manifest(manifest: set, doomed: set) -> None:
+    """Move doomed hashes from the COMMITTED manifest's active list into its
+    ``terminated_hashes`` audit list (never raises).
+
+    Order of operations overall: the state file's ``terminated`` flags are
+    written FIRST (so the flag exists even if this manifest write fails),
+    then the manifest is rewritten here. Either layer alone enforces the
+    termination: the flags fire when the OLD manifest is still deployed,
+    and the audit list fires when the state file never arrived.
+
+    Note: this writes the repo-side hash manifest, so run it on the machine
+    holding the committed copy and push it — remote deployments without
+    this manifest still enforce the termination via the synced state file.
+    """
+    try:
+        path = _user_hashes_path()
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return
+        remaining = [
+            h for h in data.get("passwords") or []
+            if str(h).strip().lower() not in doomed
+        ]
+        data["passwords"] = remaining
+        data["count"] = len(remaining)
+        data["terminated_hashes"] = sorted(doomed)
+        path.write_text(json.dumps(data, indent=1) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_unlocked_refs() -> list:
+    """Every device ref currently remembered as unlocked (for revocation)."""
+    try:
+        return list(_load_unlocks().keys())
+    except Exception:
+        return []
 
 
 def _revoke_unlocks_for(refs: list) -> None:
@@ -410,7 +614,7 @@ def reset_attempts(ref: str | None) -> None:
 
 
 def check_password(candidate: str, ref: str | None, ip: str | None = None) -> str:
-    """Evaluate one unlock attempt; returns ``ok``/``banned``/``cooldown``/``wrong``/``unconfigured``.
+    """Evaluate one unlock attempt; returns ``ok``/``banned``/``cooldown``/``wrong``/``unconfigured``/``used``/``terminated``.
 
     Like iOS: while cooling down, even the correct password cannot skip the
     timer — but entering it does not add another failure either.
@@ -418,7 +622,9 @@ def check_password(candidate: str, ref: str | None, ip: str | None = None) -> st
     Order matters: the master password (APP_PASSWORD) is checked first and is
     exempt from the user-key sharing ban; user keys from access_passwords.json
     go through check_user_password (which enforces the IP+device anti-sharing
-    rule). Anything else is a wrong password.
+    rule); one-time temp keys from temp_access_passwords.json go through
+    check_temp_password (burn-after-first-use). Anything else is a wrong
+    password.
 
     The device ref is NOT part of the password decision: the ref only keys
     the lockout bookkeeping. Requiring it here too meant that visitors with
@@ -440,8 +646,19 @@ def check_password(candidate: str, ref: str | None, ip: str | None = None) -> st
             reset_attempts(ref)
         elif result == "banned":
             return "banned"  # no failure counting: the key itself is dead
+        elif result == "terminated":
+            return "terminated"  # owner killed this key; no attempt burning
         else:
             record_failure(ref)
+        return result
+    if temp_password_status(candidate) == "temp":
+        result = check_temp_password(candidate, ref, ip)
+        if result == "ok":
+            reset_attempts(ref)
+        else:
+            # A spent temp key is the holder's own expired key: no attempt
+            # burning (it validates, it just cannot admit anyone again).
+            pass
         return result
     if not expected:
         # Fail closed: the owner has not configured APP_PASSWORD and the

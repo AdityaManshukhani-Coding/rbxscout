@@ -715,6 +715,18 @@ def _render_gate() -> None:
                     "from multiple devices and locations, which the owner treats "
                     "as sharing. Ask them for your own password."
                 )
+            if result == "terminated":
+                st.error(
+                    "⛔ **This access password has been terminated by the owner.** "
+                    "It no longer unlocks anything. Ask them for a new one."
+                )
+            if result == "used":
+                st.error(
+                    "⏱️ **This is a one-time trial password and it has already "
+                    "been used.** Trial keys unlock the tool exactly once; after "
+                    "that sign-in they stop working. Ask the owner for a "
+                    "standing access password."
+                )
             if result == "wrong":
                 if gate.cooldown_remaining(ref) > 0:
                     st.rerun()  # a cooldown just started — show the timer now

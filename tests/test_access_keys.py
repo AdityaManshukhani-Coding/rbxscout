@@ -151,8 +151,14 @@ def test_generated_manifest_round_trip(tmp_path, monkeypatch):
         import pytest
 
         pytest.skip("access_passwords.json not generated yet")
-    assert data["count"] >= 100
+    # Owner terminations (revoke_access_passwords.py) legitimately shrink
+    # the active set below 100, so the generator's exact count is not
+    # timeless — integrity is: the count matches the list, and no hash
+    # double-lists as both active and terminated.
+    assert data["count"] == len(data["passwords"])
     assert len(set(data["passwords"])) == len(data["passwords"]), "all hashes unique"
+    terminated = {str(h).strip().lower() for h in data.get("terminated_hashes", [])}
+    assert not (set(data["passwords"]) & terminated), "a hash can't be active AND terminated"
     # And the hash scheme matches what the generator produced.
     first_hash = data["passwords"][0]
     assert len(first_hash) == 64  # full sha256 hex

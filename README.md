@@ -368,9 +368,31 @@ Regenerate the set any time (this invalidates every old key):
 
     python generate_access_passwords.py
 
+Terminate specific keys by plaintext when one leaks or a person leaves
+(stops working for everyone instantly, and revokes the remembered unlocks
+of devices that used it):
+
+    python revoke_access_passwords.py 'FirstKey#Goes#Here42' ...
+
 Local development never trips the ban (unknown/localhost IPs are ignored by
 the tracker). The master password also still works when the manifest file is
 missing, so deployments without user keys behave exactly as before.
+
+### One-time trial keys (temp passwords)
+
+For handing the tool to a stranger for a look WITHOUT giving away a standing
+key: a temp key unlocks the app exactly ONCE. The first successful sign-in
+burns it, and every later login with the same plaintext is answered by a
+clear "this one-time trial key has already been used" screen — not a wrong
+password. They are generated, hashed, and checked in the same shape as the
+user keys (master → user keys → temp keys, in that order).
+
+    python generate_temp_passwords.py          # writes a fresh batch of 15
+    temp_access_passwords.txt                  # plaintexts (gitignored) — hand one out, cross it off
+
+The committed hash manifest is `temp_access_passwords.json`; burning happens
+in the gate state file, so the manifest never changes and regenerating a
+batch only rotates the not-yet-handed-out keys.
 
 ### Never-sleep keep-alive (Cloudflare Worker)
 

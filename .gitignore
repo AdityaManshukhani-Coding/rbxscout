@@ -30,6 +30,10 @@ rbx_scout.db.pull
 # --- user access keys: plaintext list NEVER enters git (hashes do) ---
 access_passwords.txt
 
+# --- one-time trial keys: plaintext list NEVER enters git (hashes do) ---
+temp_access_passwords.txt
+TEMP_PASSWORDS.md
+
 # --- Roblox credential for the home-IP contact tools (catchup_contacts.py /
 # --- atlas_home.py contact sweep): NEVER enters git ---
 local_cookie.txt
@@ -52,9 +56,11 @@ cloudflare-worker/.wrangler/
 # --- per-device profiles (contain the remembered Roblox cookie — NEVER commit) ---
 .profiles/
 
-# --- password-gate state (attempt counters + unlocked-device memory) ---
+# --- password-gate state (attempt counters + unlocked-device memory +
+# --- per-key login/termination/temp-burn bookkeeping; hashes only) ---
 .gate_lock.json
 .gate_unlocked.json
+.access_users.json
 
 # --- private notes (delete these lines to publish) ---
 GAMES_DB_PLAN.md
