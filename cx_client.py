@@ -87,6 +87,14 @@ def _env_float(name: str, default: float, minimum: float = 0.0) -> float:
 CX_RPS = _env_float("CX_RPS", 2.0, minimum=0.2)   # sustained-cap knob —
 # Effective spacing feeds the burst counter: CE's real limiter is ~12 rapid
 # requests, not a clean rps budget (see CX_BURST_LIMIT calibration notes).
+# Wall-clock cap for the whole overflow batch (2026-10-10 root-cause fix): on
+# Oct 9–10 a catalog with 18K+ stale T7 rows fed thousands of missed IDs into
+# the serial overflow loop; each miss costs ~16s wall (10s timeout + 4s retry
+# + pacing), so the hydration ran past the workflow's 20-min timeout and the
+# runner cancelled mid-pass — every 5-min dispatch failed the same way and the
+# pipeline wedged. Overflow is a repair channel, not a bulk channel, so it gets
+# a bounded slice of the tick (env-overridable) and rolls the remainder forward.
+CX_DEADLINE_S = _env_float("CX_DEADLINE_S", 90.0, minimum=10.0)
 
 
 class CxClient:
@@ -97,11 +105,11 @@ class CxClient:
     intent; the hydrator calls it serially from its rollback loop.
     """
 
-    _instance: Optional["CxClient"] = None
-    _instance_lock = threading.Lock()
-
-    def __init__(self, rps: float = CX_RPS, timeout: float = CX_TIMEOUT) -> None:
+    def __init__(self, rps: float = CX_RPS, timeout: float = CX_TIMEOUT,
+                 deadline_s: float = None) -> None:
         self.timeout = float(max(4.0, timeout))  # never below the hang-proof floor
+        self.deadline_s = float(deadline_s) if deadline_s else None
+        self.started_at = time.time()
         self._next_emit = 0.0
         self._lock = threading.Lock()
         self._consecutive_fails = 0
@@ -112,6 +120,9 @@ class CxClient:
         self.session.headers["Accept"] = (
             "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         )
+
+    _instance: Optional["CxClient"] = None
+    _instance_lock = threading.Lock()
 
     @classmethod
     def shared(cls) -> "CxClient":
@@ -316,6 +327,7 @@ def fetch_universes(
     universe_ids: List[int],
     progress_cb: Optional[Any] = None,
     client: Optional[CxClient] = None,
+    deadline_s: float = None,
 ) -> Dict[int, Dict[str, Any]]:
     """Serial overflow refresh for a batch of hot-tier due games.
 
@@ -325,12 +337,39 @@ def fetch_universes(
 
     Backoff ×2 (POLITEness §3.2): on each miss the pacer doubles the
     per-call spacing, resetting on the next success.
+
+    Wall-clock deadline (2026-10-10, ROOT-CAUSE FIX for the Oct 9–10
+    hydrator failures): the overflow pass on a game catalogue with 18K+
+    stale T7 rows would enqueue thousands of missed IDs into this serial
+    loop. Each transported timeout (~10s) + retry (~4s) + pacing (~2s)
+    eats ~16s wall per missed game — thousands of games × 16s ≫ the
+    workflow's 20-min budget, so the job got canceled by the runner
+    while the sweep was still in CE. The 20-min no-op 'cancel' repeated
+    every 5 min, wedging the pipeline (Actions' concurrency group has
+    queue: max, so every one of these dead-on-arrival runs still lands
+    in the queue, and nothing ever turns green).
+
+    Fix: fetch_universes() now accepts a wall-clock deadline. The caller
+    (scout_core's hydration overflow pass) allocates a bounded slice
+    (default CX_DEADLINE_S = 90 s) so the pass stays inside the tick
+    budget regardless of how many misses queued it up; anything past
+    the deadline rolls forward to the next sync.
     """
     cl = client or CxClient.shared()
+    if deadline_s:
+        cl.deadline_s = float(deadline_s)
+        cl.started_at = time.time()
     out: Dict[int, Dict[str, Any]] = {}
     report = progress_cb or (lambda p, m: None)
     for n, uid in enumerate(universe_ids, start=1):
         if cl.circuit_open:
+            break
+        if cl.deadline_s and (time.time() - cl.started_at) > cl.deadline_s:
+            log.warning(
+                "cx overflow hit its %.0fs wall-clock deadline after %d attempts "
+                "(%d hydrated) — rolling the rest forward",
+                cl.deadline_s, n - 1, len(out),
+            )
             break
         got = cl.fetch_universe(uid)
         if got:

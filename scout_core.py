@@ -4108,7 +4108,14 @@ class RobloxPlatformScout:
                     )
                     try:
                         import cx_client
-                        cx_overflow = cx_client.fetch_universes(overflow_ids)
+                        # Wall-clock capped (2026-10-10): the Oct 9–10 runner
+                        # failures were this loop outliving the 20-min budget
+                        # when thousands of stale games missed Roblox and all
+                        # flowed here serially. Overflow gets a bounded slice;
+                        # the rest rolls forward to the next sync.
+                        cx_overflow = cx_client.fetch_universes(
+                            overflow_ids, deadline_s=cx_client.CX_DEADLINE_S
+                        )
                     except Exception as exc:  # never fail the run on overflow
                         log.warning("cx overflow pass failed (rolling forward): %s", exc)
                         cx_overflow = {}

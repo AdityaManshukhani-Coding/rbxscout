@@ -897,7 +897,7 @@ def test_stuck_hidden_row_gets_ce_rescue_not_just_hot_tiers(tmp_path, monkeypatc
     calls = {}
     import cx_client
 
-    def fake_fetch(ids):
+    def fake_fetch(ids, deadline_s=None):
         calls["ids"] = list(ids)
         return {u: {"ccu": 5, "visits": 1, "fetched_at": "2026-10-09 17:00:00"} for u in ids}
 
