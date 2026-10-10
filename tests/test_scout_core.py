@@ -809,9 +809,9 @@ def test_hidden_gate_uses_merged_state_not_partial_upsert(tmp_path):
 
 def test_rotrends_snapshot_restamps_tier_up_for_stale_cold_game(tmp_path):
     """The stale-stats repair (2026-10-09): the sweep sees the daily CCU of a
-    T5/T6 weekly game blow up, but by contract never writes ccu/visits —
+    cold game blow up, but by contract never writes ccu/visits —
     the game stayed under its old stamp and the dashboard rendered days-old
-    numbers until the ring-fenced Roblox budget reached the weekly bucket.
+    numbers until the ring-fenced Roblox budget reached its tier group.
     The snapshot must therefore re-stamp the tier UP from the daily signal
     (pure DB logic) so the hot scheduler picks the game on the next tick
     and Roblox restores canonical stats. Stats columns stay untouched."""
@@ -819,7 +819,7 @@ def test_rotrends_snapshot_restamps_tier_up_for_stale_cold_game(tmp_path):
     scout.upsert_game({"universe_id": 11, "title": "Grower", "ccu": 496, "visits": 38_568})
     assert int(scout.load_table().set_index("universe_id").loc[11]["tier"]) == 5
     row0 = scout.load_table().set_index("universe_id").loc[11]
-    # A T5 game that 2.4x'd while sitting in the weekly bucket.
+    # A T5 game that 2.4x'd between its scheduled refreshes.
     result = scout.upsert_rotrends_snapshot({
         11: {"ts": "2026-10-09", "ccu": 1198, "like_ratio": 0.95, "earning_rank": 17},
     })
@@ -904,7 +904,7 @@ def test_stuck_hidden_row_gets_ce_rescue_not_just_hot_tiers(tmp_path, monkeypatc
     monkeypatch.setattr(cx_client, "fetch_universes", fake_fetch)
     monkeypatch.setattr(
         scout, "load_tier_refresh_ids",
-        lambda **kw: {"ids": [10408282469, 99900000001], "groups": {"weekly": 2},
+        lambda **kw: {"ids": [10408282469, 99900000001], "groups": {"t5": 2},
                       "tier_counts": {}, "ring_fenced": False},
     )
     monkeypatch.setattr(scout, "fetch_game_metrics", lambda ids: {})  # BOTH missed
@@ -1196,10 +1196,11 @@ def test_prune_clears_queue_memory_for_rediscovery(tmp_path):
 
 
 def test_scheduler_picks_tiers_by_cadence_and_orders_first_in_line(tmp_path):
-    """T1–T4 go due on WALL-CLOCK staleness (1h/2h/4h/6h) rather than sync
+    """T1–T7 go due on WALL-CLOCK staleness (0.5h/1h/2h/3h) rather than sync
     counts, so the scheduler behaves identically whether hydration runs
-    every 5 minutes or every 30. Weekly T5–T7 and the T8 rotation stay on
-    their wall-clock / positional buckets."""
+    every 5 minutes or every 30. T5/T6 ride the hourly cadence and T7 the
+    3h one (2026-10-10 weekly-bucket retirement); the T8 rotation stays on
+    its positional bucket."""
     db = str(tmp_path / "t.db")
     scout = RobloxPlatformScout(db_path=db)
     bucket_count = scout_core.TIER8_ROTATION_DAYS
@@ -1214,12 +1215,12 @@ def test_scheduler_picks_tiers_by_cadence_and_orders_first_in_line(tmp_path):
     with sqlite3.connect(db) as conn:
         for uid, tier, hours_ago in [
             (1, 1, 2.0),        # T1 stale past 0.5h -> due
-            (2, 2, 1.5),        # T2 stale past 1h -> due (tightened cadence)
+            (2, 2, 1.5),        # T2 stale past 1h -> due
             (3, 3, 1.5),        # T3 stale under 2h -> NOT due yet
             (4, 4, 3.5),        # T4 stale past 3h -> due
-            (5, 5, 2.0),        # T5–T7: weekly cutoff governs, fresh -> not due
-            (6, 6, 2.0),
-            (7, 7, 2.0),
+            (5, 5, 1.5),        # T5 stale past 1h -> due (hourly retiree)
+            (6, 6, 0.5),        # T6 fresh -> NOT due yet
+            (7, 7, 2.0),        # T7 stale under 3h -> NOT due yet
             (t8_in, 0, 2.0),    # in this rotation bucket -> due
             (t8_out, 0, 2.0),   # outside the bucket -> not due
         ]:
@@ -1230,29 +1231,28 @@ def test_scheduler_picks_tiers_by_cadence_and_orders_first_in_line(tmp_path):
             )
 
     due = set(scout.load_tier_refresh_ids(batch_size=50, budget_batches=10)["ids"])
-    assert {1, 2, 4, t8_in}.issubset(due)   # stale T1 + T2 + T4 + the T8 slice
+    assert {1, 2, 4, 5, t8_in}.issubset(due)   # stale T1 + T2 + T4 + T5 + the T8 slice
     assert 3 not in due                     # under its 2h staleness line yet
-    assert 5 not in due and 6 not in due and 7 not in due
+    assert 6 not in due and 7 not in due    # T6 under 1h, T7 under 3h
     assert t8_out not in due                # outside this rotation bucket
 
-    # And once T2/T3 cross their staleness line, they come due too.
+    # And once the under-line tiers cross their staleness line, they come due too.
     with sqlite3.connect(db) as conn:
-        for uid in (2, 3):
+        for uid in (3, 6, 7):
             conn.execute(
                 "UPDATE game_analytics SET last_updated = ? WHERE universe_id = ?",
                 (ts(12.0), uid),
             )
     due2 = set(scout.load_tier_refresh_ids(batch_size=50, budget_batches=10)["ids"])
-    assert {2, 3}.issubset(due2)
+    assert {3, 6, 7}.issubset(due2)
 
 
-def test_scheduler_weekly_bucket_and_t8_rotation(tmp_path):
-    """T5–T7 rehydrate only after the 3-day wall-clock cutoff (tightened
-    from 7d, 2026-10-09); tier-0 rows rotate through the T8 slice by
-    universe_id mod bucket count."""
+def test_scheduler_per_tier_cadence_and_t8_rotation(tmp_path):
+    """T5 due on the 1h cadence, T6/T7 still fresh; tier-0 rows rotate
+    through the T8 slice by universe_id mod bucket count."""
     db = str(tmp_path / "t.db")
     scout = RobloxPlatformScout(db_path=db)
-    stale = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 4 * 86400))
+    stale = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 2 * 3600))
     fresh = time.strftime("%Y-%m-%d %H:%M:%S")
     with sqlite3.connect(db) as conn:
         conn.execute(
@@ -1273,7 +1273,7 @@ def test_scheduler_weekly_bucket_and_t8_rotation(tmp_path):
         )
 
     schedule = scout.load_tier_refresh_ids(batch_size=50, budget_batches=10)
-    assert 21 in schedule["ids"]                       # weekly: stale T5 due
+    assert 21 in schedule["ids"]                       # T5: 2h-old, past its 1h line
     assert 22 not in schedule["ids"]                   # fresh T6: not due
 
     bucket_count = scout_core.TIER8_ROTATION_DAYS

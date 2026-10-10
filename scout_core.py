@@ -387,6 +387,9 @@ TIER_CADENCE_SYNC: Dict[int, Optional[int]] = {
     # tier: re-hydrate every N syncs; None = weekly bucket (7-day wall clock).
     # Kept for UI/summary compatibility; the live scheduler uses the
     # wall-clock hours below so cadence holds at any hydrator frequency.
+    # 2026-10-10: the weekly bucket is retired for ALL tiers — the live
+    # scheduler reads TIER_CADENCE_WALL_HOURS only. These entries stay to
+    # keep counts/UI stable; 5–7 remain None (no sync-count semantics).
     1: 1,
     2: 1,
     3: 2,
@@ -396,18 +399,23 @@ TIER_CADENCE_SYNC: Dict[int, Optional[int]] = {
     7: None,
 }
 
-# Live refresh cadences for T1–T4, expressed in wall-clock hours. Floats so a
+# Live refresh cadences for T1–T7, expressed in wall-clock hours. Floats so a
 # 5-minute hydrator can subdivide. Semantics: a tier's games enter the refresh
 # queue when last_updated is older than the tier's hours (most-stale first).
 TIER_CADENCE_WALL_HOURS: Dict[int, float] = {
     # Tightened 2026-10-09 (cadence-utilization audit): the hidden section
     # freed ~90% of the demand pool, so steady-state hydration even at these
-    # faster cadences stays ~42 games/tick — under 1% of the 7,500/tick
-    # budget and a fraction of the per-IP 429 headroom (~1 req/s sustained).
+    # faster cadences stays well under budget (roblox batched 50/call).
+    # Extended to all tiers 2026-10-10 (weekly-bucket retirement): T5/T6 at
+    # 1h, T7 at T4's 3h — measured demand ~2,330 universes/30-min pass ≈ 54
+    # batches of the 150 budget (36%), no third-party hydration source.
     1: 0.5,   # hot watchlist: refreshed within the half hour
     2: 1.0,
     3: 2.0,
     4: 3.0,
+    5: 1.0,   # 2026-10-10: was 3-day weekly bucket; CCU+visits now hourly
+    6: 1.0,
+    7: 3.0,   # T4 cadence — was 3-day weekly bucket
 }
 # Beyond-gate hidden section (2026-10-09): a catalog game that fell below the
 # strict gate keeps its row (it paid for qualification — re-checking it every
@@ -416,13 +424,10 @@ TIER_CADENCE_WALL_HOURS: Dict[int, float] = {
 # or overflow update shows it back above the gate.
 HIDDEN_GATE_VISITS = EXPANSION_TARGET_VISITS
 HIDDEN_GATE_CCU = EXPANSION_TARGET_CCU
-# Weekly tier refresh (T5–T7) wall-clock promise. Tightened 7d → 3d
-# (2026-10-09 cadence audit): with the hidden section excluding ~12.5K
-# below-gate rows, the above-gate weekly population (11.4K) drains at
-# ~3,807 refills/day ≈ 13/tick — trivially schedulable, and a scout sees
-# a week-old number at most 3 days after a game's last live touch instead
-# of 7. The rotrends daily sweep keeps them fresh anyway (20h staleness
-# target), so this is the cold path's worst case, not its norm.
+# Retired 2026-10-10: the T5–T7 weekly wall-clock bucket is gone — all
+# tiers now live on the per-tier wall-clock staleness scheduler
+# (TIER_CADENCE_WALL_HOURS above). Kept as an alias so out-of-repo imports
+# and older release-store tooling don't break; the scheduler no longer reads it.
 WEEKLY_TIER_REFRESH_DAYS = 3
 TIER8_ROTATION_DAYS = 2  # cold games all revisited within ~2 days
 TIER8_STALE_PRUNE_DAYS = 14  # unobserved 0-CCU fallback prune age
@@ -1883,8 +1888,11 @@ class RobloxPlatformScout:
     ) -> Dict[str, Any]:
         """Pick which known games deserve re-hydration this sync.
 
-        Cadence-ordered: T1–T2 (stale past 1–2 wall-clock hours) → T3 (4h)
-        → T4 (6h) → T5–T7 weekly wall-clock bucket → T8 rotating 2-day slice.
+        Cadence-ordered: T1 (0.5h) → T2/T5/T6 (1h) → T3 (2h) → T4/T7 (3h)
+        → T8 rotating 2-day slice. Every tier rides the same wall-clock
+        staleness mechanism (2026-10-10: the 3-day weekly bucket for T5–T7
+        is retired — T5/T6 poll hourly, T7 on T4's 3h cadence, ~54 batches
+        of the 150-batch pass budget).
         Tiers not due under their cadence cost zero requests. The scheduler
         caps the selected list at ``batch_size * budget_batches`` universes;
         the caller hydrates as many of those as its own budget allows —
@@ -1894,10 +1902,10 @@ class RobloxPlatformScout:
         mod bucket_count) so every sub-threshold game is visited at least once
         every rotation cycle without spending budget on all of them each sync.
         """
-        n = int(sync_number if sync_number is not None else self._sync_seq)  # weekly T5–T7 marker
+        n = int(sync_number if sync_number is not None else self._sync_seq)
         cap = max(0, int(batch_size) * int(budget_batches))
         groups: Dict[str, List[int]] = {
-            "t1_t2": [], "t2": [], "t3": [], "t4": [], "weekly": [], "t8": []
+            "t1_t2": [], "t2": [], "t3": [], "t4": [], "t5": [], "t6": [], "t7": [], "t8": []
         }
         counts: Dict[int, int] = {}
         try:
@@ -1943,23 +1951,13 @@ class RobloxPlatformScout:
                     (_stale(TIER_CADENCE_WALL_HOURS[2]),),
                     "last_updated ASC, universe_id ASC",
                 )
-                for key, tier in (("t3", 3), ("t4", 4)):
+                for key, tier in (("t3", 3), ("t4", 4), ("t5", 5), ("t6", 6), ("t7", 7)):
                     groups[key] = ids_for(
                         f"tier = {tier}" + HIDE
                         + " AND COALESCE(last_updated, '1970-01-01') <= ?",
                         (_stale(TIER_CADENCE_WALL_HOURS[tier]),),
                         "last_updated ASC, universe_id ASC",
                     )
-                weekly_cutoff = time.strftime(
-                    "%Y-%m-%d %H:%M:%S",
-                    time.gmtime(time.time() - WEEKLY_TIER_REFRESH_DAYS * 86400),
-                )
-                groups["weekly"] = ids_for(
-                    "tier IN (5, 6, 7)" + HIDE
-                    + " AND COALESCE(last_updated, '1970-01-01') < ?",
-                    (weekly_cutoff,),
-                    "last_updated ASC, universe_id ASC",
-                )
                 # T8 rotating bucket: epoch-days // rotation mod bucket_count
                 # picks this sync's slice; ordering by universe_id keeps the
                 # slice deterministic across restarts.
@@ -1975,19 +1973,19 @@ class RobloxPlatformScout:
             log.debug("tier scheduler failed: %s", exc)
         selected: List[int] = []
         hot_demand = 0
-        for key in ("t1_t2", "t2", "t3", "t4"):
+        for key in ("t1_t2", "t2", "t3", "t4", "t5", "t6", "t7"):
             hot_demand += len(groups[key])
-        # Ring-fence (HYDRATION_SOURCES.md Phase 0): the Roblox batch budget
-        # belongs to the hot tiers first. When hot demand reaches the cap,
-        # weekly/cold games are NOT scheduled into this sync — they roll
-        # over until a sync has spare capacity. Rotrends owns the cold-tail
-        # daily sweep, so a cold game waiting an extra tick loses far less
-        # than a hot game waiting past its cadence promise (the old
-        # first-come order leaked ~60% of every run's slots to weekly/cold
-        # while T2/T4 ran hours overdue).
+        # Priority order = cadence tightness. T1 (0.5h) first, then the
+        # hourly tiers (T2/T5/T6), then 2h/3h tiers, then the T8 rotation.
+        # Either way every group feeds the SAME budget; "ring-fenced" here
+        # means the due-universe cap — with cadences spread over 0.5–3h the
+        # measured steady-state demand (~2,330/pass ≈ 54 batches) sits far
+        # under it, so overflow only appears during demand spikes.
         hot_ids = list(
             dict.fromkeys(
-                groups["t1_t2"] + groups["t2"] + groups["t3"] + groups["t4"]
+                groups["t1_t2"] + groups["t2"]
+                + groups["t5"] + groups["t6"]
+                + groups["t3"] + groups["t4"] + groups["t7"]
             )
         )
         if len(hot_ids) >= cap:
@@ -1995,7 +1993,7 @@ class RobloxPlatformScout:
         else:
             room = cap - len(hot_ids)
             leftover: List[int] = []
-            for key in ("weekly", "t8"):
+            for key in ("t8",):
                 leftover.extend(groups[key])
             selected = hot_ids + list(dict.fromkeys(leftover))[:room]
         selected = list(dict.fromkeys(selected))[:cap]
@@ -4246,18 +4244,16 @@ class RobloxPlatformScout:
         """Per-tier staleness SLO check (Phase 5): worst age per tier bucket.
 
         A tier's games are 'overdue' when the freshest sample is older than
-        cadence × 3. T5–T7 compare against the WEEKLY promise (7d × 3);
-        rotrends_daily rows count toward their freshness, so a healthy
-        sweep keeps them green. '''Never raises'''.
+        cadence × 3. Every tier T1–T7 compares against its own
+        TIER_CADENCE_WALL_HOURS promise (2026-10-10: T5–T7 left the weekly
+        bucket, so their SLO is now hours, not days);
+        rotrends_daily rows still count toward freshness. '''Never raises'''.
         """
         now = time.time()
         out: Dict[str, Any] = {}
         tiers = [
-            ("T1", "tier = 1", TIER_CADENCE_WALL_HOURS[1] * 3),
-            ("T2", "tier = 2", TIER_CADENCE_WALL_HOURS[2] * 3),
-            ("T3", "tier = 3", TIER_CADENCE_WALL_HOURS[3] * 3),
-            ("T4", "tier = 4", TIER_CADENCE_WALL_HOURS[4] * 3),
-            ("weekly", "tier IN (5, 6, 7)", WEEKLY_TIER_REFRESH_DAYS * 24 * 3),
+            (f"T{t}", f"tier = {t}", TIER_CADENCE_WALL_HOURS[t] * 3)
+            for t in sorted(TIER_CADENCE_WALL_HOURS)
         ]
         try:
             with self._connect() as conn:

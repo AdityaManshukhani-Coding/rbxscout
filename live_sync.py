@@ -88,7 +88,8 @@ def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float, mode: st
     sched = scan.get("tier_schedule") or {}
     if sched:
         print(f"refresh queue     : T1 {sched.get('t1_t2', 0):,} · T2 {sched.get('t2', 0):,} · T3 {sched.get('t3', 0):,} · "
-              f"T4 {sched.get('t4', 0):,} · weekly {sched.get('weekly', 0):,} · T8 {sched.get('t8', 0):,}")
+              f"T4 {sched.get('t4', 0):,} · T5 {sched.get('t5', 0):,} · T6 {sched.get('t6', 0):,} · "
+              f"T7 {sched.get('t7', 0):,} · T8 {sched.get('t8', 0):,}")
     counts = scan.get("tier_counts") or {}
     if counts:
         tiers = " · ".join(f"T{t}: {n:,}" for t, n in sorted(counts.items()))

@@ -279,11 +279,14 @@ def select_due_universe_ids(
     tiers: Optional[Tuple[int, ...]] = (5, 6, 7),
     limit: int = 0,
 ) -> List[int]:
-    """Tier-t5..7 game IDs whose LAST ccu_history sample is > max_hours old.
+    """Tier-t5..7 (+ hidden rows in those tiers) game IDs whose LAST
+    ccu_history sample is > max_hours old.
 
     Staleness is read from ccu_history (ANY source — a rotrends_daily row
-    from today already satisfies the daily promise). T0–T4 are excluded:
-    their cadence is measured in HOURS and belongs to the live channels.
+    from today already satisfies the freshness check). T0–T7 are excluded
+    (2026-10-10: every gated tier rides the live wall-clock scheduler —
+    T5/T6 hourly, T7 3h — so the sweep's selection is effectively the
+    hidden/no-tier population plus any row whose history is missing).
 
     Hidden (below-gate) rows are deliberately NOT excluded: the sweep is
     their only cheap observation channel, and hidden-recovery watch lives

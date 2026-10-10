@@ -125,11 +125,17 @@ The initial idea mapped Rotrends → hot games. The measured data flips it: Rotr
 | Store segments | Primary source | Backup / overflow | Cadence target |
 |---|---|---|---|
 | **T0 (new/unclassified)** | Roblox live (first in line — unchanged) | CE overflow | first hydration ASAP |
-| **T1–T4 ("hot", 1,683 games)** | **Roblox live**, budget ring-fenced to hot tiers | **CE live overflow** on 429-window exhaustion | ≤6h promise → target **10–20 min** |
-| **T5–T6 ("weekly", 4,888)** | **Rotrends daily sweep** | Roblox leftover capacity if any | daily (better than today's weekly) |
-| **T7 ("cold", 18,195)** | **Rotrends daily sweep** | Roblox leftover | daily (better than 2d pull rotation) |
+| **T1–T7 (all gated tiers, 21,287 games)** | **Roblox live**, wall-clock staleness scheduler (T1 0.5h, T2/T5/T6 1h, T3 2h, T4/T7 3h) | **CE live overflow** on 429-window exhaustion | per-tier cadence, see table above |
+| **Hidden (below-gate rows)** | Rotrends daily sweep (hidden-recovery watch) | — | daily; auto-reveal at CCU ≥ 25 |
 | **Newly discovered games** | Roblox first touch (unchanged) + **Rotrends 90-day backfill** immediately on discovery | — | day-one full trend chart |
 | **Enrichment (all tiers)** | CE + Rotrends extras stored alongside: `globalRank`, `momentum`, `scammerFlag`, `earning_rank`, `like_ratio` trend | — | piggybacked, extra cost ~0 |
+
+> 2026-10-10 cadence change: the T5–T7 weekly wall-clock bucket is retired.
+> Every tier T1–T7 hydrates on its own wall-clock staleness line via the same
+> `last_updated ASC` mechanism (T5/T6 hourly, T7 on T4's 3h cadence). Measured
+> demand: ~2,330 universes/30-min pass ≈ 54 of 150 batches (36%) — no
+> third-party hydration source needed. The rotrends daily sweep keeps its
+> history/enrichment/hidden-watch role but no longer owns T5–T7 freshness.
 
 ### 3.2 Rate budgets (the numbers that make it work)
 
@@ -203,6 +209,8 @@ Phased so each step ships value alone. All phases are additive; the Roblox hydra
   as its freshest daily CCU crosses `HIDDEN_RECOVERY_MIN_CCU` (= the 25 gate floor) — `hot_refresh_batch`
   live-refreshes it, `upsert_game` re-evaluates the merged gate, and the row unhides itself within ~1 day of
   a real recovery, at near-zero marginal cost.
+- 2026-10-10 note: T5–T7 join the hourly/3h live scheduler directly, so the sweep no longer carries their
+  live-freshness duty; its role narrows to history backfill, enrichment, and the hidden-recovery watch.
 - Backfill pass (same module, second callable): for any game lacking ≥5 history rows, fetch up to 90 days and insert backdated rows. Run for newly discovered games inside the expander's landing path (`_enqueue_discovery`/expander success path), and for the 8,930 currently shallow games (≤5 samples) in a slow catch-up.
 - Orchestration: extend `expander.yml` (already shares the `rbxscout-sync` mutex) with a step gated at `:45` runs, or a new workflow file dispatched by the Cloudflare worker once daily (`wrangler.toml` cron variants). Daily, not per-5-min.
 - Add `schema_patch` for `ccu_history.source` (default `'roblox_live'` for existing rows; new index) consistent with how past schema versions were migrated in `_init_sqlite`.
