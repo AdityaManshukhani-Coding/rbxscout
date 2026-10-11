@@ -576,18 +576,25 @@ def _workflow_policy_test(env, *, expect_routes="", expect_fail=False):
     live pipeline; pool fixtures are written into a temp cwd as
     atlas_proxies.txt exactly as the validate step produces them.
     """
+    import re
     import subprocess
     import tempfile
     from pathlib import Path
 
-    import yaml
-
     pool, token = env
     workflow_path = Path(__file__).resolve().parent.parent / ".github/workflows/expander.yml"
-    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
-    steps = workflow["jobs"]["expand"]["steps"]
-    harvest = next(step for step in steps if "Run expander" in str(step.get("name", "")))
-    block = harvest["run"]
+    text = workflow_path.read_text(encoding="utf-8")
+    # Extract the "Run expander" step's run: block WITHOUT PyYAML — CI's
+    # requirements.txt deliberately doesn't carry it, and these tests must
+    # run anywhere the repo's own env does.
+    match = re.search(
+        r"name: Run expander \(Atlas harvest \+ queue drain\)\n"
+        r"(?:.*\n)*?        run: \|\n"
+        r"((?:          .*\n)+)",
+        text,
+    )
+    assert match, "expander.yml: 'Run expander' step run-block not found"
+    block = "\n".join(line[10:] for line in match.group(1).splitlines())
 
     lines = []
     for line in block.splitlines():
