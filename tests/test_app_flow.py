@@ -1011,9 +1011,11 @@ def test_game_search_filters_and_resets(monkeypatch, tmp_path):
     page' notice — the table itself is intentionally absent from the render
     tree, so a non-match must be asserted via the raw html/info state (not
     _table_html, which hard-requires a table). A match with a real no-match
-    competitor, then clearing, proves BOTH directions of the filter on a
-    genuine rerun. The match is literal and case-insensitive
-    (apply_filters regex=False), so punctuation-heavy titles stay safe."""
+    competitor proves BOTH directions of the filter on a genuine rerun.
+    The match is literal and case-insensitive (apply_filters regex=False),
+    so punctuation-heavy titles stay safe. Note (2026-10-11): FULL-clear now
+    goes back to the home state — that path is covered by
+    test_game_search_clear_returns_to_home_state with the catalog stubbed."""
     import pandas as pd
     frame = pd.concat([_demo_frame(), _demo_two_row_frame()], ignore_index=True)
     at = _fresh_app()
@@ -1050,12 +1052,143 @@ def test_game_search_filters_and_resets(monkeypatch, tmp_path):
     assert "Blox Fruits" in table_html
     assert "Pls Donate" not in table_html
 
-    # Clearing restores the full filtered result set.
+    # Full-clear → back to the home state is covered (deterministically, with
+    # the catalog reader stubbed) by
+    # test_game_search_clear_returns_to_home_state below. A whitespace-only
+    # value is ALSO treated as cleared by on_game_search_change (strip →
+    # empty), so running that turn here would rescan the REAL local catalog
+    # and produce cross-test dependent data — the test stops short.
+    # Update docstring note: the clearing semantics are 'blank box = home'.
+
+
+def test_game_search_clear_returns_to_home_state(monkeypatch, tmp_path):
+    """2026-10-11 request: type something, delete all the text — the search
+    filter narrows to nothing AND the stored result set is dropped; the
+    pending initial scan re-runs on this very rerun, so after the run the
+    session carries a FRESH synced result at page 1 (the 'home' state a
+    returning scout sees), not the narrowed table from the search. Only a
+    genuinely-empty value triggers the reset; any residual text filters only."""
+    import pandas as pd
+
+    calls: list[dict] = []
+
+    def _fake(self, min_visits=0, min_ccu=0):
+        calls.append({"min_visits": min_visits, "min_ccu": min_ccu})
+        return pd.concat([_demo_frame(), _demo_two_row_frame()], ignore_index=True)
+
+    monkeypatch.setattr(scout_core.RobloxPlatformScout, "load_catalog_matches", _fake)
+
+    at = _fresh_app()
+    at.session_state["onboarding_complete"] = True
+    at.session_state["pending_initial_scan"] = False
+    at.session_state["welcome_scan_started"] = True
+    at.session_state["data"] = _demo_frame()
+    at.session_state["source"] = "demo"
+    at.run()
+    assert not at.exception
+
+    search = at.sidebar.text_input(key="game_search")
+
+    # A non-clearing mid-edit value keeps the narrowed table (no rescan).
+    search.set_value("blox").run()
+    assert not at.exception
+    assert at.session_state["pending_initial_scan"] is False
+    assert "Blox Fruits" in _table_html(at)
+    assert len(calls) == 0
+
+    # Removing ALL the text goes back home: result set dropped + rescan.
     search.set_value("").run()
     assert not at.exception
+    assert at.session_state["pending_initial_scan"] is False, "scan consumed"
+    assert at.session_state["welcome_scan_started"] is True
+    assert at.session_state["source"] == "live"
+    assert at.session_state["contact_page"] == 1
+    assert len(calls) == 1, calls
+    # The rebuilt table is the fresh synced set: BOTH demo games are back.
+    reloaded = _table_html(at)
+    assert "Blox Fruits" in reloaded
+    assert "Pls Donate" in reloaded
+
+
+def test_potential_pill_colors_high_green_medium_orange_low_red():
+    """2026-10-11 palette: High = vibrant light green, Medium = orange,
+    Low = red — asserted on the shipped CSS classes, since AppTest can only
+    see the class names the cells carry, not the colors."""
+    import app as app_module
+
+    css = app_module.TABLE_STYLE
+    assert "#7CFC7C" in css and "ss-potential-high { color: #7CFC7C" in css
+    assert "ss-potential-medium { color: #FF6E01" in css
+    assert "ss-potential-low { color: #EF4444" in css
+
+
+# --------------------------------------------------------------------------- #
+# Potential filter (2026-10-11 request): a sidebar multiselect that keeps
+# only High / Medium / Low games — combinable with the Discord filter
+# ('high potential with Discord linked'). Same thresholds as the column.
+# --------------------------------------------------------------------------- #
+
+
+def _two_potential_frame() -> pd.DataFrame:
+    """Two games straddling the 2.0 potential bar (per 1,000 visits)."""
+    strong = _demo_frame().iloc[0].copy()  # 1000 CCU / 500k visits → 2.0 High
+    strong["visits"] = 500_000
+    weak_row = strong.copy()
+    weak_row["universe_id"] = 3
+    weak_row["root_place_id"] = 4924922224
+    weak_row["title"] = "Shaky Game"
+    weak_row["ccu"] = 30
+    weak_row["visits"] = 50_000  # 0.6 per 1k → Low
+    return pd.DataFrame([strong, weak_row]).reset_index(drop=True)
+
+
+def test_sidebar_has_potential_multiselect():
+    """The Scout filters area carries a 'Potential' multiselect on the main
+    view — and only there (the New & Upcoming watchlist has no filters)."""
+    at = _render_dashboard()
+    assert not at.exception
+    widgets = [m for m in at.sidebar.multiselect if (m.key or "") == "potential_filter"]
+    assert len(widgets) == 1, at.sidebar.multiselect
+    assert widgets[0].label == "Potential"
+    assert widgets[0].options == ["High", "Medium", "Low"]
+
+
+def test_potential_filter_narrows_rows(monkeypatch, tmp_path):
+    """Selecting High keeps only games at ≥ 2.0 CCU per 1,000 visits; High
+    combined with 'Discord available' proves the user's exact request —
+    'filter High potential with discord linked' — as ONE sidebar state."""
+    at = _fresh_app()
+    at.session_state["onboarding_complete"] = True
+    at.session_state["pending_initial_scan"] = False
+    at.session_state["welcome_scan_started"] = True
+    at.session_state["data"] = _two_potential_frame()
+    at.session_state["source"] = "demo"
+    at.run()
+    assert not at.exception
     table_html = _table_html(at)
-    assert "Blox Fruits" in table_html
-    assert "Pls Donate" in table_html
+    assert "Blox Fruits" in table_html and "Shaky Game" in table_html
+
+    widget = at.sidebar.multiselect(key="potential_filter")
+    widget.set_value(["High"]).run()
+    assert not at.exception
+    table_html = _table_html(at)
+    assert "Blox Fruits" in table_html, "2.0 ratio stays"
+    assert "Shaky Game" not in table_html, "0.6 ratio drops"
+
+    # The row filter composes with the Discord filter (the user's words:
+    # 'filter High potential with discord linked etc.').
+    at.sidebar.radio(key="discord_filter_radio").set_value("Discord Available (True)").run()
+    assert not at.exception
+    table_html = _table_html(at)
+    assert "Blox Fruits" in table_html, "a Discord-linked High game survives"
+    assert "Shaky Game" not in table_html
+
+    # Emptying the multiselect restores the full result set.
+    at.sidebar.multiselect(key="potential_filter").set_value([]).run()
+    at.sidebar.radio(key="discord_filter_radio").set_value("All Games").run()
+    assert not at.exception
+    table_html = _table_html(at)
+    assert "Blox Fruits" in table_html and "Shaky Game" in table_html
 
 
 # --------------------------------------------------------------------------- #
@@ -1135,7 +1268,6 @@ def test_sidebar_targets_share_one_session_state_with_welcome_flow(monkeypatch, 
     never disagree because there is only one place the values live.
     """
     monkeypatch.setenv("SS_PROFILE_DIR", str(tmp_path / "profiles"))
-    saved_before = False
 
     at = _fresh_app()
     at.run()
@@ -1147,7 +1279,6 @@ def test_sidebar_targets_share_one_session_state_with_welcome_flow(monkeypatch, 
     assert not at.exception
     assert at.session_state["target_min_visits"] == 50_000
     assert at.session_state["target_min_ccu"] == 75
-    saved_before = True
 
     # The capture-on-start button is what actually persists the welcome
     # targets — and the sidebar keeps rendering the SAME keys after it.
@@ -1173,4 +1304,3 @@ def test_sidebar_targets_share_one_session_state_with_welcome_flow(monkeypatch, 
     assert not at.exception
     assert at.session_state["target_min_visits"] == 100_000
     assert at.session_state["target_min_ccu"] == 125
-    assert saved_before

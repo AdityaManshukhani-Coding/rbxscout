@@ -4501,6 +4501,37 @@ SOCIAL_FILTER_ALL = "All"
 SOCIAL_FILTER_ON = "Social Links On"
 SOCIAL_FILTER_OFF = "Social Links Off"
 
+# Potential verdict levels (2026-10-10 dashboard column). The filter engine
+# needs them too so 'High potential with Discord linked' stays one query.
+POTENTIAL_LEVELS = ("High", "Medium", "Low")
+POTENTIAL_RATIO_HIGH = 2.0   # CCU per 1,000 visits ≥ 2.0 → High
+POTENTIAL_RATIO_MEDIUM = 0.9  # ≥ 0.9 up to the High bar → Medium; under → Low
+
+
+def potential_level_for_row(ccu, visits) -> str:
+    """Verdict for one row from CCU per 1,000 visits; "" (empty) when the
+    rows' stats are missing or visits is 0 — such rows carry no verdict and
+    a potential filter can therefore never keep them. Thresholds match the
+    dashboard column exactly (app._potential_level): ≥2.0 High, ≥0.9 Medium,
+    else Low. Never raises."""
+    try:
+        if ccu is None or visits is None:
+            return ""
+        visits_value = float(visits)
+        if visits_value != visits_value or visits_value <= 0:  # NaN or 0
+            return ""
+        ccu_value = float(ccu)
+        if ccu_value != ccu_value:  # NaN
+            return ""
+        ratio = ccu_value / (visits_value / 1000.0)
+    except (TypeError, ValueError):
+        return ""
+    if ratio >= POTENTIAL_RATIO_HIGH:
+        return "High"
+    if ratio >= POTENTIAL_RATIO_MEDIUM:
+        return "Medium"
+    return "Low"
+
 
 def apply_filters(
     df: pd.DataFrame,
@@ -4514,8 +4545,17 @@ def apply_filters(
     discord_filter: str = DISCORD_FILTER_ALL,
     social_filter: str = SOCIAL_FILTER_ALL,
     genres: Optional[List[str]] = None,
+    potentials: Optional[List[str]] = None,
 ) -> pd.DataFrame:
-    """Dynamic multi-variable filter engine over the tracked-games frame."""
+    """Dynamic multi-variable filter engine over the tracked-games frame.
+
+    ``potentials`` (2026-10-11) keeps only rows whose CCU-per-1,000-visits
+    verdict (same thresholds as the dashboard Potential column) is in the
+    list — e.g. ["High"] for 'high potential with Discord linked'. Rows
+    without a usable verdict (missing stats / 0 visits) are dropped whenever
+    the filter is active: they carry no verdict, so they can never be a
+    verdict the scout asked to keep. Unknown level names are ignored.
+    """
     out = df
     if search:
         needle = search.strip().lower()
@@ -4555,4 +4595,11 @@ def apply_filters(
 
     if genres:
         out = out[out["genre"].isin(genres)]
+    levels = [p for p in (potentials or []) if p in POTENTIAL_LEVELS]
+    if levels:
+        verdicts = out.apply(
+            lambda row: potential_level_for_row(row.get("ccu"), row.get("visits")),
+            axis=1,
+        )
+        out = out[verdicts.isin(levels)]
     return out

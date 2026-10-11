@@ -145,6 +145,45 @@ def test_filter_social_and_genre_and_search():
     assert apply_filters(df, search="zzz").empty
 
 
+def test_filter_potential_levels():
+    """The potential filter keeps exactly the rows whose CCU-per-1,000-visits
+    verdict is in the list; rows without a verdict (missing stats / 0
+    visits) can never survive an active potential filter."""
+    df = make_df()
+    # Blox Fruits: 361,900 CCU / 63.8B visits → 0.0057 per 1k → Low.
+    # MM2: 259,200 / 29.8B → 0.0087 per 1k → Low.
+    # Tiny Game: 40 / 20k → 2.0 per 1k → High (exactly the bar).
+    assert set(apply_filters(df, potentials=["Low"])["title"]) == {"Blox Fruits", "MM2"}
+    assert set(apply_filters(df, potentials=["High"])["title"]) == {"Tiny Game"}
+    assert set(apply_filters(df, potentials=["High", "Low"])["title"]) == set(make_df()["title"])
+    assert len(apply_filters(df, potentials=[])) == 3
+    assert len(apply_filters(df, potentials=None)) == 3
+    # Unknown names are inert, not fatal.
+    assert len(apply_filters(df, potentials=["Bogus"])) == 3
+
+    # Missing stats: no verdict → dropped by an active filter, kept otherwise.
+    no_stats = pd.DataFrame([
+        {"title": "Ghost", "creator_name": "x", "visits": None, "ccu": None,
+         "peak_ccu": 0, "has_discord": False, "discord_url": None,
+         "has_social_links": False, "genre": "RPG"},
+        {"title": "MM2", "creator_name": "x", "visits": 29_800_000_000,
+         "ccu": 259_200, "peak_ccu": 300_000, "has_discord": False,
+         "discord_url": None, "has_social_links": False, "genre": "Survival"},
+    ])
+    assert "Ghost" not in set(apply_filters(no_stats, potentials=["Low"])["title"])
+    assert "Ghost" in set(apply_filters(no_stats, potentials=[])["title"])
+
+
+def test_potential_level_for_row_matches_dashboard_thresholds():
+    from scout_core import potential_level_for_row
+
+    assert potential_level_for_row(2_000, 1_000_000) == "High"
+    assert potential_level_for_row(899, 1_000_000) == "Low"
+    assert potential_level_for_row(900, 1_000_000) == "Medium"
+    assert potential_level_for_row(None, 1_000_000) == ""
+    assert potential_level_for_row(5, 0) == ""
+
+
 def test_search_tolerates_regex_metacharacters():
     """Search must match LITERALLY, never as a regular expression.
 

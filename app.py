@@ -2,7 +2,7 @@
 UpScale Scouting Tool - Roblox Game Scouting & Contact Dashboard.
 
 Run: streamlit run app.py
-Deploy marker: table reorder + No-Discord label + literal search + genre-✕ fix (2026-09-23).
+Deploy marker: search-clear-to-home + potential palette recolor + potential filter (2026-10-11).
 """
 
 from __future__ import annotations
@@ -1325,6 +1325,29 @@ def reset_contact_page() -> None:
     st.session_state.active_run_id = None
 
 
+def on_game_search_change() -> None:
+    """Search input callback (2026-10-11): filtering behaves like the page
+    navigation — a new query resets to page 1, and CLEARING the box entirely
+    goes all the way back to the home state: the stored result set is dropped
+    and the automatic initial scan re-runs, exactly like a returning scout's
+    refresh. Only an EMPTY value triggers the reset; typing or narrowing a
+    query merely narrows the loaded set (instant, no rescan). Never raises: a
+    failing reset must not block rendering the (previous) table.
+    """
+    value = st.session_state.get("game_search", "")
+    reset_contact_page()
+    if str(value).strip():
+        return
+    try:
+        st.session_state.data = None
+        st.session_state.source = "live"
+        st.session_state.pending_initial_scan = True
+        st.session_state.welcome_scan_started = False
+        st.session_state.pop("_sync_toast_pending", None)
+    except Exception:
+        pass
+
+
 # --------------------------------------------------------------------------- #
 # Main sidebar controls
 # --------------------------------------------------------------------------- #
@@ -1557,6 +1580,14 @@ if st.session_state.source == "db":
 # rerun per session was pure memory churn under many concurrent users.
 df = st.session_state.data
 source = st.session_state.source
+if df is None:
+    # Search cleared (2026-10-11): the result set was invalidated by
+    # on_game_search_change on a previous rerun but the initial scan hasn't
+    # consumed it yet (a race or a callback-only run). Render the schema-
+    # stable empty frame instead of crashing on a None frame — the pending
+    # scan below fills data on the next run.
+    df = empty_dataframe()
+    source = "live"
 if df.empty:
     if source == "demo":
         df = demo_dataframe()
@@ -1590,6 +1621,7 @@ if is_watch_view:
     )
     search = ""
     selected_genres = []
+    selected_potentials = []
 else:
     st.sidebar.header("Scout filters")
     # Find a game by name (2026-10-10): matches title OR creator,
@@ -1600,8 +1632,8 @@ else:
     search = st.sidebar.text_input(
         "Search games",
         key="game_search",
-        help="Type part of a game name (or creator). Filters apply instantly.",
-        on_change=reset_contact_page,
+        help="Type part of a game name (or creator). Filters apply instantly — clear the box to go back home.",
+        on_change=on_game_search_change,
     )
 
     # Discord contact filter (re-added 2026-09-24). Applies AFTER metric
@@ -1616,6 +1648,20 @@ else:
              "Unchecked games disappear from both narrowed views.",
     )
     selected_genres = []
+    # Potential verdict filter (2026-10-11): pick any of High / Medium /
+    # Low and ONLY those games stay — e.g. 'High potential with Discord
+    # linked' is High + 'Discord available'. Thresholds match the column:
+    # ratio ≥ 2.0 High, ≥ 0.9 Medium, else Low.
+    selected_potentials = st.sidebar.multiselect(
+        "Potential",
+        options=list(_scout_core.POTENTIAL_LEVELS),
+        default=[],
+        key="potential_filter",
+        help="Keep only games at the chosen potential (CCU per 1,000 "
+             "visits: High ≥ 2.0, Medium 0.9–2.0, Low < 0.9). Empty = all. "
+             "Combine with the Discord filter, e.g. High + 'Discord "
+             "available'.",
+    )
 
 # Apply metric + Discord-availability filters when deciding which contact
 # page to fetch. The Discord filter MUST run before the page slice: applied
@@ -1629,6 +1675,7 @@ metric_filtered = apply_filters(
     min_ccu=eff_min_ccu,
     genres=selected_genres,
     discord_filter=discord_view,
+    potentials=selected_potentials,
 )
 
 signature = "|".join([
@@ -1637,6 +1684,7 @@ signature = "|".join([
     str(min_ccu),
     ",".join(selected_genres),
     discord_view,
+    ",".join(selected_potentials),
 ])
 if signature != st.session_state.get("filter_signature"):
     st.session_state.filter_signature = signature
@@ -1781,13 +1829,13 @@ TABLE_STYLE = _MOTION_CORE + """
               color var(--motion-fast) linear;
 }
 .ss-genre:hover { border-color: rgba(255, 110, 1, 0.45); color: #E7ECF3; }
-/* Potential (2026-10-10): CCU per 1,000 visits as a level pill. ss-genre
-   supplies the pill shape; these tints carry the verdict — Brand Orange =
-   high, bright ink = medium, muted = low (matches the up/down arrow use of
-   the same palette). */
-.ss-potential-high { color: #FF6E01; border-color: rgba(255, 110, 1, 0.5); }
-.ss-potential-medium { color: #E7ECF3; }
-.ss-potential-low { color: #9AA4B2; }
+/* Potential (2026-10-11 re-color): CCU per 1,000 visits as a level pill
+   (level thresholds unchanged: Low < 0.9, Medium 0.9–2.0, High ≥ 2.0).
+   ss-genre supplies the pill shape; tints per the scout's palette: vibrant
+   light green = high, Brand Orange = medium, red = low. */
+.ss-potential-high { color: #7CFC7C; border-color: rgba(124, 252, 124, 0.55); background: rgba(124, 252, 124, 0.08); }
+.ss-potential-medium { color: #FF6E01; border-color: rgba(255, 110, 1, 0.5); }
+.ss-potential-low { color: #EF4444; border-color: rgba(239, 68, 68, 0.5); background: rgba(239, 68, 68, 0.07); }
 .ss-up { color: #FF6E01; white-space: nowrap; }
 .ss-down { color: #EF4444; white-space: nowrap; }
 .ss-game { display: inline-flex; align-items: center; gap: 9px; text-decoration: none; color: inherit; }
