@@ -8,6 +8,7 @@ and the kill switch. All HTTP is faked — the module's live behavior was
 proven separately by the 2026-09-19 spike (3 pages, 150 IDs, 98 new).
 """
 
+import os
 import sqlite3
 
 import pytest
@@ -534,13 +535,18 @@ def test_scrape_do_token_inserted_after_pool_before_direct(scout, monkeypatch):
     ]
 
 
-def test_scrape_do_token_alone_never_becomes_primary(scout, monkeypatch):
-    """A token with no proxy pool keeps the default [direct] pool: the
-    template must never be the first entry, or every fetch would burn paid
-    credits (the laptop exports no pool and must stay on the home IP)."""
+def test_scrape_do_token_alone_now_becomes_primary(scout, monkeypatch):
+    """2026-10-11 always-on request: a token with NO free pool now puts the
+    template FIRST in the pool and keeps ``direct`` as the terminal
+    fallback — an exhausted token degrades to direct (403s, aborts) rather
+    than silently skipping the harvest. The laptop opts out
+    (RBXSCOUT_SCRAPE_DO_LOCAL_DIRECT=1) so the home IP stays free."""
     monkeypatch.delenv("RBXSCOUT_SEARCH_PROXY_URLS", raising=False)
     monkeypatch.setenv("RBXSCOUT_SCRAPE_DO_TOKEN", "tok-123")
-    assert scout._atlas_proxy_pool() == ["direct"]
+    assert scout._atlas_proxy_pool() == [
+        "https://api.scrape.do?token=tok-123&url={url}",
+        "direct",
+    ]
 
 
 def test_scrape_do_token_is_percent_encoded(scout, monkeypatch):
@@ -550,6 +556,97 @@ def test_scrape_do_token_is_percent_encoded(scout, monkeypatch):
     monkeypatch.setenv("RBXSCOUT_SCRAPE_DO_TOKEN", "a/b c+d")
     pool = scout._atlas_proxy_pool()
     assert pool[1] == "https://api.scrape.do?token=a%2Fb%20c%2Bd&url={url}"
+
+
+def test_scrape_do_laptop_opt_out_keeps_direct_only(scout, monkeypatch):
+    """RBXSCOUT_SCRAPE_DO_LOCAL_DIRECT=1 (the laptop): a token with no pool
+    must NOT promote the template — the home IP keeps its free behavior."""
+    monkeypatch.delenv("RBXSCOUT_SEARCH_PROXY_URLS", raising=False)
+    monkeypatch.setenv("RBXSCOUT_SCRAPE_DO_TOKEN", "tok-123")
+    monkeypatch.setenv("RBXSCOUT_SCRAPE_DO_LOCAL_DIRECT", "1")
+    assert scout._atlas_proxy_pool() == ["direct"]
+
+
+def _workflow_policy_test(env, *, expect_routes="", expect_fail=False):
+    """Run expander.yml's REAL route-decision block from the actual YAML.
+
+    The run: block is extracted from .github/workflows/expander.yml so a
+    workflow edit can never silently rot the policy tests. The bash script
+    prints the final RBXSCOUT_SEARCH_PROXY_URLS instead of running the
+    live pipeline; pool fixtures are written into a temp cwd as
+    atlas_proxies.txt exactly as the validate step produces them.
+    """
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    import yaml
+
+    pool, token = env
+    workflow_path = Path(__file__).resolve().parent.parent / ".github/workflows/expander.yml"
+    workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
+    steps = workflow["jobs"]["expand"]["steps"]
+    harvest = next(step for step in steps if "Run expander" in str(step.get("name", "")))
+    block = harvest["run"]
+
+    lines = []
+    for line in block.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("export RBXSCOUT_SEARCH_PROXY_URLS="):
+            # Keep the assignment, drop the export; the value is still
+            # built exactly as the workflow does it.
+            indent = line[: len(line) - len(line.lstrip())]
+            lines.append(f"{indent}RBXSCOUT_SEARCH_PROXY_URLS={stripped.split('=', 1)[1]}")
+        elif "python live_sync.py" in stripped:
+            lines.append(":")  # no-op — never run the real pipeline
+        else:
+            lines.append(line)
+    lines.append('printf \'%s\\n\' "$RBXSCOUT_SEARCH_PROXY_URLS"')
+    script = "\n".join(lines)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        Path(tmp, "atlas_proxies.txt").write_text("\n".join(f"p{i}" for i in range(pool)))
+        child_env = dict(os.environ)
+        child_env["RBXSCOUT_SCRAPE_DO_TOKEN"] = token
+        child_env["RBXSCOUT_SEARCH_PROXY_URLS"] = ""
+        child_env.pop("ATLAS_MIN_PROXY_POOL", None)
+        result = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            cwd=tmp,
+            timeout=10,
+            env=child_env,
+        )
+    if expect_fail:
+        assert result.returncode != 0, (pool, token, result.stdout)
+    else:
+        assert result.returncode == 0, (pool, token, result.stderr)
+        assert expect_routes in result.stdout, (pool, token, result.stdout)
+
+
+def test_workflow_big_pool_harvests_through_proxies():
+    """Pool ≥ 20: the full validated pool routes the harvest; the Scrape.do
+    token (when set) rides as a trailing last-resort failover entry."""
+    _workflow_policy_test(
+        (200, "tok-123"), expect_routes="api.scrape.do?token=tok-123&url={url}"
+    )
+
+
+def test_workflow_tiny_pool_routes_scrape_do():
+    """Pool < 20 with a token: the WHOLE harvest runs through Scrape.do,
+    direct as terminal fallback — no guaranteed-403 direct wave."""
+    _workflow_policy_test(
+        (5, "tok-123"), expect_routes="https://api.scrape.do?token=tok-123&url={url},direct"
+    )
+
+
+def test_workflow_tiny_pool_no_token_fails_loud():
+    """2026-10-11 fail-loud policy: a small pool with NO token refuses to
+    run the harvest (exit non-zero) instead of wasting ~100+ guaranteed-403
+    direct requests and possibly a whole discovery day."""
+    _workflow_policy_test((5, ""), expect_fail=True)
+
 
 
 def test_scrape_do_failover_fires_only_after_proxies_fail(scout, monkeypatch):

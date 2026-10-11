@@ -3456,11 +3456,16 @@ class RobloxPlatformScout:
 
         Setting RBXSCOUT_SCRAPE_DO_TOKEN appends the Scrape.do scraping-API
         template (https://api.scrape.do?token=…&url={url}) as a failover
-        slice immediately BEFORE ``direct`` — but only when the pool already
-        has a real proxy entry to absorb the primary load. A token with no
-        pool stays [direct]: the template must never be the first entry, or
-        every fetch would burn paid credits (the laptop exports no pool, so
-        it keeps its free home-IP behavior even with a token present).
+        slice immediately BEFORE ``direct``. Cloud expander always exports a
+        pool, so there the template is the last-resort after the free pool.
+        With a token set but NO pool in env, the template becomes the FIRST
+        entry (2026-10-11 request): Scrape.do is now the always-on harvest
+        source everywhere the cloud runs, and direct stays as the terminal
+        fallback inside _atlas_fetch so an exhausted token degrades to a
+        guaranteed-403 direct wave (never a silent abort) instead of a lost
+        harvest. The laptop opts out of this paid-ahead behavior locally by
+        setting RBXSCOUT_SCRAPE_DO_LOCAL_DIRECT=1 before running live_sync;
+        the home IP then keeps its previous free behavior.
         """
         raw = os.environ.get(ATLAS_PROXY_URLS_ENV, "")
         entries: List[str] = []
@@ -3474,7 +3479,8 @@ class RobloxPlatformScout:
             else:
                 log.warning("Ignoring malformed Atlas proxy URL: %r", part)
         token = os.environ.get(ATLAS_SCRAPE_DO_TOKEN_ENV, "").strip()
-        if token and any(entry != "direct" for entry in entries):
+        has_pool = any(entry != "direct" for entry in entries)
+        if token and (has_pool or not os.environ.get("RBXSCOUT_SCRAPE_DO_LOCAL_DIRECT")):
             # No trailing slash before ?token — the template keeps the
             # ^https?://[^/\s]+$ shape the operator-var parser accepts, and
             # _atlas_fetch's {url} branch percent-encodes the target into it.
@@ -3482,10 +3488,15 @@ class RobloxPlatformScout:
                 f"https://api.scrape.do?token={quote(token, safe='')}&url={{url}}"
             )
             if template not in entries:
-                if "direct" in entries:
-                    entries.insert(entries.index("direct"), template)
+                if has_pool:
+                    if "direct" in entries:
+                        entries.insert(entries.index("direct"), template)
+                    else:
+                        entries.append(template)
                 else:
-                    entries.append(template)
+                    # Token with NO pool: Scrape.do first (the always-on
+                    # harvest source), direct last as the terminal fallback.
+                    entries.insert(0, template)
         if "direct" not in entries:
             entries.append("direct")
         return entries
