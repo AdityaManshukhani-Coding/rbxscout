@@ -1312,6 +1312,15 @@ def shift_contact_page(delta: int, page_count: int) -> None:
 
 
 def reset_contact_page() -> None:
+    """Back to page 1 of the filtered results (2026-10-10 search fix).
+
+    Called from the scan/sync paths and wired as the game-search and
+    Apply-filters on_click; a bare ``st.session_state.x = 1`` is already safe
+    inside a running script — this is a plain function (no on_click re-targeting)
+    so the callers that pass args keep working. Applies to the CURRENT streamlit
+    widget state (contact_page is a keyed st.number_input): the write happens
+    BEFORE number_input mounts on this rerun, so the next page read honors it.
+    """
     st.session_state.contact_page = 1
     st.session_state.active_run_id = None
 
@@ -1583,7 +1592,17 @@ if is_watch_view:
     selected_genres = []
 else:
     st.sidebar.header("Scout filters")
-    search = ""
+    # Find a game by name (2026-10-10): matches title OR creator,
+    # case-insensitive, literal-only (regex=False in apply_filters) so
+    # punctuation-heavy Roblox titles like "+1 Every Second" can never
+    # break the filter. Applies instantly — on_change resets to page 1 and
+    # the filter signature below keeps the page stable on unrelated reruns.
+    search = st.sidebar.text_input(
+        "Search games",
+        key="game_search",
+        help="Type part of a game name (or creator). Filters apply instantly.",
+        on_change=reset_contact_page,
+    )
 
     # Discord contact filter (re-added 2026-09-24). Applies AFTER metric
     # filtering so it never changes which pages get contact checks; it only
@@ -1762,6 +1781,13 @@ TABLE_STYLE = _MOTION_CORE + """
               color var(--motion-fast) linear;
 }
 .ss-genre:hover { border-color: rgba(255, 110, 1, 0.45); color: #E7ECF3; }
+/* Potential (2026-10-10): CCU per 1,000 visits as a level pill. ss-genre
+   supplies the pill shape; these tints carry the verdict — Brand Orange =
+   high, bright ink = medium, muted = low (matches the up/down arrow use of
+   the same palette). */
+.ss-potential-high { color: #FF6E01; border-color: rgba(255, 110, 1, 0.5); }
+.ss-potential-medium { color: #E7ECF3; }
+.ss-potential-low { color: #9AA4B2; }
 .ss-up { color: #FF6E01; white-space: nowrap; }
 .ss-down { color: #EF4444; white-space: nowrap; }
 .ss-game { display: inline-flex; align-items: center; gap: 9px; text-decoration: none; color: inherit; }
@@ -2215,6 +2241,43 @@ def _is_blowup_row(row: pd.Series) -> bool:
         return False
 
 
+def _potential_level(ccu, visits) -> str:
+    """Potential verdict from CCU per 1,000 visits (2026-10-10 request).
+
+    The bar the scout named: a game should pull about 1 concurrent player
+    for every 1,000 visits it has banked. ratio = ccu / (visits / 1000):
+    below ~0.9 it reads "Low", 0.9 up to ~2.0 "Medium" (the user's "barely
+    edges it at 0.9" counts as medium), and ≥2.0 "High". Games with no
+    (usable) denominator never get a verdict — "-", never a fake Low.
+    Never raises: a missing or non-numeric value degrades to "-".
+    """
+    try:
+        if ccu is None or visits is None or pd.isna(ccu) or pd.isna(visits):
+            return "-"
+        visits_value = float(visits)
+        if visits_value <= 0:
+            return "-"
+        ratio = float(ccu) / (visits_value / 1000.0)
+    except (TypeError, ValueError):
+        return "-"
+    if ratio >= 2.0:
+        return "High"
+    if ratio >= 0.9:
+        return "Medium"
+    return "Low"
+
+
+def _potential_cell(row: pd.Series) -> str:
+    """Potential cell: a genre-style pill (Low / Medium / High), '-' when
+    the stats needed for the verdict are missing."""
+    level = _potential_level(row.get("ccu"), row.get("visits"))
+    if level == "-":
+        return '<span class="ss-none">-</span>'
+    return (
+        f'<span class="ss-genre ss-potential-{level.lower()}">{level}</span>'
+    )
+
+
 def _rating_cell(row: pd.Series) -> str:
     """Rating cell: like ratio as a whole percent; '-' when no votes yet."""
     try:
@@ -2238,16 +2301,16 @@ def render_table(frame: pd.DataFrame) -> None:
     could never display inline. HTML keeps the merged thumbnail+name and
     logo+invite cells working in every Streamlit version.
 
-    Column order (user request 2026-09-23): identity → volume (visits,
-    CCU) → action (Discord, Message) → trend (averages, momentum, rating).
-    Favorites and Peak CCU were dropped at request — lifetime favorites
-    correlate with visits, and current CCU dominates peak CCU for scouting
-    decisions.
+    Column order (user requests 2026-09-23 / 2026-10-10): identity →
+    volume (visits, CCU) → action (Discord, Message, Potential) → trend
+    (averages, momentum, rating). Favorites and Peak CCU were dropped at
+    request — lifetime favorites correlate with visits, and current CCU
+    dominates peak CCU for scouting decisions.
     """
     head = [
         "Game", "Genre", "Total visits", "CCU", "Discord", "Message",
-        "Avg CCU (1d)", "Avg CCU (3d)", "Momentum (1d)", "Rating",
-        "Earnings", "Global rank",
+        "Potential", "Avg CCU (1d)", "Avg CCU (3d)", "Momentum (1d)",
+        "Rating", "Earnings", "Global rank",
     ]
     rows = []
     for _, row in frame.iterrows():
@@ -2262,6 +2325,7 @@ def render_table(frame: pd.DataFrame) -> None:
             f"<td class='ss-num'>{_ccu_cell(row.get('ccu'))}</td>"
             f"<td>{discord_cell_html(row.get('discord_url'))}</td>"
             f"<td>{copy_cell_html(row)}</td>"
+            f"<td>{_potential_cell(row)}</td>"
             f"<td class='ss-num'>{_ccu_cell(row.get('avg_ccu_1d'))}</td>"
             f"<td class='ss-num'>{_ccu_cell(row.get('avg_ccu_3d'))}</td>"
             f"<td class='ss-num'>{_momentum_cell(row.get('momentum_1d'))}</td>"

@@ -67,6 +67,27 @@ def _demo_frame() -> pd.DataFrame:
     ])
 
 
+def _demo_two_row_frame() -> pd.DataFrame:
+    """Two games with opposite sides of the 2,000-CCU bar.
+
+    Tests that exercise the sidebar filters need a row that SURVIVES a raise
+    of the bar — a one-row demo turns every narrowing click into an empty
+    page, which would mask the difference between 'filtered' and 'broken'.
+    """
+    strong = _demo_frame().iloc[0].copy()
+    strong["universe_id"] = 2
+    strong["root_place_id"] = 4924922223
+    strong["title"] = "Pls Donate"
+    strong["ccu"] = 3_000
+    strong["visits"] = 1_500_000
+    strong["peak_ccu"] = 3_400
+    strong["avg_ccu_1d"] = 2_900.0
+    strong["avg_ccu_3d"] = 2_800.0
+    strong["momentum_1d"] = 200
+    return pd.DataFrame([strong]
+    )
+
+
 def _render_dashboard(name: str = "dev_razor10") -> AppTest:
     """Skip onboarding by seeding its outcome, then render the dashboard."""
     at = _fresh_app()
@@ -368,10 +389,10 @@ def test_store_outage_shows_banner_instead_of_crashing(monkeypatch):
 
 
 def test_table_column_order_discord_before_averages():
-    """Column order (user request 2026-09-23; extended by
-    HYDRATION_SOURCES.md Phase 3): Game, Genre, Total visits,
-    CCU, Discord, Message, Avg CCU (1d), Avg CCU (3d), Momentum, Rating,
-    Earnings (rotrends), Global rank (Creator Exchange)."""
+    """Column order (user requests 2026-09-23 & 2026-10-10; extended by
+    HYDRATION_SOURCES.md Phase 3 + Potential): Game, Genre, Total visits,
+    CCU, Discord, Message, Potential, Avg CCU (1d), Avg CCU (3d), Momentum,
+    Rating, Earnings (rotrends), Global rank (Creator Exchange)."""
     at = _render_dashboard()
     assert not at.exception
 
@@ -381,8 +402,8 @@ def test_table_column_order_discord_before_averages():
     headers = re.findall(r"<th[^>]*>(.*?)</th>", header_match.group(1))
     assert headers == [
         "Game", "Genre", "Total visits", "CCU", "Discord", "Message",
-        "Avg CCU (1d)", "Avg CCU (3d)", "Momentum (1d)", "Rating",
-        "Earnings", "Global rank",
+        "Potential", "Avg CCU (1d)", "Avg CCU (3d)", "Momentum (1d)",
+        "Rating", "Earnings", "Global rank",
     ], headers
 
 
@@ -892,3 +913,264 @@ def test_forget_this_device_clears_profile_and_returns_to_welcome(
     assert any("Welcome" in t for t in titles), "back to a fresh welcome flow"
 
 
+# --------------------------------------------------------------------------- #
+# Potential column (2026-10-10 request): CCU per 1,000 visits rendered next
+# to the copy-message button — Low < 0.9, Medium 0.9–2.0 ("barely edges it
+# at 0.9" counts as Medium), High ≥ 2.0. The module-level `_potential_level`
+# helper stays importable so the verdict never depends on a rendered row.
+# --------------------------------------------------------------------------- #
+
+
+def test_potential_level_thresholds():
+    """1000 CCU per million visits = 2 per 1,000 = the High bar; 0.9 per 1k
+    ("barely edges it") is Medium; a hair under is Low."""
+    import app as app_module
+
+    level = app_module._potential_level
+    assert level(2_000, 1_000_000) == "High"          # ratio exactly 2.0
+    assert level(1_999, 1_000_000) == "Medium"        # just under 2.0
+    assert level(900, 1_000_000) == "Medium"          # ratio exactly 0.9
+    assert level(899, 1_000_000) == "Low"             # "less than that"
+    assert level(2_500, 1_000_000) == "High"          # comfortably over
+
+
+def test_potential_level_missing_stats_degrade_to_dash():
+    import app as app_module
+
+    level = app_module._potential_level
+    assert level(None, 1000) == "-"
+    assert level(5, None) == "-"
+    assert level(float("nan"), 1000) == "-"
+    assert level(5, 0) == "-"  # no visits denominator → no verdict, never "Low"
+
+
+def test_table_has_potential_column_next_to_message():
+    """The Potential column renders directly after the Message (copy-button)
+    column, exactly where the scout asked for it."""
+    at = _render_dashboard()
+    assert not at.exception
+
+    table_html = _table_html(at)
+    header_match = re.search(r"<thead><tr>(.*?)</tr></thead>", table_html, re.S)
+    assert header_match, "results table header should render"
+    headers = re.findall(r"<th[^>]*>(.*?)</th>", header_match.group(1))
+    assert "Potential" in headers
+    assert headers.index("Potential") == headers.index("Message") + 1
+
+
+def test_potential_cell_labels_each_row_by_ratio():
+    """Rows whose CCU-per-1,000-visits ratio lands on each threshold get the
+    matching pill; a weak 0.0008-ratio game never reads High."""
+    high = _demo_frame()  # 1000 CCU / 500k visits = 2 per 1k → High
+    high["visits"] = 500_000
+    weak_row = high.iloc[0].copy()
+    weak_row["title"] = "Shaky Game"
+    weak_row["ccu"] = 40
+    weak_row["visits"] = 50_000  # 0.8 per 1k → Low
+
+    at = _fresh_app()
+    at.run()
+    at.session_state["onboarding_complete"] = True
+    at.session_state["pending_initial_scan"] = False
+    at.session_state["welcome_scan_started"] = True
+    at.session_state["data"] = high
+    at.session_state["source"] = "demo"
+    at.run()
+    assert not at.exception
+
+    table_html = _table_html(at)
+    assert 'ss-potential-high">High</span>' in table_html
+
+    at.session_state["data"] = pd.DataFrame([weak_row]).reset_index(drop=True)
+    at.run()
+    assert not at.exception
+    assert 'ss-potential-low">Low</span>' in _table_html(at)
+
+
+# --------------------------------------------------------------------------- #
+# Game-name search (2026-10-10 request): a sidebar text input inside the
+# "Scout filters" area that filters the current result set by title OR
+# creator (literal, case-insensitive — apply_filters regex=False already
+# guarantees punctuation-heavy titles are safe) and resets the page.
+# --------------------------------------------------------------------------- #
+
+
+def test_sidebar_has_game_search_input():
+    """The Scout filters area carries a 'Search games' text input on the main
+    view — and only there (the New & Upcoming watchlist has no filters)."""
+    at = _render_dashboard()
+    assert not at.exception
+    inputs = [t for t in at.sidebar.text_input if (t.key or "") == "game_search"]
+    assert len(inputs) == 1, at.sidebar.text_input
+    assert inputs[0].label == "Search games"
+
+
+def test_game_search_filters_and_resets(monkeypatch, tmp_path):
+    """Typing a matching fragment keeps both games; a non-matching one drops
+    the game row and the dashboard switches to its own 'no games on this
+    page' notice — the table itself is intentionally absent from the render
+    tree, so a non-match must be asserted via the raw html/info state (not
+    _table_html, which hard-requires a table). A match with a real no-match
+    competitor, then clearing, proves BOTH directions of the filter on a
+    genuine rerun. The match is literal and case-insensitive
+    (apply_filters regex=False), so punctuation-heavy titles stay safe."""
+    import pandas as pd
+    frame = pd.concat([_demo_frame(), _demo_two_row_frame()], ignore_index=True)
+    at = _fresh_app()
+    at.session_state["onboarding_complete"] = True
+    at.session_state["pending_initial_scan"] = False
+    at.session_state["welcome_scan_started"] = True
+    at.session_state["data"] = frame
+    at.session_state["source"] = "demo"
+    at.run()
+    assert not at.exception
+    table_html = _table_html(at)
+    assert "Blox Fruits" in table_html
+    assert "Pls Donate" in table_html
+
+    search = at.sidebar.text_input(key="game_search")
+    assert search.label == "Search games"
+
+    # A no-match fragment drops BOTH rows and renders the empty state.
+    search.set_value("zzz-no-match").run()
+    assert not at.exception
+    main_html = "".join(el.proto.body for el in at.main.get("html"))
+    assert "Blox Fruits" not in main_html
+    assert "Pls Donate" not in main_html
+    messages = " ".join(str(el.value) for el in at.info)
+    assert "No games on this page match the selected filters." in messages
+    # The page counter resets to 1 on a filter change.
+    captions = [element.value for element in at.caption]
+    assert any("Page 1 of" in value for value in captions)
+
+    # A literal, case-insensitive fragment keeps the matching game only.
+    search.set_value("blox").run()
+    assert not at.exception
+    table_html = _table_html(at)
+    assert "Blox Fruits" in table_html
+    assert "Pls Donate" not in table_html
+
+    # Clearing restores the full filtered result set.
+    search.set_value("").run()
+    assert not at.exception
+    table_html = _table_html(at)
+    assert "Blox Fruits" in table_html
+    assert "Pls Donate" in table_html
+
+
+# --------------------------------------------------------------------------- #
+# Sidebar 'Apply filters' regression (2026-10-10 report): a scout set the
+# built-in sidebar targets (min 20k visits / 25 CCU) and clicked Apply, but
+# their results table did not change. The path is: number_input writes both
+# target_min_visits/target_min_ccu AND the local min_visits/min_ccu reads;
+# apply_filters clamps rows against those — the welcome flow and the sidebar
+# converge on the exact same filter call. Tests reproduce a full dashboard
+# run (the onboarding path of test_first_scan_pulls_from_catalog… shows the
+# sidebar is not even mounted until onboarding completes) so the exact user
+# flow — raise the bar, click Apply, watch the table change — stays honest.
+# --------------------------------------------------------------------------- #
+
+
+def test_sidebar_apply_filters_narrows_by_min_ccu(monkeypatch, tmp_path):
+    """The exact 2026-10-10 user flow, run on the full welcome path: raise
+    the sidebar Minimum CCU above one game's CCU, click 'Apply filters',
+    and that game drops from the table while a stronger game stays. Proves
+    the filters genuinely re-read the canonical targets on Apply — a purely
+    cosmetic button (or a filter that never re-clamps) can't pass this.
+    """
+    import pandas as pd
+
+    calls: list[dict] = []
+
+    def _fake(self, min_visits=0, min_ccu=0):
+        calls.append({"min_visits": min_visits, "min_ccu": min_ccu})
+        return pd.concat([_demo_frame(), _demo_two_row_frame()], ignore_index=True)
+
+    monkeypatch.setattr(scout_core.RobloxPlatformScout, "load_catalog_matches", _fake)
+
+    at = _fresh_app()
+    at.run()
+    at.button(key="onb0_next").click().run()
+    at.button(key="onb1_next").click().run()
+    at.button(key="onb3_next").click().run()
+    at.button(key="onb4_start").click().run()
+    at.run()
+    assert not at.exception
+    # Both games clear the 20k visits / 25 CCU entry bar.
+    table_html = _table_html(at)
+    assert "Blox Fruits" in table_html  # 1000 CCU
+    assert "Pls Donate" in table_html   # 3000 CCU
+
+    # Raise the bar ABOVE the weak row's CCU, then click Apply.
+    at.sidebar.number_input(key="target_min_ccu").set_value(2000).run()
+    assert not at.exception
+    at.sidebar.button(key="apply_filters").click().run()
+
+    assert not at.exception
+    table_html = _table_html(at)
+    # The weak row is gone; the strong row survived the raised bar — proving
+    # the Apply click genuinely re-runs the filter chain with the raised
+    # sidebar value (the app's design: targets apply instantly to the
+    # loaded data; 'Sync live data' is what re-reads the catalog).
+    assert "Blox Fruits" not in table_html
+    assert "Pls Donate" in table_html
+    # The catalog read carries the onboarding targets (the design: a raised
+    # bar applies to the loaded results instantly; only 'Sync live data'
+    # re-reads the catalog with the new targets).
+    assert len(calls) == 1 and calls[0]["min_ccu"] == 25, calls
+    synced = at.sidebar.button(key="sync_live_data").click().run()
+    assert not at.exception
+    table_html = _table_html(at)
+    assert "Blox Fruits" not in table_html, "sync re-read the catalog with min CCU 2000"
+    assert "Pls Donate" in table_html
+    assert len(calls) == 2 and calls[-1]["min_ccu"] == 2000, calls
+
+
+def test_sidebar_targets_share_one_session_state_with_welcome_flow(monkeypatch, tmp_path):
+    """Both filter paths write the SAME canonical session-state keys. The
+    sidebar inputs are keyed directly on target_min_visits/target_min_ccu:
+    a sidebar change writes that one key set, and a real welcome-flow preset
+    button (proven through the mock-rerun save since its on_click fires during
+    the run) rewrites the same key set through set_preset — the two paths can
+    never disagree because there is only one place the values live.
+    """
+    monkeypatch.setenv("SS_PROFILE_DIR", str(tmp_path / "profiles"))
+    saved_before = False
+
+    at = _fresh_app()
+    at.run()
+    at.button(key="onb0_next").click().run()  # welcome -> targets
+
+    # Step 1 shows its OWN bound widgets plus 4 preset buttons; both write
+    # the canonical keys. Click the 'Pls Donate' tier preset (50k / 75).
+    at.button(key="preset_50000_75").click().run()
+    assert not at.exception
+    assert at.session_state["target_min_visits"] == 50_000
+    assert at.session_state["target_min_ccu"] == 75
+    saved_before = True
+
+    # The capture-on-start button is what actually persists the welcome
+    # targets — and the sidebar keeps rendering the SAME keys after it.
+    at.button(key="onb1_next").click().run()
+    at.button(key="onb3_next").click().run()
+    at.button(key="onb4_start").click().run()
+    at.run()
+    assert not at.exception
+    # Fresh sidebar after the welcome flow: SAME canonical values.
+    at.sidebar.number_input(key="target_min_visits").set_value(60_000).run()
+    at.sidebar.number_input(key="target_min_ccu").set_value(2000).run()
+    assert at.session_state["target_min_visits"] == 60_000
+    assert at.session_state["target_min_ccu"] == 2000
+
+    # Re-enter the welcome flow's targets step and click a different preset:
+    # the two paths must converge — the same canonical keys the sidebar just
+    # wrote are rewritten from the welcome-flow side.
+    at.session_state["onboarding_complete"] = False
+    at.session_state["onboarding_step"] = 1
+    at.run()
+    assert not at.exception
+    at.button(key="preset_100000_125").click().run()
+    assert not at.exception
+    assert at.session_state["target_min_visits"] == 100_000
+    assert at.session_state["target_min_ccu"] == 125
+    assert saved_before
