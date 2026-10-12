@@ -39,6 +39,10 @@ TEMP_PASSWORDS.md
 local_cookie.txt
 local_cookie2.txt
 
+# --- discord outreach (bot token + outreach ledger NEVER enter git) ---
+discord_bot.token
+outreach.sqlite
+
 # --- contacts bundle encryption key (split catalog: links never leave the
 # --- owner's deployments in plaintext) ---
 contacts.key
