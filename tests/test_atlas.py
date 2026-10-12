@@ -504,7 +504,28 @@ def test_host_port_pool_entry_routes_as_http_proxy(scout, monkeypatch):
     }
 
 
-def test_url_template_entry_routes_as_scraping_api(scout, monkeypatch):
+def test_bare_ip_port_pool_entry_accepted_and_routes_as_proxy(scout, monkeypatch):
+    """2026-10-12 regression fix: prufer.py exports the validated free pool
+    as bare ``ip:port`` (no scheme) — run #722's harvest discarded every
+    one of the 191 working proxies at parse time as 'malformed' and then
+    burned its Scrape.do/direct fallbacks before aborting. The parser must
+    accept the exported shape and the router must send it via proxies=."""
+    monkeypatch.setenv(
+        "RBXSCOUT_SEARCH_PROXY_URLS", "10.0.0.1:8080, 2.3.4.5:999, direct"
+    )
+    pool = scout._atlas_proxy_pool()
+    assert pool == ["http://10.0.0.1:8080", "http://2.3.4.5:999", "direct"]
+    calls = []
+    _patch_http(monkeypatch, pages={"*": INDEX_HTML}, calls=calls)
+    scout.harvest_atlas_seeds(pages=1, stat_pages=0, throttle_hours=0)
+    assert calls[0]["url"].startswith("https://atlasdev.gg/")
+    assert calls[0]["proxies"] == {
+        "http": "http://10.0.0.1:8080",
+        "https": "http://10.0.0.1:8080",
+    }
+
+
+def test_scrape_do_token_alone_now_becomes_primary(scout, monkeypatch):
     """A ``…url={url}`` entry is a scraping-API template (paid free tiers):
     the target URL is percent-encoded into the query string, no proxies=."""
     monkeypatch.setenv(

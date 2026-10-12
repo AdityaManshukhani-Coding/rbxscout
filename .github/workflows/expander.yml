@@ -98,7 +98,8 @@ jobs:
         run: python -m pytest tests -q
 
       # atlasdev.gg 403s many datacenter/runner IP ranges (2026-10-05 run
-      # #722: the harvest was throttled AND cloud fetches are unreliable from
+      # #722: BLUE — the harvest was throttled AND cloud fetches are
+      # unreliable from
       # runner IPs). Validate the same free public proxy pool the prufer
       # pre-pass uses (~9% yield ≈ 200 working proxies, ~4 min) and route the
       # Failure policy (2026-10-11, scout request): the pool IS the primary
@@ -111,6 +112,11 @@ jobs:
       # fails loudly (non-zero exit) so the queue stays safe from a direct
       # 403 storm. Exit is gated: set ATLAS_MIN_PROXY_POOL=0 in repo
       # Variables to re-enable direct harvesting as the old fallback.
+      # 2026-10-12: the 1,000/mo free-credit bucket is exhausted locally —
+      # until it tops up, keep ATLAS_MIN_PROXY_POOL unset (fail-loud on the
+      # malformed small-pool path) so a dead-token day cannot silently
+      # zero the discovery queue; the parser now accepts prufer's bare
+      # ip:port pool export (run #722 discarded ALL 191 working proxies).
       - name: Validate free-proxy pool for Atlas fetches
         run: python prufer.py > atlas_proxies.txt; test -n "$(cat atlas_proxies.txt)"
 

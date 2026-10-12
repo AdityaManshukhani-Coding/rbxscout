@@ -3473,6 +3473,14 @@ class RobloxPlatformScout:
             part = part.strip().rstrip("/")
             if not part:
                 continue
+            # 2026-10-12 regression fix: prufer.py exports the validated
+            # free pool as bare ``ip:port`` (no scheme); run #722/day ran
+            # with ALL 191 working proxies discarded here as "malformed"
+            # and the harvest aborting on the 403 wave. The fetch router
+            # below already routes scheme-less host:port once it carries
+            # the http:// scheme — normalize instead of discarding.
+            if re.fullmatch(r"(?:[\w.+-]+(?::[\w.+-]+)?@)?[\w.-]+:\d+", part):
+                part = f"http://{part}"
             if part == "direct" or re.match(r"^https?://[^/\s]+$", part):
                 if part not in entries:
                     entries.append(part)
