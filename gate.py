@@ -745,12 +745,12 @@ def is_unlocked(ref: str | None) -> bool:
             return True
     except Exception:
         pass
-    if not ref:
-        return False
-    state = _load_unlocks()
     now = time.time()
-    if float(state.get(ref, 0) or 0) > now:
-        return True
-    # A first visit unlocks under the UA fallback (device id unknown at that
-    # moment); honor it so the mint reload does not re-ask the password.
-    return float(state.get(_ref_key(None), 0) or 0) > now
+    if not ref:
+        # No device id yet: the only way in is the UA fallback bucket, which
+        # remember_unlock writes for exactly these ref-less visits so the
+        # mint reload does not re-ask the password.
+        state = _load_unlocks()
+        return float(state.get(_ref_key(None), 0) or 0) > now
+    state = _load_unlocks()
+    return float(state.get(ref, 0) or 0) > now

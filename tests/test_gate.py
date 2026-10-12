@@ -80,6 +80,22 @@ def test_ua_fallback_key_works_without_device_id():
     gate.reset_attempts(None)
 
 
+def test_ua_fallback_unlock_never_leaks_to_minted_refs(monkeypatch, tmp_path):
+    """A minted device ref is an identity: it must not inherit the UA bucket.
+
+    Incident 2026-10-10: remember_unlock(None) writes an unlock under the
+    UA-fallback bucket (shared by every same-browser/OS visitor). The old
+    is_unlocked honored that bucket for ANY visitor, so a fresh incognito
+    window — same Chrome version, new cookies, its own minted ref — sailed
+    straight past the gate for 30 days. The bucket must only admit the
+    ref-less visits it was written for.
+    """
+    monkeypatch.setenv("SS_GATE_DIR", str(tmp_path / "g"))
+    gate.remember_unlock(None)  # a ref-less visitor unlocked correctly
+    assert gate.is_unlocked(None) is True  # they stay unlocked
+    assert gate.is_unlocked("fresh-incognito-ref") is False  # no inheritance
+
+
 def test_state_files_isolated_via_env(tmp_path, monkeypatch, ref):
     monkeypatch.setenv("SS_GATE_DIR", str(tmp_path / "g"))
     gate.remember_unlock(ref)
