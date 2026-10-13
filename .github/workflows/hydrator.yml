@@ -34,15 +34,16 @@ on:
 # Cloudflare stays the precision clock.
   workflow_dispatch:
   schedule:
-    # Every 5 min on off-peak minutes — full parity with the Cloudflare
-    # worker's precision clock. On 2026-10-05 the deployed worker stopped
-    # dispatching (~16:15Z) and the old hourly on-the-hour backstop proved
-    # useless: GitHub suppresses/delays schedule starts under load, worst on
-    # :00 (only 3 fires in 24h). Off-peak minutes fire far more reliably.
-    # Extra triggers no-op through the concurrency group when the worker is
-    # healthy; when it is dead, this schedule IS the clock (worst-case
-    # freshness degrades from 5 min to ~10, not to hours).
-    - cron: "4-59/5 * * * *"
+    # HOURLY off-peak backstop (was 4-59/5 every 5 min). 2026-10-13: the
+    # catalog reached 235 MB and a full pull/hydrate/push cycle now takes
+    # 10-40 min on the runner, so two 5-min clocks (worker + this schedule)
+    # piled runs ~8 deep behind the rbxscout-sync mutex and Actions minutes
+    # burned on redundant duplicate cycles. The worker's cadence is the
+    # precision clock; this backstop exists only to cover a DEAD worker
+    # (see 2026-09-21 / 2026-10-05 notes), and for that an hourly fire is
+    # exactly right. Extra triggers do NOT no-op through the concurrency
+    # group — each queued run executes a full pull/hydrate/push cycle.
+    - cron: "27 * * * *"
 
 permissions:
   contents: write   # create/update the catalog-latest release assets
@@ -52,7 +53,9 @@ permissions:
 # the two-writer race on the catalog release.
 concurrency:
   group: rbxscout-sync
-  queue: max                 # retain scheduled dispatches while a run is active
+  cancel-in-progress: false  # siblings wait their turn; the (now hourly)
+                             # schedule backstop + worker dispatch keep the
+                             # queue at most ~1-2 deep at 40-min cycle times
 
 env:
   RBXSCOUT_SEARCH_PROXY_URLS: ''   # hydrator never touches the search API

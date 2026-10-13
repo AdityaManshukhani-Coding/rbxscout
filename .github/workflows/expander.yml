@@ -15,7 +15,9 @@
 # concurrency group as hydrator.yml. The DB is one binary
 # SQLite file — two pull/sync/push cycles running at once would silently
 # drop one run's data. GitHub enforces the group repo-wide as a mutex;
-# `queue: max` retains pending dispatches while a run is active.
+# with queue:max removed (2026-10-13 pending-chain outage), GitHub's default
+# auto-cancels stale pending runs instead of letting them pile up behind a
+# 40-min cycle.
 #
 # Knobs (repo Variables, optional): ATLAS_SWEEP_PAGES (index pages per daily
 # harvest, 0 = kill switch), ATLAS_STAT_PAGES (provisional first-paint rows
@@ -67,7 +69,9 @@ env:
 # literal string IS the cross-workflow mutex.
 concurrency:
   group: rbxscout-sync
-  queue: max                 # retain dispatches while another workflow runs
+  cancel-in-progress: false  # queued siblings wait; with queue:max removed,
+                             # GitHub's default keeps only the LATEST pending
+                             # run and auto-cancels older pending backlog
 
 jobs:
   expand:
