@@ -3623,9 +3623,10 @@ class RobloxPlatformScout:
             stamp = row[1] or row[0]
             if stamp is None:
                 return None
-            # 'atlas_last_run' stores an epoch in last_universe_id — that is
-            # the authoritative stamp (updated_at refreshes on any write).
-            if pointer_id == "atlas_last_run" and row[0] is not None:
+            # 'atlas_last_run' and 'atlas_deep' store an epoch in
+            # last_universe_id — that is the authoritative stamp
+            # (updated_at refreshes on any write).
+            if pointer_id in ("atlas_last_run", "atlas_deep") and row[0] is not None:
                 return float(row[0])
             try:
                 return datetime.strptime(str(stamp)[:19], "%Y-%m-%d %H:%M:%S").timestamp()
@@ -3776,6 +3777,13 @@ class RobloxPlatformScout:
                 return stats
 
         # ---- deep-sweep decision (catch-up cursor in atlas_page) ----------
+        # The DEEP-due clock reads the dedicated 'atlas_deep' pointer, NOT
+        # atlas_page: atlas_page.updated_at is refreshed by every 3-hourly
+        # steady harvest, so a deep_due check against it could never fire
+        # (2026-10-13 finding: 47% of Atlas's first 1,250 listings were
+        # unreachable because deep sweeps never triggered). atlas_deep is
+        # stamped ONLY when a harvest COMPLETES with a deep sweep, so the
+        # 30-day catch-up cadence is measured sweep-to-sweep.
         now = time.time()
         cursor_row = None
         try:
@@ -3789,12 +3797,12 @@ class RobloxPlatformScout:
         deep_due = False
         if cursor_row is not None and cursor_row[0] is not None:
             start_page = int(cursor_row[0]) or 1
-            try:
-                stamp = datetime.strptime(str(cursor_row[1] or "")[:19], "%Y-%m-%d %H:%M:%S").timestamp()
-                deep_due = deep_days > 0 and (now - stamp) >= deep_days * 86400
-            except ValueError:
-                deep_due = False
+            deep_stamp = self._atlas_pointer("atlas_deep")
+            deep_due = deep_days > 0 and (
+                deep_stamp is None or (now - deep_stamp) >= deep_days * 86400
+            )
         elif deep_days > 0:
+            # No cursor row yet (fresh store): first-ever run is a catch-up.
             deep_due = True
         sweep_pages = page_budget
         if deep_due:
@@ -3858,6 +3866,12 @@ class RobloxPlatformScout:
         self._set_atlas_pointer("atlas_last_run", now)
         completed = fetched >= sweep_pages
         self._set_atlas_pointer("atlas_page", 1 if completed else start_page + fetched)
+        # Deep-sweep clock: stamp atlas_deep only when a harvest COMPLETED
+        # with a deep sweep. Partial retries leave the clock running so the
+        # next harvest resumes the same catch-up sweep, and steady-state
+        # harvests (deep_sweep False) never touch it.
+        if stats.get("deep_sweep") and completed:
+            self._set_atlas_pointer("atlas_deep", now)
         report(0.95, f"Atlas harvest: +{stats['enqueued']} queued, {stats['provisional_rows']} first-paint rows")
         return stats
 

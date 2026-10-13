@@ -385,6 +385,36 @@ def test_deep_sweep_defaults_on_when_env_unset(scout, monkeypatch):
     assert stats["pages_fetched"] == scout_core.ATLAS_DEEP_PAGES_DEFAULT
 
 
+def test_deep_sweep_clock_does_not_reset_on_steady_harvests(scout, monkeypatch):
+    """Regression for the 2026-10-13 coverage bug: the deep-due clock was
+    reading atlas_page.updated_at, which every 3-hourly steady harvest
+    refreshes — so the 30-day full-index catch-up could never fire and the
+    sweep stayed pinned to the first pages forever. The clock must live on
+    its own pointer stamped only by COMPLETED deep sweeps."""
+    import time as _time
+
+    _patch_http(monkeypatch, pages={"*": INDEX_HTML})
+    # A steady harvest that completes well inside the deep window must NOT
+    # be a deep sweep, and must not push the deep clock forward.
+    steady = scout.harvest_atlas_seeds(deep_every_days=30, throttle_hours=0, stat_pages=0)
+    assert steady["deep_sweep"] is True  # first-ever run: catch-up fires
+    deep_stamp = scout._atlas_pointer("atlas_deep")
+    assert deep_stamp is not None  # completed deep sweep stamps the clock
+
+    # Immediate second run: window closed -> steady, and atlas_deep untouched.
+    followup = scout.harvest_atlas_seeds(pages=1, stat_pages=0, throttle_hours=0)
+    assert followup["deep_sweep"] is False
+    assert scout._atlas_pointer("atlas_deep") == deep_stamp
+
+    # Simulate steady harvests churning atlas_page for weeks: the deep clock
+    # must not care. Back date the deep stamp past the window -> deep fires.
+    scout._set_atlas_pointer("atlas_page", 1)  # what steady harvests keep doing
+    scout._set_atlas_pointer("atlas_deep", _time.time() - 31 * 86400)
+    due = scout.harvest_atlas_seeds(deep_every_days=30, pages=1, stat_pages=0, throttle_hours=0)
+    assert due["deep_sweep"] is True
+    assert due["pages_fetched"] == scout_core.ATLAS_DEEP_PAGES_DEFAULT
+
+
 # --------------------------------------------------------------------------- #
 # Provisional first-paint rows
 # --------------------------------------------------------------------------- #
