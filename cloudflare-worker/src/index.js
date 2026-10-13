@@ -53,6 +53,38 @@ const GITHUB_WORKFLOWS = {
 };
 const GITHUB_DISPATCH_ATTEMPTS = 3;
 const GITHUB_RETRY_MAX_DELAY_MS = 30_000;
+
+/**
+ * True when any workflow run in this repo is still active or waiting in the
+ * rbxscout-sync concurrency queue (status anything other than "completed",
+ * which covers in_progress, pending, queued and waiting states).
+ *
+ * 2026-10-13 pending-chain fix, second half: the workflows now use GitHub's
+ * DEFAULT concurrency (only the newest pending run survives). That means a
+ * blindly-dispatched hydrator cancels any Expander still waiting in line —
+ * which silently killed every :15/:45 expansion pass. The dispatcher must
+ * therefore only fire into an idle pipeline.
+ */
+async function anyRunInFlight(env) {
+  const url = `${GITHUB_API_BASE}/repos/${GITHUB_OWNER}/${GITHUB_REPO}`
+    + "/actions/runs?per_page=30";
+  const response = await fetch(url, {
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+      "User-Agent": "upscalescouting-cloudflare-scheduler",
+      "X-GitHub-Api-Version": GITHUB_API_VERSION,
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`GitHub list runs failed (${response.status}): ` +
+      (await response.text()).slice(0, 500));
+  }
+  const data = await response.json();
+  return (data.workflow_runs || []).some(
+    (run) => run.status && run.status !== "completed",
+  );
+}
 const GITHUB_RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 
 // Keep-alive: ping the hosted Streamlit dashboard every 11 hours so
@@ -186,18 +218,39 @@ async function dispatchWorkflow(workflow, env) {
 async function dispatchDueWorkflows(controller, env) {
   const scheduledAt = new Date(controller.scheduledTime || Date.now());
   const minute = scheduledAt.getUTCMinutes();
-  const due = [
-    ["hydrator", GITHUB_WORKFLOWS.hydrator],
-  ];
 
-  // Expander (Atlas Dev harvest + discovery-queue drain, EXPANSION_PILOT.md)
-  // gets the odd clean minute :15/:45 — its own 30-min slot. The Actions
-  // concurrency group still serializes any overlap with a long hydrator run
-  // still holding the mutex at :15.
-  if (minute === 15 || minute === 45) {
-    due.push(["expander", GITHUB_WORKFLOWS.expander]);
+  // Idle gate: with the workflows on GitHub's default concurrency (newest
+  // pending wins), dispatching into a busy pipeline would CANCEL whatever is
+  // waiting in line — that is what silently killed every :15/:45 Expander
+  // after the 2026-10-13 queue:max removal. If anything is in flight, skip
+  // this tick entirely; a skipped hydrator pass costs a few minutes of
+  // stat freshness, a cancelled expander costs a discovery cycle. The next
+  // tick remains the recovery path (the runs list is re-checked each tick).
+  let busy = false;
+  try {
+    busy = await anyRunInFlight(env);
+  } catch (error) {
+    // Fail-open: if we cannot read the runs list, dispatching as before is
+    // safer than silently stopping the clock (see the 2026-09-21 stall).
+    console.error(`in-flight check failed; dispatching anyway: ${error}`);
+  }
+  if (busy) {
+    console.log("pipeline busy (run active/pending) - tick skipped");
+    return;
   }
 
+  // Expander (Atlas Dev harvest + discovery-queue drain, EXPANSION_PILOT.md)
+  // gets the odd clean minute :15/:45 — its own 30-min slot, dispatched
+  // ALONE: a hydrator dispatch in the same tick would sit behind it in the
+  // rbxscout-sync queue and, under GitHub's default concurrency, supersede
+  // (cancel) it — which is exactly the silent Atlas-finder outage fixed on
+  // 2026-10-13. Hydrator owns every other tick.
+  const due = [];
+  if (minute === 15 || minute === 45) {
+    due.push(["expander", GITHUB_WORKFLOWS.expander]);
+  } else {
+    due.push(["hydrator", GITHUB_WORKFLOWS.hydrator]);
+  }
   const results = await Promise.allSettled(
     due.map(async ([name, workflow]) => {
       const status = await dispatchWorkflow(workflow, env);
