@@ -83,3 +83,13 @@ contacts_backup.bundle
 
 # --- capacity metering state (per-container session/queue bookkeeping) ---
 .capacity/
+
+# --- sync sidecars / scratch artifacts (never ship these) ---
+*.db.public
+*.db.public-wal
+*.db.public-shm
+*.db.tmp
+*.db.tmp-wal
+*.db.tmp-shm
+final_verification*.txt
+rank_target_test_progress.txt
