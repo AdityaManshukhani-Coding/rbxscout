@@ -716,6 +716,85 @@ class MockScout(RobloxPlatformScout):
 
 
 # --------------------------------------------------------------------------- #
+# Icon backfill: blocklist + batch mechanics
+# --------------------------------------------------------------------------- #
+
+
+def _icon_fixture(data):
+    return {"data": data}
+
+
+def test_backfill_marks_blocked_and_excludes_forever(tmp_path):
+    """A Blocked thumbnail state is permanent (moderation-removed). The first
+    backfill must record it in icon_blocked; later selections must skip it,
+    so a Blocked game can never displace a fetchable one from the batch."""
+    db = str(tmp_path / "icons.db")
+    responses = {
+        # games 1 (ok), 2 (Blocked forever)
+        "https://thumbnails.roblox.com/v1/games/icons": _icon_fixture([
+            {"targetId": 1, "state": "Completed", "imageUrl": "https://tr.rbxcdn.com/a.png"},
+            {"targetId": 2, "state": "Blocked"},
+        ]),
+        "https://games.roblox.com/v1/games/votes": {"data": []},
+    }
+    scout = MockScout(responses, db_path=db)
+    scout.upsert_game({"universe_id": 1, "title": "A", "ccu": 50, "visits": 50_000})
+    scout.upsert_game({"universe_id": 2, "title": "B", "ccu": 50, "visits": 50_000})
+
+    out = scout.backfill_missing_icons()
+    assert out["filled"] == 1 and out["newly_blocked"] == 1
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT icon_url FROM game_analytics WHERE universe_id=1"
+        ).fetchone()[0].startswith("https://tr.rbxcdn.com")
+        assert conn.execute(
+            "SELECT COUNT(*) FROM icon_blocked WHERE universe_id=2"
+        ).fetchone()[0] == 1
+
+    # Second pass: game 2 is never re-selected; game 1 isn't either (icon set).
+    out2 = scout.backfill_missing_icons()
+    assert out2["attempted"] == 0
+
+
+def test_backfill_deleted_game_stays_in_rotation(tmp_path):
+    """A game absent from the endpoint's response (deleted/unlisted) is NOT
+    blocklisted — the no-op retry is cheap and self-heals if Roblox restores
+    the game. Only explicit Blocked states enter icon_blocked."""
+    db = str(tmp_path / "icons.db")
+    responses = {
+        "https://thumbnails.roblox.com/v1/games/icons": _icon_fixture([
+            {"targetId": 3, "state": "Completed", "imageUrl": "https://tr.rbxcdn.com/c.png"},
+            # targetId 4 missing from the response entirely
+        ]),
+        "https://games.roblox.com/v1/games/votes": {"data": []},
+    }
+    scout = MockScout(responses, db_path=db)
+    scout.upsert_game({"universe_id": 3, "title": "C", "ccu": 50, "visits": 50_000})
+    scout.upsert_game({"universe_id": 4, "title": "D", "ccu": 50, "visits": 50_000})
+
+    out = scout.backfill_missing_icons()
+    assert out["filled"] == 1 and out["newly_blocked"] == 0
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM icon_blocked").fetchone()[0] == 0
+    # game 4 is retried on the next pass (still icon-less, not blocklisted)
+    out2 = scout.backfill_missing_icons()
+    assert out2["attempted"] == 1
+
+
+def test_backfill_clears_legacy_blocklist_entries_and_grows_batch(tmp_path):
+    """The cloud-side batch default was raised 50 -> 200 so a few thousand
+    icon-less rows clear in hours, not days; and >50-row selections split
+    across batch calls keep counting correctly."""
+    db = str(tmp_path / "icons.db")
+    scout = MockScout({}, db_path=db)  # every fetch 404s
+    for i in range(1, 61):
+        scout.upsert_game({"universe_id": i, "title": f"G{i}",
+                           "ccu": 50, "visits": 50_000})
+    out = scout.backfill_missing_icons()
+    assert out["attempted"] == 60  # 200-row default leaves nothing behind
+
+
+# --------------------------------------------------------------------------- #
 # Tier classifier: monotonic table + higher-axis rule
 # --------------------------------------------------------------------------- #
 

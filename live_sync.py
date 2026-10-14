@@ -109,7 +109,7 @@ def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float, mode: st
     ib = scan.get("icon_backfill") or {}
     if ib.get("attempted"):
         print(f"icon backfill    : {ib.get('filled', 0)}/{ib.get('attempted', 0)} "
-              "thumbnails filled (Blocked games retry each run)")
+              "thumbnails filled (Roblox-Blocked games are blocklisted, not retried)")
     slo = scan.get("slo") or {}
     if slo:
         overdue = " · ".join(

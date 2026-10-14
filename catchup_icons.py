@@ -23,9 +23,15 @@ EMPTY_STREAK_STOP = 2  # consecutive groups with zero fetched icons -> abort
 
 
 def remaining(conn) -> int:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS icon_blocked ("
+        "universe_id INTEGER PRIMARY KEY, "
+        "marked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+    )
     return conn.execute(
         "SELECT COUNT(*) FROM game_analytics "
-        "WHERE (icon_url IS NULL OR icon_url = '')"
+        "WHERE (icon_url IS NULL OR icon_url = '') "
+        "AND universe_id NOT IN (SELECT universe_id FROM icon_blocked)"
     ).fetchone()[0]
 
 
@@ -41,6 +47,7 @@ def main() -> int:
                 int(r[0]) for r in conn.execute(
                     "SELECT universe_id FROM game_analytics "
                     "WHERE (icon_url IS NULL OR icon_url = '') "
+                    "AND universe_id NOT IN (SELECT universe_id FROM icon_blocked) "
                     "ORDER BY universe_id LIMIT ?",
                     (GROUP,),
                 ).fetchall()
@@ -49,17 +56,23 @@ def main() -> int:
             print("nothing left — catalog fully thumbnailed")
             break
         t0 = time.time()
-        icons = scout.fetch_game_icons(doomed)
+        icons, blocked_ids = scout.fetch_game_icons(doomed, return_blocked=True)
         votes = scout.fetch_vote_totals(doomed)
         scout.upsert_icons(icons)
         scout.upsert_votes(votes)
+        if blocked_ids:
+            with sqlite3.connect(str(DB), factory=scout_core._ClosingConnection) as conn:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO icon_blocked (universe_id) VALUES (?)",
+                    [(int(uid),) for uid in blocked_ids],
+                )
         total_filled += len(icons)
         print(
             f"group {g}: {len(doomed)} rows -> {len(icons)} icons, "
             f"{len(votes)} vote rows ({time.time() - t0:.0f}s)",
             flush=True,
         )
-        if not icons:
+        if not icons and not blocked_ids:
             empty_streak += 1
             if empty_streak >= EMPTY_STREAK_STOP:
                 print("endpoint returned nothing twice in a row — stopping")

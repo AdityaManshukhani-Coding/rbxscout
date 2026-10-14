@@ -388,16 +388,31 @@ def backfill_thumbnails(local: Path) -> int:
     try:
         scout = scout_core.RobloxPlatformScout(db_path=str(local))
         with _local_conn(local) as conn:
+            # Skip icon_blocked (Roblox 'Blocked' thumbnails — permanent):
+            # same rule as scout_core.backfill_missing_icons, so the nightly
+            # batch isn't eaten by rows that can never render.
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS icon_blocked ("
+                "universe_id INTEGER PRIMARY KEY)")
             doomed = [int(r[0]) for r in conn.execute(
                 "SELECT universe_id FROM game_analytics "
                 "WHERE (icon_url IS NULL OR icon_url = '') "
+                "AND universe_id NOT IN (SELECT universe_id FROM icon_blocked) "
                 "ORDER BY universe_id LIMIT ?",
                 (ICON_BACKFILL_BATCH,),
             ).fetchall()]
         if not doomed:
             return 0
-        icons = scout.fetch_game_icons(doomed)
+        icons, blocked_ids = scout.fetch_game_icons(doomed, return_blocked=True)
         votes = scout.fetch_vote_totals(doomed)
+        scout.upsert_icons(icons)
+        scout.upsert_votes(votes)
+        if blocked_ids:
+            with _local_conn(local) as conn:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO icon_blocked (universe_id) VALUES (?)",
+                    [(int(uid),) for uid in blocked_ids],
+                )
         scout.upsert_icons(icons)
         scout.upsert_votes(votes)
         with _local_conn(local) as conn:
@@ -410,6 +425,7 @@ def backfill_thumbnails(local: Path) -> int:
         log(
             f"icon backfill: {len(icons)}/{len(doomed)} thumbnails + "
             f"{len(votes)} vote rows fetched"
+            + (f" · {len(blocked_ids)} blocked" if blocked_ids else "")
         )
         return len(icons)
     except Exception as exc:

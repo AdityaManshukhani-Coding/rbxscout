@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 import time
 import urllib.error
@@ -543,6 +544,39 @@ def cmd_pull() -> int:
     if not tmp.read_bytes().startswith(b"SQLite format 3\x00"):
         tmp.unlink(missing_ok=True)
         raise SyncError("downloaded asset is not a SQLite database — refusing to install it")
+    # Empty-catalog guard (2026-10-14 wipe): the store once held a 0-game
+    # catalog, and this pull replaced a healthy 24k-game local copy with it —
+    # starting the test-gate deadlock (a 0-game catalog trips
+    # test_catalog_counts_against_real_db, the push step after the gate
+    # never runs, and the empty catalog self-perpetuates). Never install a
+    # catalog with fewer rows than the local one when the incoming one is
+    # suspiciously empty.
+    # NOTE: connect by plain path, NOT a file:...?mode=ro URI — SQLite URI
+    # parsing chokes on project paths containing spaces (this project lived
+    # under "Discord Website/" and every pull crashed at this exact line
+    # until the connect was switched back to a plain path).
+    probe = sqlite3.connect(tmp)
+    try:
+        incoming_games = probe.execute(
+            "SELECT count(*) FROM game_analytics").fetchone()[0]
+    finally:
+        probe.close()
+    if incoming_games == 0 and DB_PATH.exists() and DB_PATH.stat().st_size > 10_000_000:
+        local_probe = sqlite3.connect(DB_PATH)
+        try:
+            local_games = local_probe.execute(
+                "SELECT count(*) FROM game_analytics").fetchone()[0]
+        finally:
+            local_probe.close()
+        if local_games > 0:
+            tmp.unlink(missing_ok=True)
+            STATE_PATH.unlink(missing_ok=True)
+            raise SyncError(
+                f"refusing to pull: store catalog has 0 games but the local "
+                f"copy has {local_games:,} — installing it would wipe healthy "
+                "data and trip the empty-catalog test gate. Restore the store "
+                "with `python db_sync.py push --force` instead."
+            )
     _checkpoint_wal(DB_PATH)
     tmp.replace(DB_PATH)
     _restore_contacts_from_bundle(rel, token)

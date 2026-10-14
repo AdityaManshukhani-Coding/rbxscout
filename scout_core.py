@@ -2460,9 +2460,21 @@ class RobloxPlatformScout:
         }
         return out
 
-    def fetch_game_icons(self, universe_ids: List[int]) -> Dict[int, str]:
-        """Batched game icons (50 per call) from thumbnails.roblox.com."""
+    def fetch_game_icons(
+        self,
+        universe_ids: List[int],
+        return_blocked: bool = False,
+    ) -> Dict[int, str]:
+        """Batched game icons (50 per call) from thumbnails.roblox.com.
+
+        ``return_blocked=True`` (used by backfill_missing_icons) makes the
+        return value of a single-call a ``(icons, blocked_ids)`` tuple: the
+        second list carries every id the endpoint explicitly answered with
+        state='Blocked' — moderation-removed, never renderable — so the
+        caller can blocklist them instead of retrying forever.
+        """
         out: Dict[int, str] = {}
+        blocked: List[int] = []
         statuses: List[int] = []
         for i in range(0, len(universe_ids), 50):
             chunk = universe_ids[i : i + 50]
@@ -2475,7 +2487,9 @@ class RobloxPlatformScout:
             if status != 200 or not data:
                 continue
             for item in data.get("data") or []:
-                if item.get("state") == "Completed" and item.get("imageUrl"):
+                if item.get("state") == "Blocked":
+                    blocked.append(int(item["targetId"]))
+                elif item.get("state") == "Completed" and item.get("imageUrl"):
                     out[int(item["targetId"])] = item["imageUrl"]
         self.source_diagnostics["icons"] = {
             "batches": len(statuses),
@@ -2483,6 +2497,8 @@ class RobloxPlatformScout:
             "failed_batches": sum(status != 200 for status in statuses),
             "records": len(out),
         }
+        if return_blocked:
+            return out, blocked
         return out
 
     # ------------------------------------------------------------------ #
@@ -2517,7 +2533,7 @@ class RobloxPlatformScout:
                     continue
         return out
 
-    def backfill_missing_icons(self, limit: int = 50) -> Dict[str, int]:
+    def backfill_missing_icons(self, limit: int = 200) -> Dict[str, int]:
         """Fill thumbnails for icon-less catalog rows (cloud-side backfill).
 
         The catalog's only thumbnail source used to be the LAPTOP's nightly
@@ -2528,20 +2544,30 @@ class RobloxPlatformScout:
         per run keeps the catalog permanently thumbnailed regardless of
         whether the laptop is awake.
 
-        Roblox states decoded (verified 2026-10-08 over the 42 then-missing
-        games): 'Completed' rows return a URL and fill immediately;
-        'Blocked' rows are moderation-removed and will NEVER render — they
-        stay icon-less and are retried each run (they share the same single
-        batch call, so the waste is zero extra requests, just batch slots).
-        Never raises: a failed pass only postpones thumbnails by one tick.
+        The ``icon_blocked`` table carries games Roblox has confirmed can
+        NEVER render: 'Blocked' (moderation-removed) thumbnails. They are
+        recorded the first time the endpoint answers with that state and
+        then excluded from selection — before the blocklist these rows
+        retried every tick inside the batch forever, displacing genuinely
+        fetchable games and burning batch slots (verified live: a 26-row
+        leftover set was 22 Blocked + 4 deleted games). Rows ABSENT from
+        the endpoint's response (deleted games) stay in rotation — that's
+        a no-op retry at worst and cheap self-healing if Roblox restores
+        a game. Never raises: a failed pass only postpones by one tick.
         """
-        out = {"attempted": 0, "filled": 0}
+        out = {"attempted": 0, "filled": 0, "newly_blocked": 0}
         try:
             with self._connect() as conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS icon_blocked ("
+                    "universe_id INTEGER PRIMARY KEY, "
+                    "marked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+                )
                 doomed = [
                     int(r[0]) for r in conn.execute(
                         "SELECT universe_id FROM game_analytics "
                         "WHERE (icon_url IS NULL OR icon_url = '') "
+                        "AND universe_id NOT IN (SELECT universe_id FROM icon_blocked) "
                         "ORDER BY last_updated ASC, universe_id ASC LIMIT ?",
                         (max(0, int(limit)),),
                     ).fetchall()
@@ -2553,9 +2579,18 @@ class RobloxPlatformScout:
             return out
         out["attempted"] = len(doomed)
         try:
-            icons = self.fetch_game_icons(doomed)
+            icons, blocked_ids = self.fetch_game_icons(
+                doomed, return_blocked=True)
             self.upsert_icons(icons)
             out["filled"] = len(icons)
+            if blocked_ids:
+                with self._connect() as conn:
+                    conn.executemany(
+                        "INSERT OR IGNORE INTO icon_blocked (universe_id) "
+                        "VALUES (?)",
+                        [(int(uid),) for uid in blocked_ids],
+                    )
+                out["newly_blocked"] = len(blocked_ids)
         except Exception as exc:  # never fail the hydrator on thumbnails
             log.warning("icon backfill failed: %s", exc)
         return out
