@@ -278,6 +278,40 @@ def test_scan_expand_phase_runs_full_pass(tmp_path, monkeypatch):
     assert row[0] == "complete" and row[1] == 1
 
 
+def test_scan_drain_phase_skips_the_atlas_harvest(tmp_path, monkeypatch):
+    """2026-10-14: the workflow runs a drain-only pass FIRST so a proxy-pool
+    failure (which gates the Atlas harvest) can never stall evaluation of
+    seeds already discovered. phases=('drain',) must hydrate queued seeds
+    with ZERO Atlas traffic."""
+    db = str(tmp_path / "t.db")
+    scout = ExpansionScout({
+        "metrics:801": _game(801, ccu=60, visits=200_000, creator_id=55, creator_type="Group"),
+    }, db)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO discovery_queue (universe_id, source, priority, status) "
+            "VALUES (801, 'atlas_dev', 2, 'pending')"
+        )
+    calls = []
+    monkeypatch.setattr(
+        scout, "harvest_atlas_seeds",
+        lambda progress_cb=None: (calls.append(1), {"enqueued": 0})[1],
+    )
+    scout.scan(
+        min_visits=20_000, min_ccu=25,
+        deep_contacts=False, progress_cb=lambda p, m: None,
+        phases=("drain",),
+    )
+    assert calls == []  # zero Atlas index requests
+    assert scout.last_scan["status"] == "complete"
+    assert scout.last_scan["expansion"]["drain"]["qualified"] == 1
+    with sqlite3.connect(db) as conn:
+        row = conn.execute(
+            "SELECT found_via, visits, ccu FROM game_analytics WHERE universe_id=801"
+        ).fetchone()
+    assert row[0] == "expansion" and row[1] == 200_000 and row[2] == 60
+
+
 def test_scan_rejects_unknown_phase():
     scout = ExpansionScout({}, ":memory:")
     import pytest

@@ -327,7 +327,7 @@ HYDRATION_BUDGET_PER_SYNC = 150
 METRICS_BATCH_SIZE = 50          # verified hard cap of /v1/games?universeIds
 EXPANSION_TARGET_VISITS = 20_000   # strict gate: nothing below target is stored
 EXPANSION_TARGET_CCU = 25
-EXPAND_QUEUE_BATCHES_DEFAULT = 10        # 10 x 50 = 500 queued candidates hydrated/run
+EXPAND_QUEUE_BATCHES_DEFAULT = 20        # 20 x 50 = 1,000 queued candidates hydrated/run — a full deep-sweep flood (≈10k seeds) clears in ~5 runs instead of 20
 EXPANSION_QUEUE_MAX_ROWS = 2_000_000     # dedup-memory ceiling (trim oldest)
 
 # --------------------------------------------------------------------------- #
@@ -346,7 +346,9 @@ ATLAS_BASE_URL = "https://atlasdev.gg/analyze"
 ATLAS_QUERY = "sort=totalVisits&dir=asc&totalVisitsMin=20000&ccuMin=25"
 ATLAS_PRIORITY_DEFAULT = 2          # queue tier (drain processes lowest first)
 ATLAS_HOURS_DEFAULT = 23            # self-throttle: one harvest per day (23h so a fixed daily slot never slips)
-ATLAS_SWEEP_PAGES_DEFAULT = 3       # steady-state pages per daily harvest
+ATLAS_SWEEP_PAGES_DEFAULT = 3       # frontier head pages re-checked on EVERY harvest (new listings enter here first)
+ATLAS_ROLL_PAGES_DEFAULT = 25       # rolling tail pages per steady harvest: the 274-page tail completes a circuit in ~11 runs (≈5 h at the 30-min expander cadence)
+ATLAS_TAIL_START = 2                # the rolling circuit covers pages >= 2 (the head owns pages 1..ATLAS_SWEEP_PAGES)
 ATLAS_DEEP_PAGES_DEFAULT = 275      # one-off catch-up sweep ceiling (full index)
 ATLAS_DEEP_EVERY_DAYS_DEFAULT = 30  # re-run the deep sweep this often (0 = never)
 ATLAS_STAT_PAGES_DEFAULT = 100      # provisional first-paint rows per harvest
@@ -3378,6 +3380,7 @@ class RobloxPlatformScout:
         self,
         queue_batches: Optional[int] = None,
         progress_cb: Optional[Callable[[float, str], None]] = None,
+        harvest: bool = True,
     ) -> Dict[str, Any]:
         """One expansion pass: Atlas Dev harvest → discovery-queue drain.
 
@@ -3387,6 +3390,11 @@ class RobloxPlatformScout:
         strict 20k/25 gate. Both sub-steps are bounded and share the pacer,
         so this pass can never breach the hydrator's T1/T2 floors — it runs
         inside the expander workflow slot, not the 5-minute hydrator.
+
+        ``harvest=False`` (drain-only): skip the Atlas fetch entirely — used
+        by the workflow's drain-first step so already-discovered seeds keep
+        flowing into the catalog even when the proxy pool (the harvest's
+        gate) is down.
         """
         report = progress_cb or (lambda p, m: None)
         drain_limit = (
@@ -3398,12 +3406,15 @@ class RobloxPlatformScout:
         # Atlas first (enqueue-only; its seeds drain from the NEXT run on —
         # daily cadence), then the drain so same-run enqueued candidates
         # (manual/forced harvests) still process this run.
-        report(0.02, "Expansion pass: Atlas Dev seed harvest…")
-        try:
-            result["atlas"] = self.harvest_atlas_seeds(progress_cb=report)
-        except Exception as exc:  # Atlas must never take the drain down
-            log.warning("Atlas harvest failed (drain continues): %s", exc)
-            result["atlas"] = {"error": str(exc), "enqueued": 0}
+        if harvest:
+            report(0.02, "Expansion pass: Atlas Dev seed harvest…")
+            try:
+                result["atlas"] = self.harvest_atlas_seeds(progress_cb=report)
+            except Exception as exc:  # Atlas must never take the drain down
+                log.warning("Atlas harvest failed (drain continues): %s", exc)
+                result["atlas"] = {"error": str(exc), "enqueued": 0}
+        else:
+            result["atlas"] = {}
         report(0.5, "Expansion pass: draining the discovery queue…")
         result["drain"] = self.drain_discovery_queue(drain_limit, progress_cb=report)
         # Rotrends 90-day trend backfill for JUST-qualified games
@@ -3584,7 +3595,17 @@ class RobloxPlatformScout:
                     last_status = resp.status_code
                     time.sleep(2.0 * (attempt + 1))
                     continue
-                if resp.status_code == 200:
+                if resp.status_code in (200, 404):
+                    # 404 = a page beyond the index end (the rolling tail
+                    # circuit and the 275-page deep ceiling both walk past
+                    # the live listing count as it shrinks). Returning the
+                    # body keeps the sweep moving — it parses to zero IDs —
+                    # where a None would abort and pin the cursor forever.
+                    if resp.status_code == 404:
+                        log.warning(
+                            "Atlas fetch %s -> 404 (beyond index end; treated as empty)",
+                            url,
+                        )
                     time.sleep(delay)
                     return resp
                 last_status = resp.status_code
@@ -3698,7 +3719,9 @@ class RobloxPlatformScout:
     ) -> Dict[str, Any]:
         """One Atlas harvest: 24h-throttled sweep of /analyze → discovery queue.
 
-        - ``pages``: index pages fetched per run (steady state; 0 disables).
+        - ``pages``: frontier head pages re-checked per run (must also be > 0
+          for the rolling tail circuit to run at all; 0 disables ALL index
+          fetching).
         - ``stat_pages``: budget of game pages fetched for provisional
           first-paint rows (0 disables the bootstrap entirely).
         - ``throttle_hours``: minimum hours between harvests (0 disables the
@@ -3733,6 +3756,10 @@ class RobloxPlatformScout:
             if stat_pages is not None
             else _env_int("ATLAS_STAT_PAGES", ATLAS_STAT_PAGES_DEFAULT)
         )
+        # Rolling tail width per steady harvest — ops knob mirroring
+        # ATLAS_SWEEP_PAGES / ATLAS_STAT_PAGES (tests and manual runs resize
+        # the circuit without touching the module default).
+        ATLAS_ROLL_PAGES = _env_int("ATLAS_ROLL_PAGES", ATLAS_ROLL_PAGES_DEFAULT)
         throttle = (
             ATLAS_HOURS_DEFAULT
             if throttle_hours is None
@@ -3776,14 +3803,20 @@ class RobloxPlatformScout:
                 stats["throttled"] = True
                 return stats
 
-        # ---- deep-sweep decision (catch-up cursor in atlas_page) ----------
-        # The DEEP-due clock reads the dedicated 'atlas_deep' pointer, NOT
-        # atlas_page: atlas_page.updated_at is refreshed by every 3-hourly
-        # steady harvest, so a deep_due check against it could never fire
-        # (2026-10-13 finding: 47% of Atlas's first 1,250 listings were
-        # unreachable because deep sweeps never triggered). atlas_deep is
-        # stamped ONLY when a harvest COMPLETES with a deep sweep, so the
-        # 30-day catch-up cadence is measured sweep-to-sweep.
+        # ---- deep-sweep decision + steady-state sweep plan -----------------
+        # Sweeping has two layers (2026-10-14 coverage fix):
+        #   head  — pages 1..min(page_budget, ATLAS_SWEEP_PAGES_DEFAULT) are
+        #           re-checked on EVERY harvest (fresh listings enter the
+        #           20k-visit frontier at the front, sort asc).
+        #   tail  — a ROLLING cursor over pages >= ATLAS_TAIL_START that
+        #           advances ATLAS_ROLL_PAGES_DEFAULT pages per harvest and
+        #           wraps at the index ceiling. The old code reset
+        #           `atlas_page` to 1 after every completed steady harvest,
+        #           so pages 4..242 (~90% of the gated index) were only ever
+        #           seen by the 30-day deep sweep — Knife Case RNG (ID
+        #           10769768230) sat un-discovered exactly there.
+        # `atlas_page` stores the NEXT tail page to fetch; 1 (legacy steady
+        # reset / circuit never started) resumes at ATLAS_TAIL_START.
         now = time.time()
         cursor_row = None
         try:
@@ -3794,9 +3827,14 @@ class RobloxPlatformScout:
         except sqlite3.Error:
             cursor_row = None
         start_page = 1
+        raw_cursor = 1  # deep-sweep resume point (1 + fetched from a partial prior sweep)
+        tail_cursor = ATLAS_TAIL_START
         deep_due = False
         if cursor_row is not None and cursor_row[0] is not None:
-            start_page = int(cursor_row[0]) or 1
+            raw_cursor = int(cursor_row[0]) or ATLAS_TAIL_START
+            # Legacy steady pointer (1 = head reset) means the tail circuit
+            # never started: begin at the first page the head does not own.
+            tail_cursor = raw_cursor if raw_cursor >= ATLAS_TAIL_START else ATLAS_TAIL_START
             deep_stamp = self._atlas_pointer("atlas_deep")
             deep_due = deep_days > 0 and (
                 deep_stamp is None or (now - deep_stamp) >= deep_days * 86400
@@ -3804,11 +3842,19 @@ class RobloxPlatformScout:
         elif deep_days > 0:
             # No cursor row yet (fresh store): first-ever run is a catch-up.
             deep_due = True
-        sweep_pages = page_budget
         if deep_due:
-            sweep_pages = ATLAS_DEEP_PAGES_DEFAULT
+            # Honor a partial prior deep sweep: its pointer (1 + fetched) is
+            # the resume point; a fresh/head-state pointer starts at page 1.
+            plan = list(range(max(1, raw_cursor), ATLAS_DEEP_PAGES_DEFAULT + 1))
             stats["deep_sweep"] = True
-        if sweep_pages <= 0:
+        else:
+            head = list(range(1, min(page_budget, ATLAS_SWEEP_PAGES_DEFAULT) + 1))
+            tail = (
+                list(range(tail_cursor, tail_cursor + ATLAS_ROLL_PAGES))
+                if page_budget > 0 else []
+            )
+            plan = head + tail
+        if not plan:
             # No index fetching (stat bootstrap only) — still stamp the run.
             self._set_atlas_pointer("atlas_last_run", now)
             return stats
@@ -3816,9 +3862,8 @@ class RobloxPlatformScout:
         # ---- index sweep ---------------------------------------------------
         harvested: Dict[int, None] = {}
         fetched = 0
-        for page in range(start_page, start_page + sweep_pages):
-            if fetched >= sweep_pages:
-                break
+        last_tail_page: Optional[int] = None  # last tail page fetched this run (steady state)
+        for page in plan:
             url = f"{ATLAS_BASE_URL}?{ATLAS_QUERY}" + (f"&page={page}" if page > 1 else "")
             resp = self._atlas_fetch(url, delay)
             if resp is None:
@@ -3826,11 +3871,17 @@ class RobloxPlatformScout:
                 break  # pointer untouched: next run retries this range
             fetched += 1
             stats["pages_fetched"] += 1
-            for uid_s in re.findall(r'href="/analyze/(\d{8,12})"', resp.text):
+            # {6,15}: universe IDs just crossed 11 digits — the old 8-12 cap
+            # silently skipped nothing today but would skip 13-15 digit IDs
+            # as soon as they appear (and 6-7 digit vet IDs sort below the
+            # 20k-visit frontier these days — keep them visible too).
+            for uid_s in re.findall(r'href="/analyze/(\d{6,15})"', resp.text):
                 uid = int(uid_s)
                 if uid > 0 and uid not in harvested:
                     harvested[uid] = None
-            report(0.1 + 0.5 * fetched / max(1, sweep_pages), f"Atlas page {page}: +{len(harvested)} IDs")
+            if not stats["deep_sweep"] and page >= ATLAS_TAIL_START:
+                last_tail_page = page
+            report(0.1 + 0.5 * fetched / len(plan), f"Atlas page {page}: +{len(harvested)} IDs")
         stats["fetched_ids"] = len(harvested)
         stats["sweep_pages"] = fetched
         if fetched == 0:
@@ -3864,8 +3915,24 @@ class RobloxPlatformScout:
 
         # ---- commit pointers ONLY after a successful harvest ---------------
         self._set_atlas_pointer("atlas_last_run", now)
-        completed = fetched >= sweep_pages
-        self._set_atlas_pointer("atlas_page", 1 if completed else start_page + fetched)
+        completed = fetched >= len(plan)
+        if stats["deep_sweep"]:
+            # Deep sweep: cursor restarts at the head once the full-index
+            # catch-up completes; partial retries resume at the first
+            # unfetched page (same resume semantics as before).
+            self._set_atlas_pointer("atlas_page", 1 if completed else 1 + fetched)
+        elif last_tail_page is not None and completed:
+            # Steady state: the tail cursor NEVER resets to the head — that
+            # reset is the 2026-10-14 coverage bug this fixes. The circuit
+            # wraps only after passing the index ceiling, so every gate
+            # page is visited at least every ~11 successful harvests.
+            nxt = last_tail_page + 1
+            self._set_atlas_pointer(
+                "atlas_page",
+                ATLAS_TAIL_START if nxt > ATLAS_DEEP_PAGES_DEFAULT else nxt,
+            )
+        # Aborted steady runs keep the previous cursor: the next harvest
+        # retries the same tail range (head fetches are still enqueued).
         # Deep-sweep clock: stamp atlas_deep only when a harvest COMPLETED
         # with a deep sweep. Partial retries leave the clock running so the
         # next harvest resumes the same catch-up sweep, and steady-state
@@ -3950,10 +4017,14 @@ class RobloxPlatformScout:
           stays correct at any call frequency.
         - ``"expand"`` — Atlas Dev harvest + discovery-queue drain through
           the strict gate (the expander workflow's pass).
+        - ``"drain"`` — discovery-queue drain ONLY, no Atlas fetch. The
+          expander workflow runs this standalone FIRST so a proxy-pool
+          failure (which gates the harvest) can never stall evaluation of
+          seeds already in the queue.
         - ``None`` (default) — full pipeline: hydrate + expand.
         """
         selected = [p.strip().lower() for p in (phases or ()) if p and p.strip()]
-        invalid = [p for p in selected if p not in ("hydrate", "expand")]
+        invalid = [p for p in selected if p not in ("hydrate", "expand", "drain")]
         if invalid:
             raise ValueError(
                 f"Unknown scan phases: {invalid}. Use 'hydrate', 'expand', or None."
@@ -4012,6 +4083,8 @@ class RobloxPlatformScout:
         # finder/hydrator tiers (the PILOT_PLAN refresh floors stay untouchable). It runs
         # AFTER the run bookkeeping above so the pass lands in scan_runs with
         # the standard lifecycle.
+        if "drain" in phase_set and "expand" not in phase_set:
+            return self._scan_expand(min_visits, min_ccu, progress_cb, harvest=False)
         if do_expand:
             return self._scan_expand(min_visits, min_ccu, progress_cb)
 
@@ -4336,6 +4409,7 @@ class RobloxPlatformScout:
         min_visits: int,
         min_ccu: int,
         progress_cb: Optional[Callable[[float, str], None]] = None,
+        harvest: bool = True,
     ) -> pd.DataFrame:
         """Run one expansion pass (strict gate) as a full scan-mode workflow.
 
@@ -4343,9 +4417,13 @@ class RobloxPlatformScout:
         and inherits the standard run lifecycle; the strict gate is enforced by
         drain_discovery_queue regardless of the caller's min_visits/min_ccu
         arguments (the expander workflow passes 20000/25).
+
+        ``harvest=False`` turns this into a drain-only pass: queued seeds are
+        evaluated through the strict gate with zero Atlas requests (the
+        workflow decouples evaluation from Atlas/proxy health).
         """
         report = progress_cb or (lambda p, m: None)
-        result = self.run_expansion(progress_cb=report)
+        result = self.run_expansion(progress_cb=report, harvest=harvest)
         atlas = result.get("atlas") or {}
         drain = result.get("drain")
         qualified = int(drain.get("qualified") or 0)

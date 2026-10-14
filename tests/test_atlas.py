@@ -300,9 +300,12 @@ def test_harvest_enqueues_new_ids_with_source_and_priority(scout, monkeypatch):
             "WHERE universe_id = 9000000002"
         ).fetchone()
     assert row == ("atlas_dev", 2, "pending")
-    # A completed sweep resets the cursor; the throttle stamp is set.
+    # A completed steady harvest advances the tail cursor (it must NEVER
+    # reset to the head — that reset made pages 4+ unreachable for 30 days).
     assert scout._atlas_pointer("atlas_last_run") is not None
-    assert scout._atlas_pointer("atlas_page") == 1.0
+    assert scout._atlas_pointer("atlas_page") == (
+        scout_core.ATLAS_TAIL_START + scout_core.ATLAS_ROLL_PAGES_DEFAULT
+    )  # tail ran [2..26] -> next [27..51]
 
 
 def test_harvest_sends_honest_user_agent(scout, monkeypatch):
@@ -338,14 +341,73 @@ def test_throttle_releases_after_window(scout, monkeypatch):
 
 
 def test_cursor_resumes_partial_sweep(scout, monkeypatch):
+    """Deep-sweep partial retry: 50 pages fetched, then a network blip —
+    the pointer must resume at 1 + fetched so the remaining pages are
+    harvested on the next run."""
+    calls = []
+    limit = 50
+
+    def fake_get(url, timeout=30, proxies=None, **kwargs):
+        if calls is not None:
+            calls.append(url)
+        if "/analyze?" in url:
+            page = int(url.split("page=")[1]) if "page=" in url else 1
+            if page > limit:
+                raise scout_core.requests.ConnectionError("boom")
+            return FakeResponse(INDEX_HTML)
+        return FakeResponse("", status_code=404)
+
+    monkeypatch.setattr(scout_core.requests, "get", fake_get)
+    stats = scout.harvest_atlas_seeds(
+        deep_every_days=30, throttle_hours=0, stat_pages=0
+    )
+    assert stats["aborted"] is True
+    assert stats["pages_fetched"] == limit
+    assert scout._atlas_pointer("atlas_page") == 1 + limit  # retry from page 51
+    assert scout._atlas_pointer("atlas_deep") is None  # never completes ⇒ never stamps
+
+
+def test_tail_circuit_advances_and_wraps(scout, monkeypatch):
+    """2026-10-14 coverage fix: the steady harvest must walk the WHOLE gated
+    index via a rolling tail cursor that wraps at the ceiling — the old
+    reset-to-page-1 behavior left pages 4..242 unreachable for 30 days."""
     calls = []
     _patch_http(monkeypatch, pages={"*": INDEX_HTML}, calls=calls)
-    scout._set_atlas_pointer("atlas_page", 2)
-    scout.harvest_atlas_seeds(pages=2, stat_pages=0, throttle_hours=0)
-    fetched_pages = [
-        int(c["url"].split("page=")[1]) if "page=" in c["url"] else 1 for c in calls
+    scout.harvest_atlas_seeds(throttle_hours=0, stat_pages=0)  # tail 2..26
+    assert scout._atlas_pointer("atlas_page") == (
+        scout_core.ATLAS_TAIL_START + scout_core.ATLAS_ROLL_PAGES_DEFAULT
+    )
+    calls.clear()
+    scout.harvest_atlas_seeds(throttle_hours=0, stat_pages=0)  # tail 27..51
+    fetched_tails = [
+        int(c["url"].split("page=")[1]) for c in calls if "page=" in c["url"]
     ]
-    assert fetched_pages == [2, 3]  # resumed, never re-fetched page 1
+    # Head pages 2-3 are re-checked first; then the circuit runs [27..51].
+    assert fetched_tails == [2, 3] + list(range(
+        scout_core.ATLAS_TAIL_START + scout_core.ATLAS_ROLL_PAGES_DEFAULT,
+        scout_core.ATLAS_TAIL_START + 2 * scout_core.ATLAS_ROLL_PAGES_DEFAULT,
+    ))
+    # Head pages are re-checked BEFORE every tail window (fresh listings).
+    assert calls[0]["url"].endswith("sort=totalVisits&dir=asc&totalVisitsMin=20000&ccuMin=25")
+    calls.clear()
+    scout._set_atlas_pointer("atlas_page", scout_core.ATLAS_DEEP_PAGES_DEFAULT)
+    scout.harvest_atlas_seeds(throttle_hours=0, stat_pages=0)  # wraps at the ceiling
+    assert scout._atlas_pointer("atlas_page") == scout_core.ATLAS_TAIL_START
+
+
+def test_tail_walk_survives_pages_beyond_index_end(scout, monkeypatch):
+    """Pages past the live listing count return 404 — the cursor must keep
+    walking them (parse empty, advance) instead of aborting and pinning the
+    circuit outside the index forever."""
+    # _patch_http returns FakeResponse('', 404) for pages missing from the
+    # dict, so pages beyond 2 are 'gone'; page 2 exists.
+    _patch_http(monkeypatch, pages={2: INDEX_HTML})
+    stats = scout.harvest_atlas_seeds(throttle_hours=0, stat_pages=0)
+    assert stats["aborted"] is False
+    assert stats["fetched_ids"] == 3
+    assert scout._atlas_pointer("atlas_page") == (
+        scout_core.ATLAS_TAIL_START + scout_core.ATLAS_ROLL_PAGES_DEFAULT
+    )
 
 
 def test_deep_sweep_runs_full_index_when_due(scout, monkeypatch):
@@ -370,8 +432,10 @@ def test_deep_sweep_env_zero_disables_catchup(scout, monkeypatch):
     monkeypatch.setenv("ATLAS_DEEP_EVERY_DAYS", "0")
     stats = scout.harvest_atlas_seeds(pages=1, stat_pages=0, throttle_hours=0)
     assert stats["deep_sweep"] is False
-    assert stats["sweep_pages"] == 1
-    assert stats["pages_fetched"] == 1
+    assert stats["sweep_pages"] == (
+        1 + scout_core.ATLAS_ROLL_PAGES_DEFAULT  # 1 head page + the tail window
+    )
+    assert stats["pages_fetched"] == 1 + scout_core.ATLAS_ROLL_PAGES_DEFAULT
 
 
 def test_deep_sweep_defaults_on_when_env_unset(scout, monkeypatch):

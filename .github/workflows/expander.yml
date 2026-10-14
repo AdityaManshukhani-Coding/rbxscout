@@ -1,12 +1,17 @@
 # UpScale Scouting Tool expander — Atlas Dev seed harvest + discovery-queue drain (every 30 min).
 #
-# The sole discovery pipeline (ATLAS_PLAN_REVIEW.md): a 3h-throttled
-# harvest of atlasdev.gg/analyze (ATLAS_THROTTLE_HOURS=3 below; the code
-# default stays 23h for local runs) enqueues mid-tier universe IDs into the
-# priority discovery queue; every run then drains a bounded slice of the
-# queue through the strict gate. Only games meeting 20k visits / 25 CCU are
-# stored — everything else is recorded in discovery_queue as dedup memory,
-# never as a catalog row.
+# The sole discovery pipeline (ATLAS_PLAN_REVIEW.md), 2026-10-14 coverage
+# overhaul: a 1h-throttled harvest of atlasdev.gg/analyze
+# (ATLAS_THROTTLE_HOURS=1 below; the code default stays 23h for local runs)
+# re-checks the frontier head pages AND advances a ROLLING cursor through
+# the rest of the gated index (~242 pages) on every harvest, so every page
+# is visited roughly every 5 h instead of only during the monthly deep
+# sweep. Each run FIRST drains a bounded slice of the discovery queue
+# through the strict gate — drain-only, even when the proxy pool (which
+# gates the Atlas fetch) is down — so evaluation of already-discovered
+# seeds never stalls. Only games meeting 20k visits / 25 CCU are stored —
+# everything else is recorded in discovery_queue as dedup memory, never as
+# a catalog row.
 #
 # The catalog lives on the rolling Release `catalog-latest` (asset
 # rbx_scout.db): pull -> sync -> push, same as hydrator.
@@ -19,10 +24,12 @@
 # auto-cancels stale pending runs instead of letting them pile up behind a
 # 40-min cycle.
 #
-# Knobs (repo Variables, optional): ATLAS_SWEEP_PAGES (index pages per daily
-# harvest, 0 = kill switch), ATLAS_STAT_PAGES (provisional first-paint rows
-# per harvest, 0 disables), ATLAS_REQUEST_DELAY (polite per-request delay),
-# ATLAS_DEEP_EVERY_DAYS (full catch-up sweep cadence), EXPAND_QUEUE_BATCHES
+# Knobs (repo Variables, optional): ATLAS_SWEEP_PAGES (frontier head pages
+# re-checked per harvest — the rolling tail cursor adds ~25 pages/run on
+# every sustainable harvest; 0 = kill switch), ATLAS_STAT_PAGES
+# (provisional first-paint rows per harvest, 0 disables),
+# ATLAS_REQUEST_DELAY (polite per-request delay), ATLAS_DEEP_EVERY_DAYS
+# (full catch-up sweep cadence, backstop only now), EXPAND_QUEUE_BATCHES
 # (queue-drain batches per run).
 #
 # Manual runs: Actions tab -> "Expander — Atlas Dev harvest + drain (30 min)" -> Run workflow
@@ -62,7 +69,7 @@ env:
   ATLAS_STAT_PAGES: ${{ vars.ATLAS_STAT_PAGES || '' }}
   ATLAS_REQUEST_DELAY: ${{ vars.ATLAS_REQUEST_DELAY || '' }}
   ATLAS_DEEP_EVERY_DAYS: ${{ vars.ATLAS_DEEP_EVERY_DAYS || '' }}
-  # Queue-drain budget (default 10 batches = 500 candidates/run):
+  # Queue-drain budget (default 20 batches = 1,000 candidates/run):
   EXPAND_QUEUE_BATCHES: ${{ vars.EXPAND_QUEUE_BATCHES || '' }}
 
 # ⚠️ Keep this group IDENTICAL to hydrator.yml — the shared
@@ -101,6 +108,16 @@ jobs:
       - name: Run test suite (protects the catalog from bad pushes)
         run: python -m pytest tests -q
 
+      # ------------------------------------------------------------------
+      # DRAIN FIRST (2026-10-14): the steps below gate the harvest on the
+      # free-proxy pool and Scrape.do credits; when that gate fails, the job
+      # used to die BEFORE the queue drain too — 6k discovered seeds sat
+      # un-evaluated for hours while new-game intake was zero. Evaluation
+      # (no Atlas traffic) now runs unconditionally ahead of the harvest.
+      # ------------------------------------------------------------------
+      - name: Drain discovery queue first (independent of Atlas/proxy health)
+        run: python live_sync.py --only drain --min-visits 20000 --min-ccu 25
+
       # atlasdev.gg 403s many datacenter/runner IP ranges (2026-10-05 run
       # #722: BLUE — the harvest was throttled AND cloud fetches are
       # unreliable from
@@ -126,7 +143,7 @@ jobs:
 
       - name: Run expander (Atlas harvest + queue drain)
         env:
-          ATLAS_THROTTLE_HOURS: "3"   # users get new games every ~3 h, not once a day
+          ATLAS_THROTTLE_HOURS: "1"   # harvest on every second 30-min run (owner request: 1 h, not 3 h)
           # Scrape.do token as an ALWAYS-on source (2026-10-11). When the
           # free pool validated, the template is appended as the LAST failover
           # entry (credits burn only when the pool fails on a fetch). When

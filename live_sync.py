@@ -179,15 +179,18 @@ def main() -> int:
     parser.add_argument("--min-ccu", type=int, default=25)
     parser.add_argument(
         "--only",
-        choices=("hydrator", "expander"),
+        choices=("hydrator", "expander", "drain"),
         default=None,
         help="hydrator = refresh known games only; expander = Atlas Dev seed "
-        "harvest + queue drain; omit for the full pipeline.",
+        "harvest + queue drain; drain = evaluate queued seeds WITHOUT an "
+        "Atlas harvest (the workflow's drain-first step); omit for the full "
+        "pipeline.",
     )
     args = parser.parse_args()
     phases = {
         "hydrator": ("hydrate",),
         "expander": ("expand",),
+        "drain": ("drain",),
         None: None,
     }[args.only]
     mode = args.only or "full"
