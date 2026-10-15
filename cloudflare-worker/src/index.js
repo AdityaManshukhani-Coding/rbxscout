@@ -251,10 +251,21 @@ async function dispatchDueWorkflows(controller, env) {
   // rbxscout-sync queue: a hydrator dispatch in the same tick would sit
   // behind it and, under GitHub's default concurrency, supersede (cancel)
   // it — exactly the silent Atlas-finder outage fixed on 2026-10-13.
+  // Expander ticks dispatch UNCONDITIONALLY (2026-10-15 starvation fix):
+  // with Hydrators routinely running 5-9 min, every odd tick landed busy
+  // and the expander stopped dispatching entirely. A dispatch into a busy
+  // pipeline only QUEUES (pending) — running runs are never cancelled under
+  // this group's cancel-in-progress:false — and GitHub's 'newest pending
+  // wins' rule keeps at most one waiting Expander, so the queue cannot
+  // grow: a later tick supersedes an older pending Expander (a fresher
+  // harvest replaces a stale one — no work is wasted). Hydrator ticks KEEP
+  // the idle gate: stats freshness is deferrable and a queued Hydrator
+  // would keep superseding the pending Expander away (the 2026-10-13
+  // outage bug this gate was built for).
   const due = [];
   if (minute % 10 !== 0) {
     due.push(["expander", GITHUB_WORKFLOWS.expander]);
-  } else {
+  } else if (!busy) {
     due.push(["hydrator", GITHUB_WORKFLOWS.hydrator]);
   }
   const results = await Promise.allSettled(
