@@ -222,35 +222,6 @@ async function dispatchDueWorkflows(controller, env) {
   const scheduledAt = new Date(controller.scheduledTime || Date.now());
   const minute = scheduledAt.getUTCMinutes();
 
-  // Idle gate: with the workflows on GitHub's default concurrency (newest
-  // pending wins), dispatching into a busy pipeline would CANCEL whatever is
-  // waiting in line — that is what silently killed every :15/:45 Expander
-  // after the 2026-10-13 queue:max removal. If anything is in flight, skip
-  // this tick entirely; a skipped hydrator pass costs a few minutes of
-  // stat freshness, a cancelled expander costs a discovery cycle. The next
-  // tick remains the recovery path (the runs list is re-checked each tick).
-  let busy = false;
-  try {
-    busy = await anyRunInFlight(env);
-  } catch (error) {
-    // Fail-open: if we cannot read the runs list, dispatching as before is
-    // safer than silently stopping the clock (see the 2026-09-21 stall).
-    console.error(`in-flight check failed; dispatching anyway: ${error}`);
-  }
-  if (busy) {
-    console.log("pipeline busy (run active/pending) - tick skipped");
-    return;
-  }
-
-  // Expander (Atlas Dev harvest + discovery-queue drain) and Hydrator
-  // (stat freshness) alternate on the 5-minute ticks, so BOTH run every
-  // 10 minutes (2026-10-15 owner request: catch new Atlas Dev listings
-  // ~3x faster without raising total Actions minutes). Extreme halves:
-  // odd ticks belong to the Expander; the other half keeps stat
-  // freshness. The expander is always dispatched ALONE into the
-  // rbxscout-sync queue: a hydrator dispatch in the same tick would sit
-  // behind it and, under GitHub's default concurrency, supersede (cancel)
-  // it — exactly the silent Atlas-finder outage fixed on 2026-10-13.
   // Expander ticks dispatch UNCONDITIONALLY (2026-10-15 starvation fix):
   // with Hydrators routinely running 5-9 min, every odd tick landed busy
   // and the expander stopped dispatching entirely. A dispatch into a busy
@@ -261,11 +232,24 @@ async function dispatchDueWorkflows(controller, env) {
   // harvest replaces a stale one — no work is wasted). Hydrator ticks KEEP
   // the idle gate: stats freshness is deferrable and a queued Hydrator
   // would keep superseding the pending Expander away (the 2026-10-13
-  // outage bug this gate was built for).
+  // outage bug this gate was built for). NOTE: the busy check deliberately
+  // does NOT early-return anymore — the early return made the
+  // unconditional-expander design dead code (every busy expander tick
+  // exited here, 13:45→15:15 UTC 2026-10-15 outage).
+  let busy = false;
+  try {
+    busy = await anyRunInFlight(env);
+  } catch (error) {
+    // Fail-open: if we cannot read the runs list, dispatching as before is
+    // safer than silently stopping the clock (see the 2026-09-21 stall).
+    console.error(`in-flight check failed; dispatching anyway: ${error}`);
+  }
   const due = [];
   if (minute % 10 !== 0) {
     due.push(["expander", GITHUB_WORKFLOWS.expander]);
-  } else if (!busy) {
+  } else if (busy) {
+    console.log("hydrator tick skipped (run active/pending)");
+  } else {
     due.push(["hydrator", GITHUB_WORKFLOWS.hydrator]);
   }
   const results = await Promise.allSettled(
