@@ -45,6 +45,13 @@ class FakeResponse:
 def scout(tmp_path, monkeypatch):
     # Default-safe posture comes from constants; tests keep the deep sweep
     # off (its dedicated test passes explicit parameters) and delay at 0.
+    # The expander workflow exports the ATLAS_* ops knobs into the SAME
+    # process that runs these tests (ATLAS_ROLL_PAGES=8 at the 2026-10-15
+    # 10-min cadence) — the cursor assertions below verify the HARVEST
+    # contract against the module default, so pin the env back to default
+    # here. (2026-10-15 run #1058: the exported knob made cursor == 10.0
+    # while the tests expected ATLAS_TAIL_START + DEFAULT(25) = 27.)
+    monkeypatch.delenv("ATLAS_ROLL_PAGES", raising=False)
     monkeypatch.setenv("ATLAS_DEEP_EVERY_DAYS", "0")
     monkeypatch.setenv("ATLAS_REQUEST_DELAY", "0")
     s = RobloxPlatformScout(db_path=str(tmp_path / "atlas.db"))
