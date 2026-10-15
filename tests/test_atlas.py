@@ -315,6 +315,61 @@ def test_harvest_enqueues_new_ids_with_source_and_priority(scout, monkeypatch):
     )  # tail ran [2..26] -> next [27..51]
 
 
+def test_first_paint_stops_on_dead_pool(scout, monkeypatch):
+    """2026-10-15 run-of-death guard: with ATLAS_ROLL_PAGES and per-request
+    delays, one harvest ran to the 60-min Actions cap because a decayed
+    proxy pool made EVERY first-paint fetch a 30-s timeout and the loop
+    'continued' through all ~100 games. Two breakers now exist: the
+    ATLAS_STAT_BUDGET_S wall clock and the ATLAS_STAT_FAIL_STREAK
+    consecutive-failure breaker. This test pins the breaker: straight
+    failures must stop the loop after the limit, not request 100 pages."""
+    fetches = {"n": 0}
+
+    def fake_fetch(url, delay):
+        # _atlas_fetch also serves the index sweep — pass those through so
+        # the harvest completes and reaches the first-paint phase.
+        if url.startswith("https://atlasdev.gg/analyze?"):
+            return FakeResponse(INDEX_HTML)
+        fetches["n"] += 1
+        return None  # every game-page attempt dies
+
+    monkeypatch.setattr(scout, "_atlas_fetch", fake_fetch)
+    monkeypatch.setenv("ATLAS_STAT_FAIL_STREAK", "3")
+    monkeypatch.setenv("ATLAS_STAT_BUDGET_S", "3600")  # budget must NOT be the breaker here
+    stats = scout.harvest_atlas_seeds(throttle_hours=0, stat_pages=50)
+    # The queue still fills from the index sweep; only the first-paint
+    # phase is bounded by the breaker.
+    assert stats["fetched_ids"] == 3
+    assert fetches["n"] == 3, f"breaker must stop after 3 failures, tried {fetches['n']}"
+    assert stats["provisional_rows"] == 0
+    assert scout._atlas_pointer("atlas_last_run") is not None
+
+
+def test_first_paint_wall_clock_budget(scout, monkeypatch):
+    """The wall-clock cap stops the loop even when fetches keep succeeding
+    slowly — one new row, then the budget expires mid-loop."""
+    import time as _time
+
+    real_page = INDEX_HTML  # passing fetch → budget is the only stop
+    calls = {"n": 0}
+
+    def slow_fetch(url, delay):
+        if url.startswith("https://atlasdev.gg/analyze?"):
+            return FakeResponse(INDEX_HTML)
+        calls["n"] += 1
+        _time.sleep(0.05)
+        return FakeResponse(
+            '<html><head><meta name="description" content="'
+            f"Slow Game {calls['n']} - 100 playing now, 50,000 total visits."
+            '"></head><body></body></html>'
+        )
+
+    monkeypatch.setattr(scout, "_atlas_fetch", slow_fetch)
+    monkeypatch.setenv("ATLAS_STAT_BUDGET_S", "0")  # budget expires immediately
+    scout.harvest_atlas_seeds(throttle_hours=0, stat_pages=10)
+    assert calls["n"] <= 1, "budget must break before the second fetch"
+
+
 def test_harvest_sends_honest_user_agent(scout, monkeypatch):
     calls = []
     _patch_http(monkeypatch, pages={"*": INDEX_HTML}, calls=calls)

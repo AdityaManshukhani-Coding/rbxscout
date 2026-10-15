@@ -352,6 +352,8 @@ ATLAS_TAIL_START = 2                # the rolling circuit covers pages >= 2 (the
 ATLAS_DEEP_PAGES_DEFAULT = 275      # one-off catch-up sweep ceiling (full index)
 ATLAS_DEEP_EVERY_DAYS_DEFAULT = 30  # re-run the deep sweep this often (0 = never)
 ATLAS_STAT_PAGES_DEFAULT = 100      # provisional first-paint rows per harvest
+ATLAS_STAT_BUDGET_S_DEFAULT = 240   # wall-clock cap on the first-paint loop (2026-10-15 run of death: a decayed proxy pool stretched ONE harvest to the 60-min runner cap, holding the rbxscout-sync mutex and starving hydrator + drain)
+ATLAS_STAT_FAIL_STREAK_DEFAULT = 6  # consecutive first-paint fetch failures before declaring the proxy pool dead and skipping the rest
 ATLAS_REQUEST_DELAY_DEFAULT = 3.0   # polite per-request delay (seconds)
 ATLAS_USER_AGENT = "UpScaleScoutingTool/1.0 (Roblox game discovery; contact via repo)"
 ATLAS_PROXY_URLS_ENV = "RBXSCOUT_SEARCH_PROXY_URLS"  # flip-ready: shared pool var
@@ -3923,14 +3925,36 @@ class RobloxPlatformScout:
             return stats  # nothing succeeded; leave throttle un-stamped
 
         # ---- provisional first-paint rows (budgeted, newest seeds first) ---
+        # Two escape hatches (2026-10-15): a wall-clock budget and a
+        # consecutive-failure breaker. Each failing fetch can burn ~30 s of
+        # proxy connect timeout; when the validated pool dies mid-run the
+        # loop used to grind through every remaining game at ~30 s/apiece —
+        # the run then hit the 60-min Actions cap, its 'cancelled' exit
+        # still held the mutex, and hydrator + drain starved for an hour.
+        # First-paint rows are a nice-to-have: the queue drain gives every
+        # seed the strict gate anyway, so the next harvest re-covers the
+        # skipped ones.
         if stat_budget > 0:
             done = 0
+            stat_started = time.monotonic()
+            stat_seconds = _env_int("ATLAS_STAT_BUDGET_S", ATLAS_STAT_BUDGET_S_DEFAULT)
+            fail_streak_limit = _env_int("ATLAS_STAT_FAIL_STREAK", ATLAS_STAT_FAIL_STREAK_DEFAULT)
+            fail_streak = 0
             for uid in sorted(harvested, reverse=True):
                 if done >= stat_budget:
                     break
+                elapsed = time.monotonic() - stat_started
+                if elapsed >= stat_seconds:
+                    report(0.65, f"Atlas first-paint budget hit ({elapsed:.0f}s) — {done} rows, skipping the rest")
+                    break
+                if fail_streak >= fail_streak_limit:
+                    report(0.65, f"Atlas first-paint pool dead ({fail_streak} straight failures) — skipping the rest")
+                    break
                 game_html = self._atlas_fetch(f"{ATLAS_BASE_URL}/{uid}", delay)
                 if game_html is None:
+                    fail_streak += 1
                     continue
+                fail_streak = 0
                 done += 1
                 meta = re.search(r'<meta name="description" content="([^"]+)"', game_html.text)
                 if not meta:
