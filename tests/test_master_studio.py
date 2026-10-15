@@ -119,26 +119,42 @@ def _walk_to_message_step(at: AppTest) -> None:
 
 
 def test_increates_templates_shape():
-    """Five rotations, [Game Name] kept, 🫡 sign-off, no identity tags."""
+    """Five rotations, [Game Name] kept, no identity tags. Since the
+    2026-10-15 universal set, BOTH studios share the SAME five starters —
+    the guard is that Increates's alias serves the universal set, not the
+    old deals-pitch wording."""
+    assert INCREASES_MESSAGE_TEMPLATES is DEFAULT_MESSAGE_TEMPLATES
     assert len(INCREASES_MESSAGE_TEMPLATES) == 5
     for template in INCREASES_MESSAGE_TEMPLATES:
         assert "[Game Name]" in template
-        assert "🫡" in template
-        assert "[Your Name]" not in template  # deals pitch, not identity-led
-        assert template.splitlines()[0] in ("Hey,", "Hi,"), template.splitlines()[0]
+        assert "🫡" not in template
+        assert "[Your Name]" not in template  # lead with enthusiasm, not identity
+        assert template.splitlines()[0].split()[0].rstrip(",") in ("Hey", "Hi", "Hello"), template.splitlines()[0]
     # Message 1 is the owner's exact copy (modulo the tag).
     first = INCREASES_MESSAGE_TEMPLATES[0]
-    assert "competitive price" in first
-    assert "LiveOps, thumbnails, growth, monetisation & much more" in first
-    assert "Thanks so much for your time 🫡" in first
-    # All five differ, like the UpScale set.
+    assert first.startswith("Hey, I really like what you are doing with **[Game Name]**")
+    assert "hearing an offer for it" in first
+    # All five differ.
     assert len(set(INCREASES_MESSAGE_TEMPLATES)) == 5
 
 
 def test_increates_set_does_not_disturb_default_set():
+    """Universal set (2026-10-15): the default alias points at the same
+    five starters, so no studio name ever leaks into the wording."""
     assert DEFAULT_MESSAGE_TEMPLATES[0] == DEFAULT_MESSAGE_TEMPLATE
-    assert "UpScale" in DEFAULT_MESSAGE_TEMPLATES[0]
     for template in DEFAULT_MESSAGE_TEMPLATES:
+        assert "UpScale" not in template
+        assert "Increates" not in template
+        assert "🫡" not in template
+
+
+def test_increates_set_does_not_disturb_default_set():
+    """Universal set (2026-10-15): the default alias points at the same
+    five starters, so no studio name ever leaks into the wording."""
+    assert DEFAULT_MESSAGE_TEMPLATES[0] == DEFAULT_MESSAGE_TEMPLATE
+    for template in DEFAULT_MESSAGE_TEMPLATES:
+        assert "UpScale" not in template
+        assert " Increates" not in template
         assert "🫡" not in template
 
 
@@ -233,10 +249,11 @@ def test_master_copy_pool_follows_active_studio():
     table_html = "".join(el.proto.body for el in html_blocks)
     assert "ss-table" in table_html, "results table renders after onboarding"
     assert "data-alts" in table_html, "copy buttons embed the rotation pool"
-    # The pool JSON is ascii-escaped, so decode it before checking the
-    # Increates sign-off made it into the rotation.
+    # The pool carries the universal starters: every entry names the game
+    # (title filled) and pitches an offer.
     import html as html_module
     match = re.search(r'data-alts="([^"]+)"', table_html)
     pool = json.loads(html_module.unescape(match.group(1)))
     assert len(pool) == 5
-    assert all("🫡" in entry["t"] for entry in pool)
+    assert all("offer" in entry["t"].lower() for entry in pool)
+    assert all("[Game Name]" not in entry["t"] for entry in pool)

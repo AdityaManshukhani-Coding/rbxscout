@@ -108,20 +108,25 @@ def _render_dashboard(name: str = "dev_razor10") -> AppTest:
 
 
 def test_render_fills_name_and_game_tags():
+    """The [Game Name] tag fills from the row; the universal starters carry
+    no [Your Name] tag, so a supplied scout name cannot leak into them."""
     message = render_outreach_message(DEFAULT_MESSAGE_TEMPLATE, "dev_razor10", "Blox Fruits")
-    assert "dev_razor10" in message
-    assert "Blox Fruits" in message
-    assert "[Your Name]" not in message
+    assert "**Blox Fruits**" in message
     assert "[Game Name]" not in message
-    assert "I'm [Your Name] from UpScale" not in message
-    assert "caught our eye" in message and "Blox Fruits" in message
-    assert "temporary percentage of revenue" in message
+    assert "dev_razor10" not in message  # no name tag to fill
+    assert message == (
+        "Hey, I really like what you are doing with **Blox Fruits** "
+        "and I was hoping you are interested in hearing an offer for it"
+    )
 
 
 def test_render_keeps_tag_when_name_missing():
+    """Universal template: the name plays no role — game title fills,
+    no tags ever remain."""
     message = render_outreach_message(DEFAULT_MESSAGE_TEMPLATE, "", "Blox Fruits")
-    assert "[Your Name]" in message
-    assert "Blox Fruits" in message
+    assert "**Blox Fruits**" in message
+    assert "[Game Name]" not in message
+    assert "[Your Name]" not in message
 
 
 def test_render_case_insensitive_tags():
@@ -132,15 +137,32 @@ def test_render_case_insensitive_tags():
 
 def test_render_empty_template_falls_back_to_default():
     message = render_outreach_message("   ", "ace", "Speed Run")
-    assert "I'm ace from UpScale" in message
+    # Universal templates (2026-10-15): no [Your Name] tag — the fallback is
+    # the owner's exact wording with the game name filled in.
+    assert "Speed Run" in message
+    assert "I really like what you are doing with **Speed Run**" in message
+    assert "ace" not in message  # no name tag to fill
 
 
 def test_default_templates_open_with_plain_greeting():
-    """(2026-09-28) The [User] placeholder is gone: every starter opens with
-    a plain greeting, so nothing is ever copied with an unfilled tag."""
+    """(2026-09-28, updated 2026-10-15) The [User] placeholder is gone and
+    each of the 5 universal starters opens with a greeting word, keeps the
+    【Game Name】 tag for auto-fill, and mentions an offer — no studio
+    name, no identity tag in any of them."""
     for template in DEFAULT_MESSAGE_TEMPLATES:
         assert "[User]" not in template
-        assert template.splitlines()[0] in ("Hey,", "Hi,"), template.splitlines()[0]
+        assert "UpScale" not in template and "Increates" not in template
+        assert "[Your Name]" not in template
+        assert "[Game Name]" in template, template
+        assert "offer" in template.lower(), template
+        assert template.splitlines()[0].split()[0].rstrip(",") in ("Hey", "Hi", "Hello"), template.splitlines()[0]
+
+
+def _tagged_template():
+    """A scout-modified template with identity tags — exercises the
+    [Your Name] mention/name fill even though the universal starters do not
+    carry the tag."""
+    return "[Your Name] here — love **[Game Name]**, open to a quick chat?"
 
 
 # --------------------------------------------------------------------------- #
@@ -167,7 +189,7 @@ def test_normalize_discord_user_id(raw, expected):
 
 def test_render_with_user_id_makes_real_mention_token():
     message = render_outreach_message(
-        DEFAULT_MESSAGE_TEMPLATE, "dev_razor10", "Blox Fruits",
+        _tagged_template(), "dev_razor10", "Blox Fruits",
         discord_user_id="53908099506183680",
     )
     assert "<@53908099506183680>" in message
@@ -177,7 +199,7 @@ def test_render_with_user_id_makes_real_mention_token():
 
 def test_render_without_user_id_keeps_plain_name():
     message = render_outreach_message(
-        DEFAULT_MESSAGE_TEMPLATE, "dev_razor10", "Blox Fruits", discord_user_id=""
+        _tagged_template(), "dev_razor10", "Blox Fruits", discord_user_id=""
     )
     assert "dev_razor10" in message
     assert "<@" not in message
@@ -185,7 +207,7 @@ def test_render_without_user_id_keeps_plain_name():
 
 def test_render_invalid_user_id_falls_back_to_plain_name():
     message = render_outreach_message(
-        DEFAULT_MESSAGE_TEMPLATE, "dev_razor10", "Blox Fruits",
+        _tagged_template(), "dev_razor10", "Blox Fruits",
         discord_user_id="not-an-id",
     )
     assert "dev_razor10" in message
@@ -195,7 +217,7 @@ def test_render_invalid_user_id_falls_back_to_plain_name():
 def test_render_missing_name_leaves_tag_even_with_id():
     """No username + an ID: the token still fills — the mention IS the name."""
     message = render_outreach_message(
-        DEFAULT_MESSAGE_TEMPLATE, "", "Blox Fruits",
+        _tagged_template(), "", "Blox Fruits",
         discord_user_id="53908099506183680",
     )
     assert "<@53908099506183680>" in message
@@ -296,10 +318,35 @@ def test_user_id_optional_field_flows_into_copied_message(monkeypatch):
     at.run()
 
     assert not at.exception
+    # The universal starters carry no [Your Name] tag, so the saved ID has
+    # nothing to fill — no accidental mention in the copied message.
+    match = re.search(r'data-msg="([^"]+)"', _table_html(at))
+    message = json.loads(html_module.unescape(match.group(1)))
+    assert "<@53908099506183680>" not in message
+    assert "[Your Name]" not in message
+    assert "[Game Name]" not in message
+
+
+def test_user_id_flows_into_a_tagged_customized_template(monkeypatch):
+    """A scout who adds the [Your Name] tag back to their customized
+    template gets the real <@ID> mention behaviour the field exists for."""
+    _patch_catalog_reader(monkeypatch, _demo_frame())
+
+    at = _fresh_app()
+    at.run()
+    at.button(key="onb0_next").click().run()
+    at.button(key="onb1_next").click().run()
+    at.text_input(key="discord_name").set_value("dev_razor10").run()
+    at.text_input(key="discord_user_id").set_value("53908099506183680").run()
+    at.button(key="onb3_next").click().run()  # -> message template step
+    at.text_area(key="message_template").set_value(_tagged_template()).run()
+    at.button(key="onb4_start").click().run()
+    at.run()
+
+    assert not at.exception
     match = re.search(r'data-msg="([^"]+)"', _table_html(at))
     message = json.loads(html_module.unescape(match.group(1)))
     assert "<@53908099506183680>" in message
-    assert "dev_razor10" not in message
     assert "[Your Name]" not in message
 
 
@@ -502,9 +549,9 @@ def test_results_table_has_copy_message_column():
     message = json.loads(html_module.unescape(match.group(1)))
 
     # The Discord name from the welcome flow and the row's game title are filled in.
-    assert "dev_razor10" in message
     assert "Blox Fruits" in message
     assert "[Your Name]" not in message
+    assert "[Game Name]" not in message
     assert "[Game Name]" not in message
 
 
@@ -526,12 +573,14 @@ def test_copy_button_rotates_all_variants_never_repeating():
     assert keys == [f"s{i}" for i in range(5)], "one pool entry per starter"
     texts = [entry["t"] for entry in pool]
     assert len(set(texts)) == 5, "all starters differ"
-    # Every pool entry is rendered for this row's game but keeps [Your Name]
-    # for the click-time identity fill.
+    # Every pool entry is rendered for this row's game. The universal
+    # starters carry no name tag — the pool text is one voice per starter,
+    # always with the game title filled and no tag left anywhere.
     for text in texts:
         assert "Blox Fruits" in text
         assert "[Game Name]" not in text
-        assert "[Your Name]" in text
+        assert "[Your Name]" not in text
+        assert "offer" in text.lower()
 
     # The client script does the no-repeat pick in localStorage.
     scripts = re.findall(r"<script>(.*?)</script>", table_html, re.S)
@@ -541,9 +590,10 @@ def test_copy_button_rotates_all_variants_never_repeating():
     assert "filter" in js, "previous variant is excluded from the pick"
 
 
-def test_standard_session_rotation_pool_has_no_increates_messages():
-    """A regular (friend-key or gate-bypassed) session never rotates the
-    master-only Increates set: the pool stays exactly the 5 UpScale starters."""
+def test_standard_session_rotation_pool_matches_universal_set():
+    """Every session's rotation pool is exactly the 5 UNIVERSAL starters
+    (2026-10-15: both studios share one set, so the pool is the same for
+    master and standard sessions)."""
     at = _render_dashboard()
     assert not at.exception
 
@@ -552,9 +602,11 @@ def test_standard_session_rotation_pool_has_no_increates_messages():
     assert match, "copy button should embed the rotation pool"
     pool = json.loads(html_module.unescape(match.group(1)))
     texts = [entry["t"] for entry in pool]
-    for template in scout_core.INCREASES_MESSAGE_TEMPLATES:
-        rendered = render_outreach_message(template, "", "Blox Fruits")
-        assert rendered not in texts, "Increates copy leaked into a standard session"
+    expected = [
+        render_outreach_message(template, "", "Blox Fruits")
+        for template in scout_core.DEFAULT_MESSAGE_TEMPLATES
+    ]
+    assert texts == expected, "the pool must be the universal starter set"
 
 
 def test_copy_script_rewrites_identity_from_live_sidebar_inputs():
@@ -830,13 +882,16 @@ def test_refresh_restores_completed_scout_and_reloads_results(
     assert not at.exception
     titles = [el.value for el in at.title]
     assert any("Games matching" in t for t in titles), "dashboard, not welcome flow"
-    # Identity came back for the copy-message cells: with a saved User ID the
-    # message carries the real mention token (which takes precedence), so the
-    # restored identity is proven by the token itself.
+    # Identity came back for the copy-message cells. The universal
+    # starters carry no [Your Name] tag, so the restored identity proves
+    # itself differently: the saved ID still exists, and the copied
+    # message carries the universal wording with the game filled.
     match = re.search(r'data-msg="([^"]+)"', _table_html(at))
     assert match, "results table with copy buttons rendered"
     message = json.loads(html_module.unescape(match.group(1)))
-    assert "<@53908099506183680>" in message
+    assert "[Your Name]" not in message
+    assert "**Blox Fruits**" in message or "Blox Fruits" in message
+    assert at.session_state["discord_user_id"] == "53908099506183680"
     assert "[Your Name]" not in message
 
 

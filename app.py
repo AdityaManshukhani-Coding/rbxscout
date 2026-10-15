@@ -1028,13 +1028,15 @@ def render_onboarding() -> bool:
             "picking one just loads it here as your starting point."
         )
         st.caption(
-            "Make sure you use the [Your Name] tag for your Discord username and the "
-            "[Game Name] tag for the game's name — both are filled in automatically "
-            "when you copy a message, so keep them if you edit the text."
+            "The [Game Name] tag fills in each game's title automatically when "
+            "you copy a message — keep it if you edit the text. If you add a "
+            "[Your Name] tag to your template, your Discord username fills in "
+            "automatically too."
         )
         st.caption(
-            "With a User ID saved, [Your Name] copies as a real @mention; without one, "
-            "your plain username is used. Both work — the ID is optional."
+            "If your template carries a [Your Name] tag, a saved User ID copies it "
+            "as a real @mention; without one, your plain username is used. The ID "
+            "is optional — the starters don't use the tag by default."
         )
         preview = render_outreach_message(
             st.session_state.message_template,
@@ -1485,7 +1487,8 @@ with st.sidebar.expander("Your message", expanded=False):
         on_change=_save_profile_identity,
     )
     st.caption(
-        "ID set → [Your Name] copies as a clickable, pingable @mention. "
+        "If your template uses the [Your Name] tag, a saved ID copies it as a "
+        "clickable, pingable @mention. "
         "Find it: Developer Mode → right-click your name → Copy User ID."
     )
     st.text_area(
@@ -1497,8 +1500,8 @@ with st.sidebar.expander("Your message", expanded=False):
     )
     st.caption(
         "Each Copy click picks a random starter (never the same one twice "
-        "in a row) and auto-fills [Your Name] / [Game Name]. Edit the text "
-        "above to customize what gets rotated."
+        "in a row) and auto-fills [Game Name] — plus [Your Name] if your "
+        "template uses it. Edit the text above to customize what gets rotated."
     )
 
 if st.sidebar.button("Forget this device", width="stretch", key="forget_device"):

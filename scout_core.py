@@ -155,112 +155,39 @@ DISCORD_LOGO_URL = "https://cdn.simpleicons.org/discord/5865F2"
 # title). Users may edit the template freely in the welcome flow or sidebar,
 # but the tags must stay for auto-fill to keep working.
 #
-# The model every variant describes (owner's wording, 2026-09-27): UpScale
-# takes a temporary percentage of revenue for a set period, provides
-# dedicated PTR support and LiveOps, and when the term ends full revenue and
-# control return to the developer who keeps everything built during the
-# partnership. No portfolio links, no sale/investment framing.
-DEFAULT_MESSAGE_TEMPLATE = """\
-Hey,
-
-I'm [Your Name] from UpScale. At UpScale, we take a temporary percentage of revenue for a set period while providing our partners with dedicated PTR support and LiveOps. Once the term ends, full revenue and control return to you, and you keep everything built during the partnership.
-
-**[Game Name]** recently caught our eye, and we really love where you're taking the project. I wanted to see if you're open to exploring ways to scale it?
-
-If you're up for a quick look, I can answer any extra questions."""
-
-# Four more phrasings of the same outreach, so a scout can rotate between
-# copies and Discord's anti-spam heuristics see varied text instead of one
-# identical message pasted at 20 servers. Every variant keeps the
-# [Your Name] and [Game Name] tags (render_outreach_message fills them) and
-# the same revenue-share/PTR/LiveOps model; openings, closings and sentence
-# structures differ.
-DEFAULT_MESSAGE_TEMPLATES = (
-    DEFAULT_MESSAGE_TEMPLATE,
+# Universal outreach starters, shared by every studio (owner request
+# 2026-10-15: one message set instead of the old UpScale/Increates split,
+# in the owner's exact wording). The **[Game Name]** tag is filled in
+# automatically when the user copies a message (game title from the row).
+# The set deliberately carries no [Your Name] tag — these messages lead
+# with enthusiasm, not identity — though render_outreach_message still
+# honors a [Your Name] tag if a scout adds one to a customized template.
+# Five distinct phrasings keep Discord's anti-spam heuristics from seeing
+# one identical message pasted at many servers.
+UNIVERSAL_MESSAGE_TEMPLATES = (
     """\
-Hi,
-
-[Your Name] here, from UpScale. Our model is simple: we take a temporary percentage of revenue for a set period, and in exchange our partners get dedicated PTR support and LiveOps. When the term ends, full revenue and control come back to you — everything built during the partnership stays yours.
-
-**[Game Name]** caught our eye recently, and honestly, we love the direction you're taking it. Would you be open to exploring a few ways to scale it?
-
-Happy to answer any questions — a quick look costs you nothing.""",
+Hey, I really like what you are doing with **[Game Name]** and I was hoping you are interested in hearing an offer for it""",
     """\
-Hey,
-
-I'm [Your Name] with UpScale. Here's how we work: UpScale takes a temporary cut of revenue for a fixed period while providing dedicated PTR support and LiveOps to our partners. Once that term ends, full revenue and control return to you, and you keep everything that was built along the way.
-
-We recently came across **[Game Name]** and really like where you're taking the project. I'd love to see if you're open to exploring ways to scale it.
-
-If you're up for a quick chat, I can answer any extra questions you have.""",
+Hi, I love playing **[Game Name]**, are you down to hear an offer for it?""",
     """\
-Hi,
-
-[Your Name] from UpScale here. Our partnership model: a temporary percentage of revenue for a set period, with dedicated PTR support and LiveOps provided throughout. When the term is over, full revenue and control return to you — and you keep everything built during the partnership.
-
-**[Game Name]** recently caught our attention, and we genuinely love where you're taking it. I wanted to ask if you'd be open to exploring some ways to scale the game.
-
-Up for a quick look? I'm happy to answer any extra questions.""",
+Hello, really well done with **[Game Name]**, open to hearing an offer for it?""",
     """\
-Hey,
-
-This is [Your Name] from UpScale. We take a temporary percentage of revenue for a set period, and our partners get dedicated PTR support and LiveOps the whole way. Once the term ends, full revenue and control go back to you — everything built during the partnership is yours to keep.
-
-**[Game Name]** caught our eye recently and we really like the direction you're taking it. Would you be interested in exploring ways to scale it together?
-
-If you'd like, I can walk you through it and answer any extra questions.""",
+Hey **[Game Name]** looks awesome, are you open to talk about an offer for it?""",
+    """\
+Hi, love what you've done with **[Game Name]** and I wanted to see if you're open to offers?""",
 )
+
+# The studio-agnostic set the whole app reads.
+DEFAULT_MESSAGE_TEMPLATES = UNIVERSAL_MESSAGE_TEMPLATES
 # Backwards-compatible alias: the first variant IS the original default.
 DEFAULT_MESSAGE_TEMPLATE = DEFAULT_MESSAGE_TEMPLATES[0]
 
-# Master-key-only alternative starter set ("Increates Studio"). Shown as a
-# second studio choice in the welcome flow and sidebar when the deployment's
-# master password (the owner's key) unlocked the app — regular scout keys
-# never see it. Same shape as the UpScale set: five rotations, [Game Name]
-# tag kept for render_outreach_message, casual deals-first voice, 🫡 sign-off
-# (owner-requested override of the no-emoji rule for this set).
-INCREASES_MESSAGE_TEMPLATES = (
-    """\
-Hey,
-
-I was wondering if there's any chance you'd be open to any deals for **[Game Name]**?
-
-We can offer you a competitive price and provide help with LiveOps, thumbnails, growth, monetisation & much more.
-
-Thanks so much for your time 🫡""",
-    """\
-Hey,
-
-Quick one — would you be open to hearing a deal or two for **[Game Name]**?
-
-We keep our offers competitive and back them up with hands-on help: LiveOps, thumbnails, growth, monetisation & a lot more.
-
-Appreciate you taking a look 🫡""",
-    """\
-Hi,
-
-Would you be interested in talking deals for **[Game Name]** at all?
-
-We can put a competitive price on the table and bring real support with it — LiveOps, thumbnails, growth, monetisation & much more besides.
-
-Thanks a lot for your time 🫡""",
-    """\
-Hey,
-
-Is there any room to chat about a deal for **[Game Name]**?
-
-We come in with a competitive offer and back it up with the full toolkit: LiveOps, thumbnails, growth, monetisation & more.
-
-Cheers for reading 🫡""",
-    """\
-Hi,
-
-Would you be open to exploring some deals for **[Game Name]**?
-
-Our offers are competitive, and we bring hands-on help along with them — LiveOps, thumbnails, growth, monetisation & much more.
-
-Thanks so much 🫡""",
-)
+# Master-key-only "Increates Studio" choice: since 2026-10-15 BOTH studio
+# selections share the same universal set (the master-only Studio switch
+# survives in the UI but can no longer change the wording). Kept as an
+# explicit alias so existing callers (app.py's hot-update fallback, the
+# master-studio tests) keep importing it.
+INCREASES_MESSAGE_TEMPLATES = UNIVERSAL_MESSAGE_TEMPLATES
 
 NAME_TAG_REGEX = re.compile(r"\[(?:your name|name)\]", re.IGNORECASE)
 GAME_TAG_REGEX = re.compile(r"\[(?:game name|game)\]", re.IGNORECASE)
