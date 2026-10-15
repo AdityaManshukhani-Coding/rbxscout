@@ -928,61 +928,22 @@ def render_onboarding() -> bool:
             st.warning("Both targets are at the entry bar — fine, but you can raise them any time.")
         if st.button("Next", type="primary", width="stretch", key="onb1_next"):
             if int(st.session_state.target_min_visits) or int(st.session_state.target_min_ccu):
-                st.session_state.onboarding_step = 3
+                # 2026-10-15: the Discord username / User ID step is GONE —
+                # the universal outreach starters carry no [Your Name] tag,
+                # so there is nothing to fill between targets and message.
+                # Someone who wants the old identity behaviour can add a
+                # [Your Name] tag to a customized template and set their
+                # username in the sidebar.
+                st.session_state.onboarding_step = 4
                 _profile_save()  # targets + step survive a refresh
                 st.rerun()
         return False
 
+    # Legacy sessions parked mid-flow on the removed Discord step (step 3)
+    # resume on the message step instead of falling through every branch.
     if step == 3:
-        st.title("What is your Discord username?")
-        st.caption(
-            "Your username is filled into the outreach message automatically, so game "
-            "owners see who is contacting them. You can change it later in the sidebar."
-        )
-        st.text_input(
-            "Discord username",
-            key="discord_name",
-            max_chars=64,
-            placeholder="e.g. dev_razor10 or rip_indra",
-            persist_state="session",
-            on_change=_save_profile_identity,
-        )
-        if not str(st.session_state.discord_name or "").strip():
-            st.caption("Tip: add your username so the message template can fill it in for you.")
-        st.text_input(
-            "Discord User ID (optional)",
-            key="discord_user_id",
-            max_chars=32,
-            placeholder="e.g. 53908099506183680",
-            persist_state="session",
-            on_change=_save_profile_identity,
-        )
-        st.caption(
-            "How to find it: 1) Discord → User Settings → Advanced → turn on Developer Mode. "
-            "2) Right-click your own name anywhere in a server or DM. "
-            "3) Click “Copy User ID” and paste it here."
-        )
-        st.caption(
-            "Why an ID? Pasting “@username” into Discord is plain text — only messages "
-            "carrying your numeric ID ping and link to you. Leave it blank and your plain "
-            "username is used instead; this field is always optional."
-        )
-        if str(st.session_state.discord_user_id or "").strip() and not normalize_discord_user_id(
-            st.session_state.discord_user_id
-        ):
-            st.warning(
-                "That doesn't look like a User ID (it should be 15–21 digits). "
-                "It will be ignored and your plain username used — or clear the field."
-            )
-        back, next_column = st.columns(2)
-        if back.button("Back", width="stretch", key="onb3_back"):
-            st.session_state.onboarding_step = 1
-            st.rerun()
-        if next_column.button("Next", type="primary", width="stretch", key="onb3_next"):
-            st.session_state.onboarding_step = 4
-            _profile_save()  # keep name / ID / progress across refreshes
-            st.rerun()
-        return False
+        st.session_state.onboarding_step = 4
+        st.rerun()
 
     if step == 4:
         st.title("Your outreach message")
@@ -1048,7 +1009,7 @@ def render_onboarding() -> bool:
             st.code(preview, language="markdown")
         back, next_column = st.columns(2)
         if back.button("Back", width="stretch", key="onb4_back"):
-            st.session_state.onboarding_step = 3
+            st.session_state.onboarding_step = 1
             st.rerun()
         if next_column.button("Start my first scan", type="primary", width="stretch", key="onb4_start"):
             # Bulletproof target capture: read the live onboarding widget

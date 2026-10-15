@@ -108,9 +108,7 @@ def _friend_app(ref: str) -> AppTest:
 
 def _walk_to_message_step(at: AppTest) -> None:
     at.button(key="onb0_next").click().run()
-    at.button(key="onb1_next").click().run()
-    at.text_input(key="discord_name").set_value("master_scout").run()
-    at.button(key="onb3_next").click().run()
+    at.button(key="onb1_next").click().run()  # targets -> message (no Discord step)
 
 
 # --------------------------------------------------------------------------- #

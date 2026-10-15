@@ -229,20 +229,22 @@ def test_render_missing_name_leaves_tag_even_with_id():
 # --------------------------------------------------------------------------- #
 
 
-def test_onboarding_asks_discord_name_then_template():
+def test_onboarding_goes_targets_then_template_no_discord_step():
+    """(2026-10-15) The Discord username / User ID step is removed: targets
+    flow straight into the message step, and no step of the welcome flow
+    ever asks for the username again."""
     at = _fresh_app()
     at.run()
     assert not at.exception
 
     at.button(key="onb0_next").click().run()  # welcome -> targets
-    at.button(key="onb1_next").click().run()  # targets -> Discord name
+    at.button(key="onb1_next").click().run()  # targets -> message
 
-    # Discord username step comes right after the targets step.
     titles = [element.value for element in at.title]
-    assert any("Discord username" in value for value in titles)
-
-    at.text_input(key="discord_name").set_value("dev_razor10").run()
-    at.button(key="onb3_next").click().run()  # Discord -> message template
+    assert any("outreach message" in value for value in titles), titles
+    assert not [t for t in titles if "Discord username" in t], (
+        "welcome flow must not ask for a Discord username"
+    )
 
     titles = [element.value for element in at.title]
     assert any("outreach message" in value for value in titles)
@@ -298,28 +300,22 @@ def test_sidebar_variant_switcher_swaps_template(monkeypatch, tmp_path):
 def test_user_id_optional_field_flows_into_copied_message(monkeypatch):
     """Step 3 shows the optional User ID field with helper captions; a saved
     ID makes the copied message carry a real <@ID> mention token; leaving it
-    empty keeps the plain username."""
+    empty keeps the plain username. (2026-10-15: the welcome-flow ask is
+    gone — the optional field lives in the sidebar now.)"""
     _patch_catalog_reader(monkeypatch, _demo_frame())
 
     at = _fresh_app()
     at.run()
     at.button(key="onb0_next").click().run()
-    at.button(key="onb1_next").click().run()
-
-    # Step 3: the optional field + the 3-step "how to find your ID" helper.
-    captions = [element.value for element in at.caption]
-    assert any("Developer Mode" in value and "Copy User ID" in value for value in captions)
-    assert any("optional" in value.lower() for value in captions)
-
-    at.text_input(key="discord_name").set_value("dev_razor10").run()
-    at.text_input(key="discord_user_id").set_value("53908099506183680").run()
-    at.button(key="onb3_next").click().run()  # -> message template step
+    at.button(key="onb1_next").click().run()  # targets -> message
     at.button(key="onb4_start").click().run()  # first scan from the catalog
     at.run()
-
     assert not at.exception
-    # The universal starters carry no [Your Name] tag, so the saved ID has
-    # nothing to fill — no accidental mention in the copied message.
+
+    # The universal starters carry no [Your Name] tag, so an ID set in the
+    # sidebar has nothing to fill — no accidental mention in the copy.
+    at.sidebar.text_input(key="discord_user_id").set_value("53908099506183680").run()
+    assert not at.exception
     match = re.search(r'data-msg="([^"]+)"', _table_html(at))
     message = json.loads(html_module.unescape(match.group(1)))
     assert "<@53908099506183680>" not in message
@@ -329,18 +325,19 @@ def test_user_id_optional_field_flows_into_copied_message(monkeypatch):
 
 def test_user_id_flows_into_a_tagged_customized_template(monkeypatch):
     """A scout who adds the [Your Name] tag back to their customized
-    template gets the real <@ID> mention behaviour the field exists for."""
+    template gets the real <@ID> mention behaviour the field exists for
+    (set via the sidebar — the welcome flow no longer asks)."""
     _patch_catalog_reader(monkeypatch, _demo_frame())
 
     at = _fresh_app()
     at.run()
     at.button(key="onb0_next").click().run()
-    at.button(key="onb1_next").click().run()
-    at.text_input(key="discord_name").set_value("dev_razor10").run()
-    at.text_input(key="discord_user_id").set_value("53908099506183680").run()
-    at.button(key="onb3_next").click().run()  # -> message template step
-    at.text_area(key="message_template").set_value(_tagged_template()).run()
+    at.button(key="onb1_next").click().run()  # targets -> message
     at.button(key="onb4_start").click().run()
+    at.run()
+    at.sidebar.text_input(key="discord_name").set_value("dev_razor10").run()
+    at.sidebar.text_input(key="discord_user_id").set_value("53908099506183680").run()
+    at.sidebar.text_area(key="message_template").set_value(_tagged_template()).run()
     at.run()
 
     assert not at.exception
@@ -679,8 +676,7 @@ def _patch_catalog_reader(monkeypatch, frame: pd.DataFrame) -> list[dict]:
 
 def _walk_onboarding_to_template(at: AppTest) -> None:
     at.button(key="onb0_next").click().run()  # welcome -> targets
-    at.button(key="onb1_next").click().run()  # targets -> Discord name
-    at.button(key="onb3_next").click().run()  # Discord -> message template
+    at.button(key="onb1_next").click().run()  # targets -> message template
 
 
 def test_first_scan_pulls_from_catalog_without_discovery(monkeypatch):
@@ -919,8 +915,8 @@ def test_mid_onboarding_refresh_resumes_the_saved_step(monkeypatch, tmp_path):
 
     assert not at.exception
     titles = [el.value for el in at.title]
-    assert any("Discord username" in t for t in titles), "resumes at step 3"
-    assert at.text_input(key="discord_name").value == "Part Scout"
+    assert any("outreach message" in t for t in titles), "legacy step 3 resumes on the message step"
+    assert at.session_state["onboarding_step"] == 4
 
 
 def test_onboarding_progress_is_saved_for_the_next_refresh(monkeypatch, tmp_path):
@@ -935,7 +931,7 @@ def test_onboarding_progress_is_saved_for_the_next_refresh(monkeypatch, tmp_path
     at.run()
 
     saved = profile_store.load_profile("test-ref-3")
-    assert saved.get("onboarding_step") == 3  # Discord name step (cookie guide removed)
+    assert saved.get("onboarding_step") == 4  # message step (Discord ask removed 2026-10-15)
     assert saved.get("target_min_visits")
 
 
@@ -1281,12 +1277,9 @@ def test_sidebar_apply_filters_narrows_by_min_ccu(monkeypatch, tmp_path):
     at = _fresh_app()
     at.run()
     at.button(key="onb0_next").click().run()
-    at.button(key="onb1_next").click().run()
-    at.button(key="onb3_next").click().run()
-    at.button(key="onb4_start").click().run()
+    at.button(key="onb1_next").click().run()  # targets -> message template (no Discord step)
+    at.button(key="onb4_start").click().run()  # first scan from the catalog
     at.run()
-    assert not at.exception
-    # Both games clear the 20k visits / 25 CCU entry bar.
     table_html = _table_html(at)
     assert "Blox Fruits" in table_html  # 1000 CCU
     assert "Pls Donate" in table_html   # 3000 CCU
@@ -1340,7 +1333,6 @@ def test_sidebar_targets_share_one_session_state_with_welcome_flow(monkeypatch, 
     # The capture-on-start button is what actually persists the welcome
     # targets — and the sidebar keeps rendering the SAME keys after it.
     at.button(key="onb1_next").click().run()
-    at.button(key="onb3_next").click().run()
     at.button(key="onb4_start").click().run()
     at.run()
     assert not at.exception
