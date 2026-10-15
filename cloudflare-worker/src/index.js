@@ -6,11 +6,14 @@
  * 1. Search proxy: mirrors the public Roblox omni-search endpoint so the
  *    keyword crawler can use Cloudflare's IP pool instead of the shared
  *    GitHub Actions runner IP range.
- * 2. Scheduler: every five minutes, dispatches the Hydrator workflow through
- *    GitHub's workflow_dispatch API. At :15/:45 it also dispatches the
- *    Expander (Atlas Dev harvest + discovery-queue drain). GitHub's internal
- *    `schedule` triggers are disabled in this repository, so Cloudflare is
- *    the only automatic clock.
+ * 2. Scheduler: every five minutes, dispatches one workflow through
+ *    GitHub's workflow_dispatch API. The Expander (Atlas Dev harvest +
+ *    discovery-queue drain) and the Hydrator (stat freshness) alternate,
+ *    so each runs every ten minutes (2026-10-15 owner request for faster
+ *    new-game pickup, at the same total run rate as the old
+ *    hydrator-every-other-tick / expander-at-:15-:45 layout). GitHub's
+ *    internal `schedule` triggers are disabled in this repository, so
+ *    Cloudflare is the only automatic clock.
  *
  * The GitHub token is a Worker secret (`GITHUB_TOKEN`) and is never returned
  * in a response or written to logs.
@@ -239,14 +242,17 @@ async function dispatchDueWorkflows(controller, env) {
     return;
   }
 
-  // Expander (Atlas Dev harvest + discovery-queue drain, EXPANSION_PILOT.md)
-  // gets the odd clean minute :15/:45 — its own 30-min slot, dispatched
-  // ALONE: a hydrator dispatch in the same tick would sit behind it in the
-  // rbxscout-sync queue and, under GitHub's default concurrency, supersede
-  // (cancel) it — which is exactly the silent Atlas-finder outage fixed on
-  // 2026-10-13. Hydrator owns every other tick.
+  // Expander (Atlas Dev harvest + discovery-queue drain) and Hydrator
+  // (stat freshness) alternate on the 5-minute ticks, so BOTH run every
+  // 10 minutes (2026-10-15 owner request: catch new Atlas Dev listings
+  // ~3x faster without raising total Actions minutes). Extreme halves:
+  // odd ticks belong to the Expander; the other half keeps stat
+  // freshness. The expander is always dispatched ALONE into the
+  // rbxscout-sync queue: a hydrator dispatch in the same tick would sit
+  // behind it and, under GitHub's default concurrency, supersede (cancel)
+  // it — exactly the silent Atlas-finder outage fixed on 2026-10-13.
   const due = [];
-  if (minute === 15 || minute === 45) {
+  if (minute % 10 !== 0) {
     due.push(["expander", GITHUB_WORKFLOWS.expander]);
   } else {
     due.push(["hydrator", GITHUB_WORKFLOWS.hydrator]);

@@ -1,12 +1,16 @@
-# UpScale Scouting Tool expander — Atlas Dev seed harvest + discovery-queue drain (every 30 min).
+# UpScale Scouting Tool expander — Atlas Dev seed harvest + discovery-queue drain (every 10 min).
 #
-# The sole discovery pipeline (ATLAS_PLAN_REVIEW.md), 2026-10-14 coverage
-# overhaul: a 1h-throttled harvest of atlasdev.gg/analyze
-# (ATLAS_THROTTLE_HOURS=1 below; the code default stays 23h for local runs)
-# re-checks the frontier head pages AND advances a ROLLING cursor through
-# the rest of the gated index (~242 pages) on every harvest, so every page
-# is visited roughly every 5 h instead of only during the monthly deep
-# sweep. Each run FIRST drains a bounded slice of the discovery queue
+# The sole discovery pipeline (ATLAS_PLAN_REVIEW.md), 2026-10-15 cadence
+# upgrade (owner request: be first on new games): a ~10-min-throttled
+# harvest of atlasdev.gg/analyze
+# (ATLAS_THROTTLE_HOURS≈0.16 below; the code default stays 23h for local
+# runs) re-checks the frontier head pages AND advances a ROLLING cursor
+# through the rest of the gated index (~274 pages, ATLAS_ROLL_PAGES=8 per
+# harvest here) on every harvest, so every page is visited roughly every
+# 6 h and NEW LISTINGS surface within ~10 min of Atlas publishing them —
+# roughly 3x faster than the 1h-throttle era at ~2.4x the polite volume
+# (~66 pages/h at the 3s request delay, same robots-permitted crawl).
+# Each run FIRST drains a bounded slice of the discovery queue
 # through the strict gate — drain-only, even when the proxy pool (which
 # gates the Atlas fetch) is down — so evaluation of already-discovered
 # seeds never stalls. Only games meeting 20k visits / 25 CCU are stored —
@@ -34,23 +38,23 @@
 #
 # Manual runs: Actions tab -> "Expander — Atlas Dev harvest + drain (30 min)" -> Run workflow
 
-name: Expander — Atlas Dev harvest + drain (30 min)
+name: Expander — Atlas Dev harvest + drain (10 min)
 
 on:
 # Automatic dispatching is owned by the Cloudflare Worker in
-# cloudflare-worker/wrangler.toml (:15/:45 every 30 min). The 3-hour GitHub
+# cloudflare-worker/src/index.js (Expander and Hydrator alternate on the
+# 5-min ticks — Expander on the odd ones, 6 slots/h). The 10-minute GitHub
 # schedule is a backstop added after the 2026-09-21 worker redeploy dropped
 # the Cloudflare crons and silently stalled the whole pipeline for 3 days
-# (see hydrator.yml). Discovery tolerates a 3 h gap — the queue drains a
-# bounded slice each run anyway; freshness of stats is the hydrator's job.
+# (see hydrator.yml). Extra triggers no-op through the concurrency group
+# when the worker is healthy; the Atlas harvest self-throttles to ~10 min.
   workflow_dispatch:
   schedule:
-    # Every 30 min on off-peak minutes — parity with the Cloudflare worker's
-    # :15/:45 cadence (2026-10-05: the worker stopped dispatching ~16:15Z and
-    # the on-the-hour backstop barely fired — GitHub suppresses :00 schedules
-    # under load). Extra triggers no-op through the concurrency group when
-    # the worker is healthy; the Atlas harvest self-throttles to 3h.
-    - cron: "13,43 * * * *"
+    # Every 10 min on off-peak minutes (:07/:17/...) — near-parity with the
+    # Cloudflare worker's odd-tick slots (:05/:15/...). (2026-10-05: the
+    # worker stopped dispatching ~16:15Z and the on-the-hour backstop barely
+    # fired — GitHub suppresses :00 schedules under load.)
+    - cron: "7,17,27,37,47,57 * * * *"
 
 permissions:
   contents: write   # create/update the catalog-latest release assets
@@ -64,7 +68,11 @@ env:
   # contacts.bundle sidecar. The key lives in repo secrets (same hex value
   # as the laptop's contacts.key and the Streamlit CONTACTS_KEY secret).
   CONTACTS_KEY: ${{ secrets.CONTACTS_KEY || '' }}
-  # Atlas harvest knobs (defaults live in scout_core.py):
+  # Atlas harvest knobs (defaults live in scout_core.py). ATLAS_ROLL_PAGES
+  # is sized for the 10-min cadence: 8 rolling pages × 6 harvests/h keeps
+  # the ~274-page tail circuit at ~6 h while holding the polite volume at
+  # ~66 Atlas pages/h (the 1h era fetched ~28/h).
+  ATLAS_ROLL_PAGES: '8'
   ATLAS_SWEEP_PAGES: ${{ vars.ATLAS_SWEEP_PAGES || '' }}
   ATLAS_STAT_PAGES: ${{ vars.ATLAS_STAT_PAGES || '' }}
   ATLAS_REQUEST_DELAY: ${{ vars.ATLAS_REQUEST_DELAY || '' }}
@@ -143,7 +151,7 @@ jobs:
 
       - name: Run expander (Atlas harvest + queue drain)
         env:
-          ATLAS_THROTTLE_HOURS: "1"   # harvest on every second 30-min run (owner request: 1 h, not 3 h)
+          ATLAS_THROTTLE_HOURS: "0.16"   # harvest on every 10-min run (owner request 2026-10-15: new listings within ~10 min)
           # Scrape.do token as an ALWAYS-on source (2026-10-11). When the
           # free pool validated, the template is appended as the LAST failover
           # entry (credits burn only when the pool fails on a fetch). When
@@ -176,20 +184,22 @@ jobs:
       # snapshot from api.rotrends.com instead of spending the Roblox
       # batch budget. Sliced: each expander run does a bounded slice
       # (ROTRENDS_SWEEP_MAX_GAMES + ROTRENDS_BACKFILL_MAX_GAMES); the
-      # next :13/:43 run continues the rotation. Fail-open: a rotrends
+      # next expander run continues the rotation. Fail-open: a rotrends
       # outage must not fail the expansion push (|| true).
       # ------------------------------------------------------------------
       - name: Rotrends daily sweep slice (cold tail T5-T7)
         if: always()
         env:
           ROTRENDS_RPS: '8'
-          # Slice sized to keep the whole expander under ~10 min: the run
-          # holds the rbxscout-sync mutex, so a long sweep starves the
-          # 5-min hydrator (first run 2026-10-08: a 6,000-game slice took
-          # 22 min of sweep alone and queued 6 hydrator ticks).
-          # 2,000 games ≈ 4-5 min of sweep at 8 req/s.
-          ROTRENDS_SWEEP_MAX_GAMES: ${{ vars.ROTRENDS_SWEEP_MAX_GAMES || '2000' }}
-          ROTRENDS_BACKFILL_MAX_GAMES: ${{ vars.ROTRENDS_BACKFILL_MAX_GAMES || '200' }}
+          # Slice sized to keep the whole expander under ~5 min at the 10-min
+          # cadence: the run holds the rbxscout-sync mutex, so a long sweep
+          # starves the interleaved hydrator ticks (first run 2026-10-08: a
+          # 6,000-game slice took 22 min of sweep alone and queued 6
+          # hydrator ticks). 700 games ≈ 1.5-2 min at 8 req/s; 12 expander
+          # runs/h × 700 keeps the same ~8k games/h sweep rate the 30-min
+          # era averaged (2,000 × 2/h + hydrator spaced slices).
+          ROTRENDS_SWEEP_MAX_GAMES: ${{ vars.ROTRENDS_SWEEP_MAX_GAMES || '700' }}
+          ROTRENDS_BACKFILL_MAX_GAMES: ${{ vars.ROTRENDS_BACKFILL_MAX_GAMES || '70' }}
         run: |
           python rotrends_sweep.py || echo "rotrends sweep failed (fail-open; next run continues)"
 

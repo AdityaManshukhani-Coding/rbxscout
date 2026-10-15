@@ -1325,6 +1325,24 @@ def reset_contact_page() -> None:
     st.session_state.active_run_id = None
 
 
+def _on_discord_filter_change() -> None:
+    """Discord-availability radio callback (2026-10-15 bug fixes).
+
+    A filter switch must be visible immediately: the stored frame is ALWAYS
+    the FULL synced set now (the scan block no longer persists a narrowed
+    frame), so the render-time apply_filters re-narrows it on this rerun.
+    The only thing to reset is the contact page — the new filter may have a
+    different page count. (A rescan here would re-read the full catalog
+    from disk for nothing; the cached shared frame already covers it.)
+    Never raises.
+    """
+    reset_contact_page()
+    try:
+        st.session_state.scan_error = ""
+    except Exception:
+        pass
+
+
 def on_game_search_change() -> None:
     """Search input callback (2026-10-11): filtering behaves like the page
     navigation — a new query resets to page 1, and CLEARING the box entirely
@@ -1526,12 +1544,12 @@ if sync or st.session_state.pending_initial_scan:
             # Keep only what the dashboard renders in session state (see
             # SESSION_KEEP_COLUMNS) — never the demo/DB fallback frame.
             st.session_state.data = slim_result_frame(data) if not data.empty else empty_dataframe()
-            # The filter pipeline runs on the freshly synced result set so a
-            # brand-new verdict becomes visible on the very next rerun.
-            df = st.session_state.data
-            if not df.empty and st.session_state.get("discord_filter_radio", DISCORD_FILTER_ALL) != DISCORD_FILTER_ALL:
-                df = apply_filters(df, discord_filter=st.session_state.discord_filter_radio)
-            st.session_state.data = df
+            # Keep the FULL synced frame — never a Discord-filtered one (2026-10-15
+            # bug fixes): narrowing here persisted the filtered rows back into
+            # session state, so switching the sidebar filter back to 'All Games'
+            # kept showing only the saved slice, and a search-clear under the
+            # filter could not reach the real home set. The render-time
+            # apply_filters below applies the Discord filter every run instead.
             # Keep the exact onboarding targets attached to the result set so
             # the dashboard cannot accidentally present a previous cached scan.
             st.session_state.result_target_min_visits = int(min_visits)
@@ -1643,6 +1661,7 @@ else:
         "Discord availability",
         options=[DISCORD_FILTER_ALL, DISCORD_FILTER_TRUE, DISCORD_FILTER_FALSE],
         key="discord_filter_radio",
+        on_change=_on_discord_filter_change,
         help="'Discord available' keeps games with a resolved invite; "
              "'No Discord' keeps games checked and found without one. "
              "Unchecked games disappear from both narrowed views.",
@@ -2240,30 +2259,6 @@ def _momentum_cell(value) -> str:
     return "<span class='ss-none'>0</span>"
 
 
-def _earnings_cell(row: pd.Series) -> str:
-    """Earnings-rank cell (HYDRATION_SOURCES.md Phase 3): a Rotrends
-    revenue proxy Roblox never exposes — '#N' with a source caption, '-'
-    when the sweep hasn't reached this game yet."""
-    try:
-        rank = row.get("earning_rank")
-        if rank is None or pd.isna(rank):
-            return "-"
-        return f"#{int(rank)}"
-    except (TypeError, ValueError):
-        return "-"
-
-
-def _rank_cell(row: pd.Series) -> str:
-    """Creator Exchange globalRank cell (Phase 3 enrichment)."""
-    try:
-        rank = row.get("cx_global_rank")
-        if rank is None or pd.isna(rank):
-            return "-"
-        return f"#{int(rank)}"
-    except (TypeError, ValueError):
-        return "-"
-
-
 def _momentum_flag(row: pd.Series) -> str:
     """CE momentum tag (Surging/Fading/Stable) for game detail tooltips.
     Empty string when absent — never a false signal."""
@@ -2326,21 +2321,6 @@ def _potential_cell(row: pd.Series) -> str:
     )
 
 
-def _rating_cell(row: pd.Series) -> str:
-    """Rating cell: like ratio as a whole percent; '-' when no votes yet."""
-    try:
-        up = row.get("upvotes")
-        down = row.get("downvotes")
-        if up is None or down is None or pd.isna(up) or pd.isna(down):
-            return "-"
-        total = int(up) + int(down)
-        if total <= 0:
-            return "-"
-        return f"{round(100.0 * int(up) / total):.0f}%"
-    except (TypeError, ValueError):
-        return "-"
-
-
 def render_table(frame: pd.DataFrame) -> None:
     """Render the visible page as an HTML table.
 
@@ -2349,16 +2329,15 @@ def render_table(frame: pd.DataFrame) -> None:
     could never display inline. HTML keeps the merged thumbnail+name and
     logo+invite cells working in every Streamlit version.
 
-    Column order (user requests 2026-09-23 / 2026-10-10): identity →
-    volume (visits, CCU) → action (Discord, Message, Potential) → trend
-    (averages, momentum, rating). Favorites and Peak CCU were dropped at
-    request — lifetime favorites correlate with visits, and current CCU
-    dominates peak CCU for scouting decisions.
+    column order (user requests 2026-09-23 / 2026-10-10 / 2026-10-15):
+    identity → volume (visits, CCU) → action (Discord, Message, Potential)
+    → trend (averages, momentum). Rating / Earnings / Global rank were
+    dropped at the 2026-10-15 request — a scouting-for-new-contact table
+    reads them rarely, and their sweep cost buys nothing at decision time.
     """
     head = [
         "Game", "Genre", "Total visits", "CCU", "Discord", "Message",
         "Potential", "Avg CCU (1d)", "Avg CCU (3d)", "Momentum (1d)",
-        "Rating", "Earnings", "Global rank",
     ]
     rows = []
     for _, row in frame.iterrows():
@@ -2377,9 +2356,6 @@ def render_table(frame: pd.DataFrame) -> None:
             f"<td class='ss-num'>{_ccu_cell(row.get('avg_ccu_1d'))}</td>"
             f"<td class='ss-num'>{_ccu_cell(row.get('avg_ccu_3d'))}</td>"
             f"<td class='ss-num'>{_momentum_cell(row.get('momentum_1d'))}</td>"
-            f"<td class='ss-num'>{_rating_cell(row)}</td>"
-            f"<td class='ss-num'>{_earnings_cell(row)}</td>"
-            f"<td class='ss-num'>{_rank_cell(row)}</td>"
             + "</tr>"
         )
     # st.html with unsafe_allow_javascript=True is required for the copy

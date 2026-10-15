@@ -389,10 +389,11 @@ def test_store_outage_shows_banner_instead_of_crashing(monkeypatch):
 
 
 def test_table_column_order_discord_before_averages():
-    """Column order (user requests 2026-09-23 & 2026-10-10; extended by
-    HYDRATION_SOURCES.md Phase 3 + Potential): Game, Genre, Total visits,
-    CCU, Discord, Message, Potential, Avg CCU (1d), Avg CCU (3d), Momentum,
-    Rating, Earnings (rotrends), Global rank (Creator Exchange)."""
+    """Column order (user requests 2026-09-23 & 2026-10-10 & 2026-10-15):
+    Game, Genre, Total visits, CCU, Discord, Message, Potential,
+    Avg CCU (1d), Avg CCU (3d), Momentum (1d). The user asked (2026-10-15)
+    to drop Rating, Earnings and Global rank — a new-games table never
+    reads them at decision time."""
     at = _render_dashboard()
     assert not at.exception
 
@@ -403,8 +404,9 @@ def test_table_column_order_discord_before_averages():
     assert headers == [
         "Game", "Genre", "Total visits", "CCU", "Discord", "Message",
         "Potential", "Avg CCU (1d)", "Avg CCU (3d)", "Momentum (1d)",
-        "Rating", "Earnings", "Global rank",
     ], headers
+    for dropped in ("Rating", "Earnings", "Global rank"):
+        assert dropped not in headers, f"{dropped} column must not appear"
 
 
 def test_missing_discord_says_no_discord_server():
