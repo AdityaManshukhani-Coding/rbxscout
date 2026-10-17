@@ -179,18 +179,20 @@ def main() -> int:
     parser.add_argument("--min-ccu", type=int, default=25)
     parser.add_argument(
         "--only",
-        choices=("hydrator", "expander", "drain"),
+        choices=("hydrator", "expander", "drain", "removal"),
         default=None,
         help="hydrator = refresh known games only; expander = Atlas Dev seed "
         "harvest + queue drain; drain = evaluate queued seeds WITHOUT an "
-        "Atlas harvest (the workflow's drain-first step); omit for the full "
-        "pipeline.",
+        "Atlas harvest (the workflow's drain-first step); removal = take-down "
+        "sweep (Atlas-absent games verified directly against Roblox, "
+        "absent = soft-delete); omit for the full pipeline.",
     )
     args = parser.parse_args()
     phases = {
         "hydrator": ("hydrate",),
         "expander": ("expand",),
         "drain": ("drain",),
+        "removal": ("removal",),
         None: None,
     }[args.only]
     mode = args.only or "full"
@@ -210,6 +212,23 @@ def main() -> int:
 
     def progress(pct: float, msg: str) -> None:
         print(f"  [{pct * 3:5.1f}%] {msg}")
+
+    # Take-down removal sweep (2026-10-17): a dedicated phase OUTSIDE the
+    # scan pipeline — it must never gate discovery or hydration. Ideal surge:
+    # the Atlas stamps this expander run just wrote decide the candidate set;
+    # the sweep self-throttles (REMOVAL_SWEEP_HOURS) and fail-closes
+    # (no writes unless Roblox verification succeeded).
+    if args.only == "removal":
+        result = scout.run_removal_sweep(progress_cb=progress)
+        print("\n" + "=" * 62)
+        print(f"REMOVAL SWEEP — {result.get('removed', 0)} soft-deleted · "
+              f"{result.get('verified_present', 0)} verified alive · "
+              f"{result.get('candidates', 0)} suspect(s) examined")
+        for key in ("throttled", "aborted"):
+            if result.get(key):
+                print(f"  {key.upper()}: no writes this run ({'next window' if key == 'throttled' else 'API failure — safe'})")
+        print("=" * 62)
+        return 0
 
     try:
         scout.scan(

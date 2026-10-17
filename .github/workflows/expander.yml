@@ -33,9 +33,8 @@
 # every sustainable harvest; 0 = kill switch), ATLAS_STAT_PAGES
 # (provisional first-paint rows per harvest, 0 disables),
 # ATLAS_REQUEST_DELAY (polite per-request delay), ATLAS_DEEP_EVERY_DAYS
-# (full catch-up sweep cadence, backstop only now), EXPAND_QUEUE_BATCHES
-# (queue-drain batches per run).
-#
+# (full catch-up sweep cadence, backstop only now), EXPAND_QUEUE_BATCHES# (queue-drain batches per run). REMOVAL_SWEEP_HOURS / REMOVAL_STALE_HOURS /
+# REMOVAL_SWEEP_MAX_GAMES (take-down removal sweep, soft-delete only).
 # Manual runs: Actions tab -> "Expander — Atlas Dev harvest + drain (30 min)" -> Run workflow
 
 name: Expander — Atlas Dev harvest + drain (10 min)
@@ -178,6 +177,29 @@ jobs:
           fi
           python live_sync.py --only expander --min-visits 20000 --min-ccu 25
 
+      # ------------------------------------------------------------------
+      # Take-down removal sweep (2026-10-17, owner request): games Roblox
+      # removes must leave the site. Two-phase, all on GHA:
+      #   1. the harvest above stamps atlas_last_seen for every ID Atlas
+      #      still lists — a full ~6 h circuit miss + 72 h (REMOVAL_STALE_HOURS)
+      #      turns the row into a suspect;
+      #   2. this sweep verifies suspects DIRECTLY against the live Roblox
+      #      games API (batched 50/call) and soft-deletes only CONFIRMED
+      #      removals (removed=1 — dashboard hides, ccu_history/contacts stay:
+      #      the harvest stamps re-add a game instantly if Roblox/Atlas
+      #      relists it). Self-throttled ~6 h, capped 400 games/run,
+      #      fail-CLOSED: an API outage writes nothing. Runs AFTER the
+      #      expander so the just-written stamps are honored, BEFORE the
+      #      push so this run's tombstones ship with the catalog.
+      # ------------------------------------------------------------------
+      - name: Take-down removal sweep (soft-delete verified removals only)
+        if: always()
+        env:
+          REMOVAL_SWEEP_HOURS: ${{ vars.REMOVAL_SWEEP_HOURS || '6' }}
+          REMOVAL_STALE_HOURS: ${{ vars.REMOVAL_STALE_HOURS || '72' }}
+          REMOVAL_SWEEP_MAX_GAMES: ${{ vars.REMOVAL_SWEEP_MAX_GAMES || '400' }}
+        run: |
+        run: python live_sync.py --only removal || echo "removal sweep failed (fail-open; next run retries)"
       # ------------------------------------------------------------------
       # Rotrends daily sweep + shallow backfill (HYDRATION_SOURCES.md
       # Phase 1): the cold tail (T5-T7, ~23k games) gets its daily CCU

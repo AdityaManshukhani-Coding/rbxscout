@@ -41,7 +41,9 @@ CREATE TABLE game_analytics (
                     has_social_links BOOLEAN,
                     contacts_checked_at TIMESTAMP,
                     last_updated     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                , description TEXT, contact_schema_version INTEGER DEFAULT 0, tier INTEGER DEFAULT 0, prev_tier INTEGER DEFAULT 0, tier_since TIMESTAMP, blowup_flag INTEGER DEFAULT 0, blowup_at TIMESTAMP);;
+                , description TEXT, contact_schema_version INTEGER DEFAULT 0, tier INTEGER DEFAULT 0, prev_tier INTEGER DEFAULT 0, tier_since TIMESTAMP, blowup_flag INTEGER DEFAULT 0, blowup_at TIMESTAMP
+                  -- take-down soft delete (2026-10-17): harvest stamps + removal sweep tombstones
+                  , atlas_last_seen TIMESTAMP, removed INTEGER DEFAULT 0, removed_suspect INTEGER DEFAULT 0, removed_at TIMESTAMP, removed_checked_at TIMESTAMP);;
 
 CREATE TABLE keyword_crawl_state (
                     id INTEGER PRIMARY KEY CHECK (id = 1),

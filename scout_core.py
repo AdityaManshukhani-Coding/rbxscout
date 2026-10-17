@@ -275,6 +275,13 @@ ATLAS_PRIORITY_DEFAULT = 2          # queue tier (drain processes lowest first)
 ATLAS_HOURS_DEFAULT = 23            # self-throttle: one harvest per day (23h so a fixed daily slot never slips)
 ATLAS_SWEEP_PAGES_DEFAULT = 3       # frontier head pages re-checked on EVERY harvest (new listings enter here first)
 ATLAS_ROLL_PAGES_DEFAULT = 25       # rolling tail pages per steady harvest: the 274-page tail completes a circuit in ~11 runs (≈5 h at the 30-min expander cadence)
+
+# Take-down removal sweep (2026-10-17, owner request). Runs on GHA inside the
+# expander workflow (live_sync.py --only removal), self-throttled like the
+# contact sweep — never on the laptop, never in a per-tick hot path.
+REMOVAL_SWEEP_HOURS_DEFAULT = 6     # minimum gap between sweeps (full Atlas circuit ≈ 6 h)
+REMOVAL_STALE_HOURS_DEFAULT = 72    # off-Atlas for ≥72 h ⇒ suspect → direct Roblox verification
+REMOVAL_SWEEP_MAX_GAMES_DEFAULT = 400  # verification budget per sweep (≈8 metric batches)
 ATLAS_TAIL_START = 2                # the rolling circuit covers pages >= 2 (the head owns pages 1..ATLAS_SWEEP_PAGES)
 ATLAS_DEEP_PAGES_DEFAULT = 275      # one-off catch-up sweep ceiling (full index)
 ATLAS_DEEP_EVERY_DAYS_DEFAULT = 30  # re-run the deep sweep this often (0 = never)
@@ -790,6 +797,40 @@ class RobloxPlatformScout:
                 )
             if "blowup_at" not in columns:
                 conn.execute("ALTER TABLE game_analytics ADD COLUMN blowup_at TIMESTAMP")
+            # Take-down soft delete (2026-10-17, owner request): games Roblox
+            # removes leave the dashboard but NEVER lose their history rows
+            # (ccu_history, contacts, paid hydration stay queryable — a wrong
+            # flag or a re-listed game just flips the flag back). Three
+            # timestamps + zero cost:
+            #   atlas_last_seen — stamped on every Atlas harvest that sees the
+            #     game; backfilled to NOW on migration so the staleness
+            #     trigger only starts REMOVAL_STALE_HOURS after this lands.
+            #   removed / removed_suspect / removed_at / removed_checked_at —
+            #     the tombstone the removal sweep writes after a DIRECT
+            #     Roblox verification (absent from the live API = removed).
+            if "atlas_last_seen" not in columns:
+                conn.execute("ALTER TABLE game_analytics ADD COLUMN atlas_last_seen TIMESTAMP")
+                # Backfill NOW: a NULL would mean 'never seen', and treating
+                # the whole existing catalog as instantly stale would suspect
+                # every game the day this ships. From the next harvest on,
+                # rows carry real stamps again.
+                conn.execute("UPDATE game_analytics SET atlas_last_seen = CURRENT_TIMESTAMP")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_ga_atlas_seen "
+                    "ON game_analytics(atlas_last_seen)"
+                )
+            if "removed" not in columns:
+                conn.execute("ALTER TABLE game_analytics ADD COLUMN removed INTEGER DEFAULT 0")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_ga_removed "
+                    "ON game_analytics(removed)"
+                )
+            if "removed_suspect" not in columns:
+                conn.execute("ALTER TABLE game_analytics ADD COLUMN removed_suspect INTEGER DEFAULT 0")
+            if "removed_at" not in columns:
+                conn.execute("ALTER TABLE game_analytics ADD COLUMN removed_at TIMESTAMP")
+            if "removed_checked_at" not in columns:
+                conn.execute("ALTER TABLE game_analytics ADD COLUMN removed_checked_at TIMESTAMP")
             # The DEYOND-GATE hidden section (2026-10-09, user policy): once a
             # game qualified into the catalog it stays — but when its live
             # stats fall below the gate (wobbly CCU), it stops consuming
@@ -1130,6 +1171,7 @@ class RobloxPlatformScout:
             record = {**record, **self._tier_stamp_for(int(uid), record)}
         # First-seen stamp: set only on brand-new rows; upserts of existing
         # games can never rewrite it (first_seen backfill lives in _init_sqlite).
+        is_new = False
         try:
             with self._connect() as conn:
                 if conn.execute(
@@ -1137,6 +1179,7 @@ class RobloxPlatformScout:
                 ).fetchone():
                     record = {**record, "first_seen": None}
                 else:
+                    is_new = True
                     record = {
                         **record,
                         "first_seen": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1241,6 +1284,18 @@ class RobloxPlatformScout:
                     int(HIDDEN_GATE_CCU),
                 ),
             )
+            # Take-down sweep integrity (2026-10-17): brand-new rows start
+            # Atlas-stamped NOW — a fresh row can never be suspected before
+            # its first full harvest circuit (~6 h). The harvest's own stamp
+            # pass maintains it afterwards; hydration upserts of EXISTING
+            # rows never touch atlas_last_seen (it is Atlas-truth, not
+            # Roblox-truth).
+            if is_new:
+                conn.execute(
+                    "UPDATE game_analytics SET atlas_last_seen = CURRENT_TIMESTAMP "
+                    "WHERE universe_id = ?",
+                    (int(uid),),
+                )
             if record.get("ccu") is not None and record_ccu_history:
                 # Microsecond-precision local timestamp. SQLite's
                 # strftime('%f') only has millisecond precision, so two
@@ -1338,6 +1393,7 @@ class RobloxPlatformScout:
             with self._connect() as conn:
                 out = pd.read_sql_query(
                     "SELECT * FROM game_analytics WHERE COALESCE(blowup_flag, 0) = 1 "
+                    "AND COALESCE(removed, 0) = 0 "
                     "ORDER BY COALESCE(blowup_at, last_updated) DESC",
                     conn,
                 )
@@ -1378,6 +1434,9 @@ class RobloxPlatformScout:
         limit = max(0, int(limit)) if limit is not None else None
         where = ["COALESCE(visits, 0) >= ?", "COALESCE(ccu, 0) >= ?"]
         params: List[int] = [min_visits, min_ccu]
+        # Roblox take-downs (2026-10-17): tombstoned rows (removed=1) never
+        # surface — not even in a zero-filter browse; the row and its trend
+        # history stay in SQLite for re-add/tombstone stats.
         # Beyond-gate hidden section: when the user filters at ANY real
         # threshold (the normal scouting state), below-gate games stay out —
         # that's the whole "hidden until it recovers" policy. Only a full
@@ -1401,7 +1460,7 @@ class RobloxPlatformScout:
             with self._connect() as conn:
                 out = pd.read_sql_query(
                     "SELECT * FROM game_analytics "
-                    f"WHERE {' AND '.join(where)} "
+                    f"WHERE COALESCE(removed, 0) = 0 AND {' AND '.join(where)} "
                     "ORDER BY COALESCE(visits, 0) ASC, COALESCE(ccu, 0) ASC, "
                     "COALESCE(first_seen, '2999-01-01') ASC"
                     + (f" LIMIT {int(limit)}" if limit else ""),
@@ -3611,7 +3670,7 @@ class RobloxPlatformScout:
             # 'atlas_last_run' and 'atlas_deep' store an epoch in
             # last_universe_id — that is the authoritative stamp
             # (updated_at refreshes on any write).
-            if pointer_id in ("atlas_last_run", "atlas_deep") and row[0] is not None:
+            if pointer_id in ("atlas_last_run", "atlas_deep", "removal_last_run") and row[0] is not None:
                 return float(row[0])
             try:
                 return datetime.strptime(str(stamp)[:19], "%Y-%m-%d %H:%M:%S").timestamp()
@@ -3894,6 +3953,43 @@ class RobloxPlatformScout:
                     stats["provisional_rows"] += 1
             report(0.7, f"Atlas first-paint rows: {stats['provisional_rows']}")
 
+        # ---- take-down bookkeeping (2026-10-17): stamps + quick re-add ----
+        # Every ID Atlas still lists refreshes atlas_last_seen — that stamp
+        # is the ONLY removal-suspicion signal (a game missing from the
+        # rolling ~6 h circuit for REMOVAL_STALE_HOURS straight is the
+        # suspect the later Roblox verification confirms). Any stamped game
+        # still carrying a tombstone (removed=1) or an unresolved suspicion
+        # (removed_suspect=1) is instantly revived: the owner asked for a
+        # quick re-add the moment a removed game shows up on Atlas again.
+        # Chunked batched UPDATE on known rows only (unknown IDs simply get
+        # enqueued below); a single UPDATE per stamping run, never a loop.
+        stamped = 0
+        readded = 0
+        for i in range(0, len(harvested), 900):
+            chunk = list(harvested)[i : i + 900]
+            placeholders = ",".join("?" for _ in chunk)
+            with self._connect() as conn:
+                cur = conn.execute(
+                    "UPDATE game_analytics "
+                    "SET atlas_last_seen = CURRENT_TIMESTAMP "
+                    f"WHERE universe_id IN ({placeholders})",
+                    tuple(chunk),
+                )
+                stamped += cur.rowcount
+                cur2 = conn.execute(
+                    "UPDATE game_analytics "
+                    "SET removed = 0, removed_suspect = 0, "
+                    "    removed_at = NULL, atlas_last_seen = CURRENT_TIMESTAMP "
+                    f"WHERE universe_id IN ({placeholders}) "
+                    "  AND (COALESCE(removed, 0) = 1 OR COALESCE(removed_suspect, 0) = 1)",
+                    tuple(chunk),
+                )
+                readded += cur2.rowcount
+        if stamped or readded:
+            report(0.72, f"Atlas stamps: {stamped} refreshed · {readded} re-added")
+        stats["stamped"] = stamped
+        stats["readded"] = readded
+
         # ---- enqueue → the existing drain + strict gate own the rest -------
         stats["enqueued"] = self._enqueue_discovery(
             (uid, "atlas_dev", queue_priority) for uid in harvested
@@ -3926,6 +4022,172 @@ class RobloxPlatformScout:
         if stats.get("deep_sweep") and completed:
             self._set_atlas_pointer("atlas_deep", now)
         report(0.95, f"Atlas harvest: +{stats['enqueued']} queued, {stats['provisional_rows']} first-paint rows")
+        return stats
+
+    # ------------------------------------------------------------------ #
+    # Take-down removal sweep (2026-10-17, owner request): games Roblox
+    # removes leave this catalog. Runs ON GHA (the expander workflow's
+    # live_sync.py --only removal step) — never on the laptop, never inside
+    # the per-tick expand path.
+    # ------------------------------------------------------------------ #
+
+    def run_removal_sweep(
+        self,
+        progress_cb: Optional[Callable[[float, str], None]] = None,
+        stale_hours: Optional[float] = None,
+        max_games: Optional[int] = None,
+        throttle_hours: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Verify Atlas-absent games directly against Roblox and soft-delete.
+
+        Three-phase sweep, deliberately boring:
+          1. SELECT candidates: catalog rows still on the dashboard (removed
+             = 0) whose atlas_last_seen stamp is older than
+             ``stale_hours`` (default REMOVAL_STALE_HOURS = 72). Atlas's full
+             ~6 h circuit visits every page, so anything a FULL circuit plus
+             a day failed to list is a real suspect — the two-run false-
+             alarm window the owner asked for is the staleness gap itself.
+          2. VERIFY each batch against the live Roblox games API (50 IDs per
+             batch, shared token bucket). A batch response that omits an ID
+             is Roblox's own proof the universe is gone/privated; a present
+             ID means the game lives but dropped off Atlas — keep it.
+          3. WRITE: absent IDs gets ``removed`` = 1 (tombstone timestamp in
+             ``removed_at``, first_seen untouched); present IDs get
+             ``removed_suspect`` cleared and a fresh ``removed_checked_at``.
+
+        Soft-delete only: ccu_history / contacts / tier data stay untouched —
+        the harvest's Atlas stamps do the re-add (``removed`` cleared the
+        moment the game lists again). A fully failed batch never writes:
+        network outages must not masquerade as take-downs.
+        """
+        report = progress_cb or (lambda p, m: None)
+        stats: Dict[str, Any] = {
+            "candidates": 0,
+            "verified_present": 0,
+            "removed": 0,
+            "batches": 0,
+            "failed_batches": 0,
+            "throttled": False,
+            "aborted": False,
+        }
+        stale = (
+            float(stale_hours)
+            if stale_hours is not None
+            else float(os.environ.get("REMOVAL_STALE_HOURS", "") or REMOVAL_STALE_HOURS_DEFAULT)
+        )
+        cap = (
+            max(0, int(max_games))
+            if max_games is not None
+            else _env_int("REMOVAL_SWEEP_MAX_GAMES", REMOVAL_SWEEP_MAX_GAMES_DEFAULT)
+        )
+        throttle = (
+            float(throttle_hours)
+            if throttle_hours is not None
+            else float(os.environ.get("REMOVAL_SWEEP_HOURS", "") or REMOVAL_SWEEP_HOURS_DEFAULT)
+        )
+        if cap == 0:
+            return stats  # kill switch
+        if throttle > 0:
+            last = self._atlas_pointer("removal_last_run")
+            if last is not None and (time.time() - last) < throttle * 3600:
+                stats["throttled"] = True
+                return stats
+
+        # ---- candidates: confirmed-alive rows whose Atlas stamp aged out ---
+        ids: List[int] = []
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT universe_id FROM game_analytics "
+                    "WHERE COALESCE(removed, 0) = 0 "
+                    "  AND atlas_last_seen IS NOT NULL "
+                    "  AND atlas_last_seen < datetime('now', ?) "
+                    "ORDER BY atlas_last_seen ASC "
+                    "LIMIT ?",
+                    (f"-{stale:g} hours", cap),
+                ).fetchall()
+                ids = [int(r[0]) for r in rows]
+        except sqlite3.Error as exc:
+            log.warning("removal sweep candidate query failed: %s", exc)
+            return stats
+        stats["candidates"] = len(ids)
+        if not ids:
+            # Nothing suspicious — still stamp the window so an empty catalog
+            # doesn't hammer the API every tick.
+            self._set_atlas_pointer("removal_last_run", time.time())
+            return stats
+        report(0.05, f"Removal sweep: {len(ids)} game(s) absent from Atlas ≥{stale:g}h")
+
+        # ---- verify against the live games API (batched, paced) ------------
+        present: set[int] = set()
+        fail_streak = 0
+        for i in range(0, len(ids), METRICS_BATCH_SIZE):
+            chunk = ids[i : i + METRICS_BATCH_SIZE]
+            q = ",".join(str(u) for u in chunk)
+            self._emit_pace()
+            status, data = self._get_json(
+                f"https://games.roblox.com/v1/games?universeIds={q}"
+            )
+            stats["batches"] += 1
+            if status != 200 or data is None:
+                fail_streak += 1
+                stats["failed_batches"] += 1
+                if fail_streak >= 3:
+                    # Roblox unreachable / API redesign: write NOTHING — an
+                    # outage must never look like a wave of take-downs.
+                    stats["aborted"] = True
+                    report(0.5, f"Removal sweep ABORTED after {fail_streak} failed batches — no writes")
+                    return stats
+                continue
+            fail_streak = 0
+            for g in data.get("data") or []:
+                try:
+                    present.add(int(g["id"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            report(
+                0.05 + 0.75 * min(1.0, (i + METRICS_BATCH_SIZE) / max(1, len(ids))),
+                f"verified {min(i + METRICS_BATCH_SIZE, len(ids))}/{len(ids)} — "
+                f"{len(present)} alive so far",
+            )
+        if not present and stats["failed_batches"] >= 1 and stats["batches"] >= stats["failed_batches"]:
+            stats["aborted"] = True
+            report(0.8, "Removal sweep ABORTED: not a single batch succeeded — no writes")
+            return stats
+
+        # ---- write: soft-delete the confirmed dead, clear the alive --------
+        absent = [u for u in ids if u not in present]
+        still_alive = [u for u in ids if u in present]
+        for i in range(0, len(absent), 900):
+            chunk = absent[i : i + 900]
+            placeholders = ",".join("?" for _ in chunk)
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE game_analytics "
+                    "SET removed = 1, removed_suspect = 0, "
+                    "    removed_at = CURRENT_TIMESTAMP, "
+                    "    removed_checked_at = CURRENT_TIMESTAMP "
+                    f"WHERE universe_id IN ({placeholders})",
+                    tuple(chunk),
+                )
+        for i in range(0, len(still_alive), 900):
+            chunk = still_alive[i : i + 900]
+            placeholders = ",".join("?" for _ in chunk)
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE game_analytics "
+                    "SET removed_suspect = 0, removed_checked_at = CURRENT_TIMESTAMP "
+                    f"WHERE universe_id IN ({placeholders})",
+                    tuple(chunk),
+                )
+        stats["removed"] = len(absent)
+        stats["verified_present"] = len(still_alive)
+        self._set_atlas_pointer("removal_last_run", time.time())
+        report(
+            0.95,
+            f"Removal sweep: {len(absent)} soft-deleted · "
+            f"{len(still_alive)} verified alive (staying in the catalog)",
+        )
         return stats
 
     # ------------------------------------------------------------------ #
