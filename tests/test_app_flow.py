@@ -1309,6 +1309,59 @@ def test_sidebar_apply_filters_narrows_by_min_ccu(monkeypatch, tmp_path):
     assert len(calls) == 2 and calls[-1]["min_ccu"] == 2000, calls
 
 
+def test_sidebar_max_ccu_and_max_visits_filters(monkeypatch, tmp_path):
+    """The 2026-10-17 ceiling filters: set a Max CCU below one game's CCU and
+    that game drops from the table while a game under the ceiling stays; the
+    same holds for Max visits. 0 must mean NO ceiling (all games come back).
+    The ceilings are display-time only — the catalog read carries the floors,
+    never the maxima, so no sync re-read is needed for a ceiling change.
+    """
+    import pandas as pd
+
+    calls: list[dict] = []
+
+    def _fake(self, min_visits=0, min_ccu=0):
+        calls.append({"min_visits": min_visits, "min_ccu": min_ccu})
+        return pd.concat([_demo_frame(), _demo_two_row_frame()], ignore_index=True)
+
+    monkeypatch.setattr(scout_core.RobloxPlatformScout, "load_catalog_matches", _fake)
+
+    at = _fresh_app()
+    at.run()
+    at.button(key="onb0_next").click().run()
+    at.button(key="onb1_next").click().run()  # targets -> message
+    at.button(key="onb4_start").click().run()  # first scan from the catalog
+    at.run()
+    table_html = _table_html(at)
+    assert "Blox Fruits" in table_html  # 1000 CCU / 50M visits
+    assert "Pls Donate" in table_html   # 3000 CCU / 1.5M visits
+
+    # Cap CCU at 2000: Pls Donate (3000 CCU) hides, Blox Fruits stays.
+    at.sidebar.number_input(key="filter_max_ccu").set_value(2000).run()
+    assert not at.exception
+    table_html = _table_html(at)
+    assert "Pls Donate" not in table_html
+    assert "Blox Fruits" in table_html
+    # Ceiling changes are display-time only: no catalog re-read happens.
+    assert len(calls) == 1, calls
+
+    # Lift the CCU ceiling and cap visits instead: Blox Fruits (50M) hides,
+    # Pls Donate (1.5M) stays.
+    at.sidebar.number_input(key="filter_max_ccu").set_value(0).run()
+    at.sidebar.number_input(key="filter_max_visits").set_value(2_000_000).run()
+    assert not at.exception
+    table_html = _table_html(at)
+    assert "Blox Fruits" not in table_html
+    assert "Pls Donate" in table_html
+
+    # 0 = no ceiling: both games return.
+    at.sidebar.number_input(key="filter_max_visits").set_value(0).run()
+    assert not at.exception
+    table_html = _table_html(at)
+    assert "Blox Fruits" in table_html
+    assert "Pls Donate" in table_html
+
+
 def test_sidebar_targets_share_one_session_state_with_welcome_flow(monkeypatch, tmp_path):
     """Both filter paths write the SAME canonical session-state keys. The
     sidebar inputs are keyed directly on target_min_visits/target_min_ccu:

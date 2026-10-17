@@ -1407,6 +1407,28 @@ with st.sidebar.expander("Current target", expanded=True):
         persist_state="session",
         help="Hard floor: the pipeline only stores games at or above this bar, so lower settings would always return nothing.",
     )
+    # Ceiling filters (2026-10-17): unlike the floor targets, the maxima are
+    # dashboard-side display ceilings only — the pipeline keeps discovering
+    # rows above the floors, and a 0 here means "no ceiling" (apply_filters
+    # receives None, matching its max_visits/max_ccu semantics).
+    max_visits = st.number_input(
+        "Maximum visits",
+        min_value=0,
+        step=1_000,
+        value=int(st.session_state.get("filter_max_visits", 0) or 0),
+        key="filter_max_visits",
+        persist_state="session",
+        help="Hard ceiling: games at or above this lifetime visit count are hidden. 0 = no ceiling.",
+    )
+    max_ccu = st.number_input(
+        "Maximum CCU",
+        min_value=0,
+        step=25,
+        value=int(st.session_state.get("filter_max_ccu", 0) or 0),
+        key="filter_max_ccu",
+        persist_state="session",
+        help="Hard ceiling: games at or above this current player count are hidden. 0 = no ceiling.",
+    )
     st.caption(
         f"Targets filter your results the moment you sync (locked at {DEFAULT_MIN_VISITS // 1000}k visits / {DEFAULT_MIN_CCU} CCU — the pipeline's entry bar). New games appear as the 24/7 pipeline discovers them."
     )
@@ -1590,6 +1612,10 @@ if is_watch_view:
 # The watchlist ignores the user's target thresholds entirely.
 eff_min_visits = 0 if is_watch_view else int(min_visits)
 eff_min_ccu = 0 if is_watch_view else int(min_ccu)
+# Ceiling filters (2026-10-17): 0 = no ceiling, passed to apply_filters as
+# None. They apply at display time exactly where the floors do.
+eff_max_visits = 0 if is_watch_view else int(max_visits)
+eff_max_ccu = 0 if is_watch_view else int(max_ccu)
 
 # --------------------------------------------------------------------------- #
 # Filters and paginated contact loading
@@ -1655,7 +1681,9 @@ metric_filtered = apply_filters(
     df,
     search=search,
     min_visits=eff_min_visits,
+    max_visits=eff_max_visits or None,
     min_ccu=eff_min_ccu,
+    max_ccu=eff_max_ccu or None,
     genres=selected_genres,
     discord_filter=discord_view,
     potentials=selected_potentials,
@@ -1665,6 +1693,8 @@ signature = "|".join([
     search,
     str(min_visits),
     str(min_ccu),
+    str(eff_max_visits),
+    str(eff_max_ccu),
     ",".join(selected_genres),
     discord_view,
     ",".join(selected_potentials),
