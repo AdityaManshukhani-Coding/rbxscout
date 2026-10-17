@@ -671,20 +671,41 @@ def main() -> int:
         + ("  · ABORTED" if stats.get("aborted") else "")
         + f"  ({time.time() - started:.0f}s)"
     )
-    if stats.get("throttled"):
-        log("24h throttle active — nothing to do today (this is normal).")
-        return 0
-    if stats.get("fetched_ids", 0) == 0:
-        log("harvest produced nothing — NOT pushing (store unchanged).")
-        return 2
+    # 2026-10-17 stale-Discord-filter fix: a THROTTLED harvest used to return
+    # 0 HERE — skipping the icon backfill, the nightly Discord contact sweep
+    # AND the push. Since the 10-minute Actions expander took over Atlas
+    # harvesting (both sides share the 23h atlas_last_run pointer through the
+    # store, and the 10-min cadence always wins that race), home harvests are
+    # throttled on EVERY scheduled run — so the contact sweep never ran and
+    # every game found after 2026-10-15 stayed has_discord=NULL. The
+    # "Discord available" filter (`has_discord == 1`) then showed only the
+    # old, already-checked games. A throttled harvest only skips DISCOVERY;
+    # the maintenance passes below own their own throttle pointers (icon
+    # backfill: home_icon_backfill_at; contact sweep: home_contact_sweep_at),
+    # so they are safe to run on a no-harvest day. The push happens only when
+    # something was actually written (avoid pushing a 200 MB identical
+    # catalog twice a day).
+    throttled = bool(stats.get("throttled"))
+    if throttled:
+        log("24h Atlas throttle active — discovery skipped this run (this is "
+            "normal); icon backfill + Discord contact sweep below still run.")
     if stats.get("aborted"):
         # Partial sweep (e.g. a DNS blip mid-run): the IDs fetched so far are
         # valid candidates (dedup is by ID, the cursor marks the resume
         # point) — push them; the next run resumes the remaining pages.
         log("partial sweep — pushing what was harvested; next run resumes")
 
+    # Anything the catalog now holds that the store must learn about.
+    dirty = bool(
+        stats.get("fetched_ids")
+        or stats.get("enqueued")
+        or stats.get("provisional_rows")
+        or stats.get("aborted")
+    )
+
     after = catalog_stats(local)
-    log(f"catalog now: {after['games']:,} games · {after['atlas_pending']:,} atlas seeds PENDING → Actions")
+    if not throttled:
+        log(f"catalog now: {after['games']:,} games · {after['atlas_pending']:,} atlas seeds PENDING → Actions")
 
     # -- 3. backfill thumbnails for icon-less rows (24h-throttled) ---------
     # Home IP only: atlasdev.gg 403s runner IPs, and the thumbnail/vote
@@ -692,19 +713,23 @@ def main() -> int:
     with _local_conn(local) as conn:
         backfill_due = _hours_since_backfill(conn) >= ICON_BACKFILL_HOURS
     if backfill_due:
-        backfill_thumbnails(local)
+        if backfill_thumbnails(local) > 0:
+            dirty = True
     else:
         log("icon backfill throttled (next sweep in ~24h)")
 
     # -- 3b. nightly Discord contact sweep for the frontier (bounded) ------
-    # Home IP + cookie only. Runs BEFORE the push: verdicts on today's
-    # discoveries ride the end-of-run store push to the dashboard for free.
+    # Home IP + cookie only. Runs BEFORE the push (the sweep populates the
+    # pool from the discovery queue / oldest unchecked rows regardless of
+    # this run's harvest outcome). Verdicts ride the end-of-run store push
+    # to the dashboard for free.
     contact_stats: dict = {}
     if scout_core_guard():
         log("contact backfill RUNNING — skipping the frontier contact sweep "
             "(same home IP; the backfill's pool covers today's rows anyway)")
     else:
-        contact_sweep(local, contact_stats)
+        contacted = contact_sweep(local, contact_stats)
+        dirty = dirty or contacted > 0
     if contact_stats:
         log(
             "frontier contacts: "
@@ -717,6 +742,12 @@ def main() -> int:
     # file) retried on transient open failures, then the merge-safe push.
     # A final failure strands NOTHING: the marker makes the next run drain
     # before pulling, and the local catalog keeps every harvested row.
+    # Skipped entirely when nothing changed (previously the "harvest
+    # produced nothing — NOT pushing (store unchanged)" early return carried
+    # this promise; the dirty flag now expresses it for all run shapes).
+    if not dirty:
+        log("nothing new harvested/swept/iconed — store unchanged, NOT pushing")
+        return 0
     if not run_push_tail(local):
         return 1
     log(f"DONE in {time.time() - started:.0f}s — Actions will drain + hydrate the new seeds")
