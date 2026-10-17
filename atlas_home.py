@@ -501,13 +501,29 @@ def contact_sweep(local: Path, stats: dict) -> int:
         else:
             import concurrent.futures
 
+            # 2026-10-17 two-lane migration-race fix: every
+            # RobloxPlatformScout constructor runs the _init_sqlite schema
+            # migration. Constructed from two threads at once (this is a
+            # two-cookie lane sweep), both read the pragma BEFORE either
+            # ALTER commits — and when a pull has just replaced the file
+            # with a store copy whose schema predates a brand-new column,
+            # both ALTER the same missing column in: the loser dies with
+            # "duplicate column name" and the WHOLE sweep aborts, silently
+            # (the except below swallows the traceback). Construct the lane
+            # scouts SEQUENTIALLY here — one init at a time — and hand them
+            # to the lanes ready-to-use. Also keeps the arms race harmless
+            # once the store itself carries the migrated schema forevermore.
+            lane_scouts = []
+            for lane_index in range(lanes):
+                lane_scout = scout_core.RobloxPlatformScout(db_path=str(local))
+                lane_scout.set_cookie(cookies[lane_index])
+                lane_scouts.append(lane_scout)
+
             # Interleave the ordered pool (frontier-first preserved per lane);
             # disjoint halves, so no game is requested twice.
             lane_pools = [pool[i::lanes] for i in range(lanes)]
 
-            def _lane(cookie: str, ids: list) -> int:
-                scout = scout_core.RobloxPlatformScout(db_path=str(local))
-                scout.set_cookie(cookie)
+            def _lane(scout, ids: list) -> int:
                 result = scout.scan_contacts(ids)
                 if result is None or result.empty:
                     return 0
@@ -515,7 +531,7 @@ def contact_sweep(local: Path, stats: dict) -> int:
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=lanes) as lane_x:
                 hits = int(sum(lane_x.map(lambda pair: _lane(*pair),
-                                          zip(cookies, lane_pools))))
+                                          zip(lane_scouts, lane_pools))))
         with _local_conn(local) as conn:
             conn.execute(
                 "INSERT INTO scan_pointers (id, last_universe_id, updated_at) "
