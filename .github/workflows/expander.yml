@@ -199,7 +199,7 @@ jobs:
           REMOVAL_STALE_HOURS: ${{ vars.REMOVAL_STALE_HOURS || '72' }}
           REMOVAL_SWEEP_MAX_GAMES: ${{ vars.REMOVAL_SWEEP_MAX_GAMES || '400' }}
         run: |
-        run: python live_sync.py --only removal || echo "removal sweep failed (fail-open; next run retries)"
+          python live_sync.py --only removal || echo "removal sweep failed (fail-open; next run retries)"
       # ------------------------------------------------------------------
       # Rotrends daily sweep + shallow backfill (HYDRATION_SOURCES.md
       # Phase 1): the cold tail (T5-T7, ~23k games) gets its daily CCU
