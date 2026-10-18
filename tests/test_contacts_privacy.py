@@ -171,6 +171,87 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(title2, "keep me", "non-contact columns must be untouched")
         self.assertEqual(link, "https://discord.gg/updated")
 
+    def test_stale_bundle_cannot_roll_back_fresh_verdicts(self):
+        """2026-10-18 freeze regression: a bundle written by an OLDER pipeline
+        state (e.g. the store's ever-rebuilt contacts.bundle lagging behind a
+        home-IP sweep) must never overwrite verdicts the catalog already
+        holds. The old unconditional upsert re-wrote every CONTACT_COLUMN,
+        so an Actions expander applying a stale bundle minutes after the
+        laptop's keyed push reverted ``checked-today`` verdicts to nothing —
+        and the poisoned bundle re-shipped forever, freezing the whole
+        Discord filter at the bundle's timestamp."""
+        db, td = self._db()
+        try:
+            # The catalog has a verdict NEWER than anything the bundle knows.
+            conn = sqlite3.connect(str(db))
+            try:
+                conn.execute(
+                    "UPDATE game_analytics SET has_discord = 1, "
+                    "discord_url = 'https://discord.gg/fresh', status = 'OK', "
+                    "found_via = 'game_social_links', has_social_links = 1, "
+                    "contacts_checked_at = '2026-10-18 20:01:15' "
+                    "WHERE universe_id = 2"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            # The bundle still carries universe 2's OLD, EMPTY verdict.
+            payload = {"version": contacts_privacy.BUNDLE_VERSION,
+                       "rows": {"2": {"has_discord": False, "discord_url": None,
+                                       "status": None, "found_via": None,
+                                       "has_social_links": None,
+                                       "contacts_checked_at": "2026-10-10 09:00:00"}},
+                       "archive": {}}
+            contacts_privacy.apply_bundle(db, payload)
+            conn = sqlite3.connect(str(db))
+            try:
+                row = conn.execute(
+                    "SELECT has_discord, discord_url, contacts_checked_at "
+                    "FROM game_analytics WHERE universe_id = 2"
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(
+                row, (1, "https://discord.gg/fresh", "2026-10-18 20:01:15"),
+                "a stale bundle verdict must never overwrite a newer stored one",
+            )
+        finally:
+            td.cleanup()
+
+    def test_newer_bundle_verdict_still_lands(self):
+        """Forward-only: precedence protection must not freeze the catalog —
+        a strictly newer bundle verdict (existing row) overwrites, and a
+        bundle row for a universe the table lacks is inserted."""
+        db, td = self._db()
+        try:
+            payload = contacts_privacy.build_bundle_payload(db)
+            # Overwrite an EXISTING row with a newer verdict.
+            payload["rows"]["1"]["discord_url"] = "https://discord.gg/moved"
+            payload["rows"]["1"]["contacts_checked_at"] = "2026-10-18 21:00:00"
+            # And a verdict for a row the table has never seen.
+            payload["rows"]["777"] = {"has_discord": True,
+                                       "discord_url": "https://discord.gg/brave",
+                                       "status": "OK", "found_via": "test",
+                                       "has_social_links": True,
+                                       "contacts_checked_at": "2026-10-17 12:00:00"}
+            contacts_privacy.apply_bundle(db, payload)
+            conn = sqlite3.connect(str(db))
+            try:
+                moved = conn.execute(
+                    "SELECT discord_url, contacts_checked_at FROM game_analytics "
+                    "WHERE universe_id = 1"
+                ).fetchone()
+                brave = conn.execute(
+                    "SELECT discord_url FROM game_analytics WHERE universe_id = 777"
+                ).fetchone()
+            finally:
+                conn.close()
+            self.assertEqual(moved[0], "https://discord.gg/moved")
+            self.assertEqual(moved[1], "2026-10-18 21:00:00")
+            self.assertEqual(brave[0], "https://discord.gg/brave")
+        finally:
+            td.cleanup()
+
     def test_wrong_key_bundle_rejected(self):
         db, td = self._db()
         try:

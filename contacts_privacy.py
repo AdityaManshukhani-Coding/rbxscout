@@ -62,6 +62,26 @@ CONTACT_COLUMNS = (
 _TOMBSTONE = {"has_discord": False, "discord_url": None, "status": "No Contact Found"}
 
 
+def _bundle_takes_precedence(new_ts: str | None, old_ts: object) -> bool:
+    """True when a bundle verdict may overwrite the stored one.
+
+    Lexicographic comparison is exact here: both sides are 'YYYY-MM-DD
+    HH:MM:SS' UTC strings written by the same code (resolve_game_contact /
+    contacts backfill), and that format collates chronologically.
+
+    Only a STRICTLY OLDER bundle verdict is poison (2026-10-18: an Actions
+    expander applying the store's lagging bundle minutes after the laptop's
+    keyed push reverted freshly-written verdicts). EQUAL stamps are the
+    normal restore case — the bundle was built FROM this very catalog — and
+    must still land (idempotent, same values). An empty stored stamp is a
+    row the table has never had a verdict for: the bundle always wins.
+    """
+    if not new_ts:
+        return False  # a verdict without a stamp has no precedence claim
+    old = str(old_ts or "").strip()[:len(new_ts)]
+    return not old or old <= new_ts
+
+
 # ---------------------------------------------------------------------------
 # Key handling
 # ---------------------------------------------------------------------------
@@ -200,11 +220,29 @@ def decrypt_bundle(key: bytes, blob: bytes) -> dict:
 
 
 def apply_bundle(db_path: Path, payload: dict) -> tuple[int, int]:
-    """Write bundle rows back into a catalog. Returns (rows, archive_rows).
+    """Write bundle rows back into a catalog — forward-only in time.
 
     Contact columns missing from the target table are added on the fly
     (self-heal, mirroring scout_core's CREATE-if-missing pattern), so a
-    restore always succeeds against any catalog generation."""
+    restore always succeeds against any catalog generation.
+
+    Timestamp awareness (2026-10-18 incident fix): a bundle written by an
+    OLDER pipeline state must never overwrite verdicts the catalog already
+    holds. The old unconditional ``CONTACT_COLUMNS = excluded.…`` upsert
+    did exactly that — an Actions expander pulls the (already stale) store
+    bundle, applies it over its own fresh pull minutes after the laptop's
+    keyed push, and every verdict newer than the bundle reverts to the
+    bundle's copy (checked-today 135 → 0). The freeze then self-perpetuates:
+    the poisoned bundle re-ships with the next push and no later run can
+    ever recover. Now each row updates ONLY when its bundle verdict is
+    strictly newer than the stored ``contacts_checked_at`` — the bundle
+    still fills remarks for rows the target has    never seen (NULL stored stamp = nothing to protect) and touch-upserts
+    equal-or-newer rows; only a bundle verdict STRICTLY OLDER than the one
+    the row already holds is discarded (the 2026-10-18 stale-bundle freeze).
+
+    Returns (rows, archive_rows) — rows TAKEN from the bundle, regardless
+    of how many columns they actually moved.
+    """
     rows = payload.get("rows") or {}
     archive = payload.get("archive") or {}
     conn = sqlite3.connect(str(db_path))
@@ -225,18 +263,74 @@ def apply_bundle(db_path: Path, payload: dict) -> tuple[int, int]:
                             )
                         except sqlite3.Error:
                             pass
-                # Upsert only the contact columns; never touch other fields.
-                assignments = ", ".join(f"{c}=excluded.{c}" for c in CONTACT_COLUMNS)
-                placeholders = ", ".join("?" for _ in CONTACT_COLUMNS)
-                conn.executemany(
-                    f"INSERT INTO {table} (universe_id, {', '.join(CONTACT_COLUMNS)}) "
-                    f"VALUES (?, {placeholders}) "
-                    f"ON CONFLICT(universe_id) DO UPDATE SET {assignments}",
-                    [
-                        (int(uid), *(rec.get(c) for c in CONTACT_COLUMNS))
-                        for uid, rec in data.items()
-                    ],
-                )
+                # Take only the contact columns the table actually has, so the
+                # SQL below never cites an absent cell.
+                cols = [c for c in CONTACT_COLUMNS if c in _existing_columns(conn, table)]
+                if not cols:
+                    continue
+                # 2026-10-18: every writer stamps the verdict with
+                # contacts_checked_at. A bundle without that column is
+                # pre-split-format content whose precedence is unknowable —
+                # only INSERT rows the table lacks, never overwrite stored ones.
+                has_stamp = "contacts_checked_at" in cols
+                # Which bundle rows already exist in the table (determines
+                # INSERT vs timestamp-guarded UPDATE)? Load the table's
+                # universe_id -> stamp map in 900-ID chunks instead of probing
+                # row by row: one indexed read per chunk, not per row.
+                stored: dict[int, object] = {}
+                uids = [int(u) for u in data]
+                for i in range(0, len(uids), 900):
+                    chunk = uids[i : i + 900]
+                    marks = ",".join("?" for _ in chunk) or "NULL"
+                    if has_stamp:
+                        rows_out = conn.execute(
+                            f"SELECT universe_id, contacts_checked_at FROM {table} "
+                            f"WHERE universe_id IN ({marks})",
+                            chunk,
+                        ).fetchall()
+                    else:
+                        rows_out = [
+                            (r[0], None) for r in conn.execute(
+                                f"SELECT universe_id FROM {table} "
+                                f"WHERE universe_id IN ({marks})",
+                                chunk,
+                            ).fetchall()
+                        ]
+                    for r in rows_out:
+                        stored[int(r[0])] = r[1] if has_stamp else None
+                inserts = [
+                    (int(uid), *(rec.get(c) for c in cols))
+                    for uid, rec in data.items()
+                    if int(uid) not in stored
+                ]
+                placeholders = ", ".join("?" for _ in cols)
+                if inserts:
+                    conn.executemany(
+                        f"INSERT INTO {table} (universe_id, {', '.join(cols)}) "
+                        f"VALUES (?, {placeholders})",
+                        inserts,
+                    )
+                # Rows needing an UPDATE: a bundle verdict strictly newer
+                # than the stored one. Filtered in Python against the stamp
+                # map loaded above; most rows are already current, so the
+                # write set is tiny and the old bug (rewriting 27k rows per
+                # pull, each overwrite a potential time reversal) is gone.
+                updates = [
+                    (int(uid), *(rec.get(c) for c in cols))
+                    for uid, rec in data.items()
+                    if has_stamp and int(uid) in stored and _bundle_takes_precedence(
+                        rec.get("contacts_checked_at"), stored.get(int(uid))
+                    )
+                ]
+                if updates:
+                    assignments = ", ".join(f"{c}=excluded.{c}" for c in cols)
+                    placeholders2 = ", ".join("?" for _ in cols)
+                    conn.executemany(
+                        f"INSERT INTO {table} (universe_id, {', '.join(cols)}) "
+                        f"VALUES (?, {placeholders2}) "
+                        f"ON CONFLICT(universe_id) DO UPDATE SET {assignments}",
+                        updates,
+                    )
     finally:
         conn.close()
     return len(rows), len(archive)
