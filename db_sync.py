@@ -606,6 +606,69 @@ def cmd_pull() -> int:
     return 0
 
 
+def _merge_newer_store_contacts(rel: dict, token: str) -> int:
+    """Re-apply the store's contacts bundle when it holds newer verdicts.
+
+    2026-10-19 freeze fix. A push REPLACES the contacts.bundle asset with
+    the payload built from the pushing side's local catalog. A run whose
+    pull predates another writer's push (Actions runs pulling minutes
+    before the laptop's keyed push, then scanning + pushing an hour
+    later) re-ships the OLD bundle with a HIGHER sync counter — the newer
+    verdicts vanish from the store AND from every later pull. With the
+    nightly contact sweep budget-bound, that regression persisted forever
+    (store newest stamp pinned at 2026-10-15 10:26 for 4 days).
+
+    So before any push bundles its contacts: fetch the store's current
+    bundle; if its newest contacts_checked_at is strictly newer than the
+    local catalog's, apply it into the local DB first (apply_bundle's
+    forward-only timestamp guard keeps this safe — only rows the local
+    copy holds as older-or-NULL are touched). The push then re-ships the
+    merged state, and no run can ever erase another writer's verdicts.
+    Best-effort: any failure here degrades to the previous un-merged push.
+    """
+    try:
+        asset = next(
+            (a for a in rel.get("assets", [])
+             if a.get("name") == contacts_privacy.ASSET_BUNDLE),
+            None,
+        )
+        if not asset:
+            return 0
+        key = contacts_privacy.load_key()
+        if not key:
+            return 0
+        blob = _api("GET", asset["url"], token, expect_json=False,
+                    accept="application/octet-stream")
+        if not blob:
+            print("push: WARNING — could not download the store bundle for "
+                  "the pre-push contacts merge; pushing the local copy as-is")
+            return 0
+        payload = contacts_privacy.decrypt_bundle(key, bytes(blob))
+        rows_now = payload.get("rows") or {}
+        store_max = max(
+            (str(r.get("contacts_checked_at") or "") for r in rows_now.values()),
+            default="",
+        )
+        probe = sqlite3.connect(str(DB_PATH))
+        try:
+            local_max = str(probe.execute(
+                "SELECT COALESCE(MAX(contacts_checked_at), '') "
+                "FROM game_analytics").fetchone()[0])
+        finally:
+            probe.close()
+        if not store_max or store_max <= local_max:
+            return 0  # store bundle is not newer — local copy already covers it
+        applied_rows, applied_archive = contacts_privacy.apply_bundle(DB_PATH, payload)
+        print(f"push: merged the store bundle first — {applied_rows:,} row verdicts "
+              f"(+{applied_archive:,} archive) newer than the local copy "
+              f"(store stamp {store_max} > local {local_max or 'none'})")
+        return 1
+    except Exception as exc:  # degraded-but-working beats a failed push
+        print(f"push: WARNING — pre-push contacts merge skipped ({exc}); "
+              "pushing the local copy as-is")
+        return 0
+
+
 def cmd_push(force: bool = False) -> int:
     token = gh_token()
     if not DB_PATH.exists():
@@ -613,6 +676,12 @@ def cmd_push(force: bool = False) -> int:
     if not DB_PATH.read_bytes()[:16].startswith(b"SQLite format 3\x00"):
         raise SyncError(f"{DB_PATH} is not a SQLite database — refusing to upload")
     _checkpoint_wal(DB_PATH)  # consistent snapshot before building copies
+    # 2026-10-19 freeze fix: undo pull-race clobbers BEFORE the bundle is
+    # built from this DB — the store's newer verdicts ride up in this very
+    # push instead of being erased by it.
+    rel = get_or_create_release(token)
+    _merge_newer_store_contacts(rel, token)
+    _checkpoint_wal(DB_PATH)  # re-checkpoint after the merge wrote to the DB
     key = contacts_privacy.load_key()
     # Build the encrypted contacts bundle + the link-free public copy from
     # the local catalog. The public asset is what the world downloads; the
@@ -631,7 +700,6 @@ def cmd_push(force: bool = False) -> int:
         public_path.unlink(missing_ok=True)
         raise SyncError(f"stripped copy of {DB_PATH} is not a SQLite database — refusing to upload")
     state = local_state()
-    rel = get_or_create_release(token)
     old_state = _asset_state(rel, token)
     # Stale-push guard: never let an old local copy roll the store back.
     # The store only ever moves forward (each pipeline pull/push bumps the

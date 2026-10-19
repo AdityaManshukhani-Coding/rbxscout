@@ -386,6 +386,77 @@ class TestPush(DBSyncTest):
         blob = FakeGitHubHandler.assets[db_sync.ASSET_DB]
         self.assertEqual(len(blob), db_sync.DB_PATH.stat().st_size)
 
+    def test_push_reapplies_newer_store_bundle_after_pull_race(self):
+        """2026-10-19 freeze fix: a run that pulled the store BEFORE another
+        writer's push re-ships the OLD contacts bundle with a HIGHER sync
+        counter, permanently erasing the newer verdicts (the store's newest
+        stamp was pinned at 2026-10-15 for 4 days). The pre-push merge must
+        re-apply a strictly-newer store bundle, forward-only, before the
+        push builds and uploads its own."""
+        # Seed the store: local db with contacts data -> version-1 keyed push.
+        self.make_local_db(games=2)
+        conn = sqlite3.connect(str(db_sync.DB_PATH))
+        try:
+            conn.execute(
+                "ALTER TABLE game_analytics ADD COLUMN contacts_checked_at TEXT")
+            conn.execute(
+                "ALTER TABLE game_analytics ADD COLUMN has_discord INTEGER")
+            conn.execute(
+                "UPDATE game_analytics SET contacts_checked_at=?, has_discord=1 "
+                "WHERE universe_id=0",
+                ("2026-10-15 10:26:54",))
+            conn.commit()
+        finally:
+            conn.close()
+        db_sync.STATE_PATH.write_text("100\n")
+        self.assertEqual(db_sync.main(["db_sync.py", "push"]), 0)
+        store_bundle = FakeGitHubHandler.assets[contacts_privacy.ASSET_BUNDLE]
+        self.assertTrue(store_bundle)
+
+        # The racy run: an OLDER local copy (stamp pulled before the newer
+        # verdict existed — the store's newest stamp here is Oct 15) with a
+        # HIGHER sync counter, same shape as every real pull-race push.
+        conn = sqlite3.connect(str(db_sync.DB_PATH))
+        try:
+            conn.execute("DROP TABLE game_analytics")
+            conn.commit()
+        finally:
+            conn.close()
+        self.make_local_db(games=4)
+        conn = sqlite3.connect(str(db_sync.DB_PATH))
+        try:
+            conn.execute(
+                "ALTER TABLE game_analytics ADD COLUMN contacts_checked_at TEXT")
+            conn.execute(
+                "ALTER TABLE game_analytics ADD COLUMN has_discord INTEGER")
+            conn.execute(
+                "UPDATE game_analytics SET contacts_checked_at=?, has_discord=1 "
+                "WHERE universe_id=1",
+                ("2026-10-10 00:00:00",))
+            conn.commit()
+        finally:
+            conn.close()
+        db_sync.STATE_PATH.write_text("101\n")
+        self.assertEqual(db_sync.main(["db_sync.py", "push"]), 0, "equal-or-newer counter push must be allowed")
+
+        # The pushed bundle must STILL carry the newer Oct 15 verdict (the
+        # pre-push merge reapplied the store bundle before building its own).
+        key = contacts_privacy.load_key()
+        payload = contacts_privacy.decrypt_bundle(
+            key, FakeGitHubHandler.assets[contacts_privacy.ASSET_BUNDLE])
+        rows = payload.get("rows") or {}
+        merged_newest = max(
+            (str(r.get("contacts_checked_at") or "") for r in rows.values()),
+            default="",
+        )
+        self.assertEqual(merged_newest, "2026-10-15 10:26:54")
+        # Forward-only in the other direction too: the store's own newer
+        # merge must not resurrect the local copy's older Oct 10 stamp over
+        # rows the bundle already covers — the merged bundle's row 1 keeps
+        # whichever verdict was newer than NULL/local-old, i.e. Oct 15 (row
+        # 1 carries the store verdict only if the bundle listed it; the key
+        # assertion is the max above).
+
     def test_equal_sync_push_is_allowed(self):
         """Same counter (e.g. re-pushing the recovered copy) is fine."""
         self.make_local_db(games=3)
