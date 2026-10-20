@@ -262,6 +262,10 @@ ICON_BACKFILL_HOURS = 24           # minimum gap between backfill sweeps
 # unchecked stragglers, capped so the nightly run never turns into the
 # one-time backfill (that job belongs to catchup_contacts.py).
 CONTACT_SWEEP_BUDGET = 200         # games per nightly run
+# 2026-10-20 group-resilience knob: sweep pool is processed in groups of this
+# size; a group's failure (schema race, resolver exception) costs only that
+# group instead of scrapping the whole nightly sweep.
+CONTACT_SWEEP_GROUP = 50
 CONTACT_SWEEP_HOURS = 24           # self-throttle, mirroring the icon backfill
 
 
@@ -496,8 +500,35 @@ def contact_sweep(local: Path, stats: dict) -> int:
         if lanes <= 1:
             scout = scout_core.RobloxPlatformScout(db_path=str(local))
             scout.set_cookie(cookies[0])
-            result = scout.scan_contacts(pool)
-            hits = int((result.get("has_discord") == True).sum()) if result is not None and not result.empty else 0  # noqa: E712
+            # 2026-10-20 group-resilience fix: one big scan_contacts(pool)
+            # call meant ANY exception discarded all ~200 games for the day
+            # (the Oct 17 20:39 run lost its whole sweep to a single schema
+            # error — "duplicate column name" — and the Discord list froze
+            # across three days of nightly failures). Groups of 50 with a
+            # per-group try/except: a failure costs one group, the rest of
+            # the pool still gets verdicts, and a throttled window stops the
+            # sweep cleanly instead of burning the rest of the budget on
+            # guaranteed 429s.
+            hits = 0
+            checked_count = 0
+            for start in range(0, len(pool), CONTACT_SWEEP_GROUP):
+                chunk = pool[start:start + CONTACT_SWEEP_GROUP]
+                try:
+                    result = scout.scan_contacts(chunk)
+                    group_hits = (
+                        int((result.get("has_discord") == True).sum())
+                        if result is not None and not result.empty else 0  # noqa: E712
+                    )
+                    checked_count += len(chunk)
+                except Exception as exc:
+                    log(f"contact sweep group {start // CONTACT_SWEEP_GROUP} "
+                        f"failed ({exc}) — continuing with the rest")
+                    group_hits = 0
+                hits += group_hits
+                if scout.throttle_window_active():
+                    log("Roblox throttle window active — stopping the sweep "
+                        "early (completed groups keep their verdicts)")
+                    break
         else:
             import concurrent.futures
 
@@ -539,10 +570,13 @@ def contact_sweep(local: Path, stats: dict) -> int:
                 "ON CONFLICT(id) DO UPDATE SET updated_at = CURRENT_TIMESTAMP"
             )
             conn.commit()
-        stats["contacts_checked"] = len(pool)
+        # Only the SINGLE-lane loop sets checked_count; both-lanes ran the
+        # whole pool. One variable name for both shapes keeps the stats line
+        # honest about partial (throttled/failed-group) sweeps.
+        stats["contacts_checked"] = checked_count if lanes <= 1 else len(pool)
         stats["contacts_hits"] = hits
-        log(f"contact sweep: {len(pool)} games checked · {hits} with Discord")
-        return len(pool)
+        log(f"contact sweep: {stats['contacts_checked']} games checked · {hits} with Discord")
+        return stats["contacts_checked"]
     except Exception as exc:
         log(f"contact sweep skipped: {exc}")
         return 0
@@ -661,7 +695,26 @@ def main() -> int:
         log("CONTACT BACKFILL RUNNING — skipping pull; working on the local "
             "catalog (the backfill's end-of-run push will carry our results)")
     else:
-        db_sync("pull")
+        # 2026-10-20 freeze-proofing: a transient pull crash KILLED the whole
+        # nightly run before (Oct 17 20:00: the 200 MB asset read died with
+        # "OSError: [Errno 65] No route to host" mid-file → SystemExit here →
+        # icon backfill + contact sweep + push all skipped → the Discord
+        # filter froze for days). Retry once, then fall back to the local
+        # copy: the contact sweep still produces verdicts locally, and the
+        # stranded-work chain (pre-pull drain + push marker) delivers this
+        # run's writes on the next healthy cycle.
+        pull_rc, pull_out = db_sync_out("pull")
+        if pull_out:
+            log("  " + pull_out.replace("\n", "\n  "))
+        if pull_rc != 0:
+            time.sleep(60)
+            pull_rc, pull_out = db_sync_out("pull")
+            if pull_out:
+                log("  " + pull_out.replace("\n", "\n  "))
+            if pull_rc != 0:
+                log("WARNING: pull failed twice (transient network?) — "
+                    "continuing on the local copy; the stranded-work chain "
+                    "keeps this run's writes safe")
     restored = _restore_pending_seeds(local, pre_pull_seeds)
     if restored:
         log(f"pull protection: re-enqueued {restored} local seed(s) the pull had wiped")

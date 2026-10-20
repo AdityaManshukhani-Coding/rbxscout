@@ -535,10 +535,30 @@ def cmd_pull() -> int:
             f"(updated {incoming['updated_at']})"
         )
     print(f"pull: {asset['name']}  {asset['size']/1e6:.1f} MB  (updated {asset['updated_at']})")
-    blob = _api("GET", asset["url"], token, expect_json=False,
-                accept="application/octet-stream")
+    # 2026-10-20 freeze-proofing: the 200 MB asset read dies mid-stream on
+    # transient network errors (Oct 17 20:00: "OSError: [Errno 65] No route
+    # to host" 20 minutes into a pull) — and every caller treats a pull
+    # crash as fatal, so ONE dropped TCP connection skipped that night's
+    # icon backfill + Discord contact sweep + push and froze the site's
+    # Discord filter for days. Retry before giving up; a persistent failure
+    # still raises (SyncError) so the caller fails visibly.
+    blob = None
+    for _attempt in range(1, 4):
+        try:
+            blob = _api("GET", asset["url"], token, expect_json=False,
+                        accept="application/octet-stream")
+        except OSError as exc:
+            # Connection reset / DNS blip / dropped socket mid-read: HTTP
+            # errors surface as SyncError from _api; raw OSError is the
+            # transport layer giving up on a live download.
+            print(f"pull: asset download attempt {_attempt}/3 failed ({exc})")
+            blob = None
+        if blob:
+            break
+        if _attempt < 3:
+            time.sleep(5 * _attempt)
     if not blob:
-        raise SyncError(f"asset download returned nothing (asset id {asset['id']})")
+        raise SyncError(f"asset download failed after 3 attempts (asset id {asset['id']})")
     tmp = DB_PATH.with_suffix(".db.tmp")
     tmp.write_bytes(blob)
     if not tmp.read_bytes().startswith(b"SQLite format 3\x00"):

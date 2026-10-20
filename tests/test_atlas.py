@@ -236,6 +236,66 @@ def test_contact_sweep_two_cookies_split_pool(tmp_path, monkeypatch):
     assert not set(_SweepScout.all_pools[0]) & set(_SweepScout.all_pools[1])
 
 
+class _FlakyGroupSweepScout(_SweepScout):
+    """scan_contacts explodes on any group that contains universe 1.
+
+    Used to prove the 2026-10-20 group-resilience fix: a bad group costs
+    that group only — the sweep CONTINUES over the remaining pool instead
+    of discarding the whole night's list (the Oct 17 single-call sweep lost
+    all 200 games to one schema error and the Discord list froze for days).
+    """
+
+    failed_groups: list = []
+    survivor_groups: list = []
+
+    def scan_contacts(self, universe_ids, force=False, run_id=None, progress_cb=None):
+        ids = list(universe_ids)
+        if 1 in ids:
+            type(self).failed_groups.append(ids)
+            raise RuntimeError("resolver exploded (simulated group failure)")
+        type(self).survivor_groups.append(ids)
+        return super().scan_contacts(ids)
+
+
+def test_contact_sweep_survives_a_failed_group(tmp_path, monkeypatch):
+    db = tmp_path / "t.db"
+    monkeypatch.setenv("RBXSCOUT_COOKIE", ".ROBLOSECURITY=test-cookie")
+    monkeypatch.setattr(atlas_home, "CONTACT_SWEEP_BUDGET", 3)
+    # Force two groups: [1, 2] fails, [3] must still run.
+    monkeypatch.setattr(atlas_home, "CONTACT_SWEEP_GROUP", 2)
+    _FlakyGroupSweepScout(str(db))
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute("INSERT INTO discovery_queue (universe_id, source, status, seen_at) "
+                     "VALUES (1, 'atlas_dev', 'pending', datetime('now', '-1 hours'))")
+        conn.execute("INSERT INTO discovery_queue (universe_id, source, status, seen_at) "
+                     "VALUES (2, 'atlas_dev', 'pending', datetime('now', '-2 hours'))")
+        conn.execute(
+            "INSERT INTO game_analytics (universe_id, visits, ccu, first_seen) "
+            "VALUES (3, 30000, 30, datetime('now', '-20 days'))"
+        )
+    import scout_core as sc
+    monkeypatch.setattr(sc, "RobloxPlatformScout", _FlakyGroupSweepScout)
+
+    _FlakyGroupSweepScout.failed_groups = []
+    _FlakyGroupSweepScout.survivor_groups = []
+    stats = {}
+    checked = atlas_home.contact_sweep(db, stats)
+
+    # The first group failed BUT the second one still ran — the whole pool
+    # was not scrapped.
+    self_check = _FlakyGroupSweepScout
+    assert self_check.failed_groups == [[1, 2]]
+    assert self_check.survivor_groups == [[3]]
+    assert checked == 1  # only the surviving group counts as checked
+    assert stats["contacts_checked"] == 1
+    assert stats["contacts_hits"] == 0  # universe 3 is odd -> no Discord
+    with sqlite3.connect(str(db)) as conn:
+        stamp = conn.execute(
+            "SELECT last_universe_id FROM scan_pointers WHERE id='home_contact_sweep_at'"
+        ).fetchone()
+    assert stamp is not None  # the run still stamps its 24h throttle
+
+
 def test_contact_sweep_throttled_when_already_run_today(tmp_path, monkeypatch):
     db = tmp_path / "t.db"
     monkeypatch.setenv("RBXSCOUT_COOKIE", ".ROBLOSECURITY=test-cookie")

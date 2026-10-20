@@ -518,6 +518,88 @@ class TestPull(DBSyncTest):
         with self.assertRaises(db_sync.SyncError):
             db_sync.cmd_pull()
 
+    def _asset_flakiness_patch(self, fail_times: int):
+        """Return (install, uninstall) wrappers that make the first
+        ``fail_times`` GETs of the db asset die with a transport OSError
+        (the Oct 17 20:00 outage class: "[Errno 65] No route to host"
+        mid-download), then serve normally."""
+        original_api = db_sync._api
+        state = {"fails_left": fail_times, "asset_gets": 0}
+
+        def flaky_api(method, path, token, **kwargs):
+            is_db_asset = path.endswith(
+                f"/{db_sync.ASSET_DB}"
+            ) or path.endswith(
+                f"/{db_sync.ASSET_DB}{db_sync.INCOMING_SUFFIX}"
+            )
+            if method == "GET" and is_db_asset:
+                state["asset_gets"] += 1
+                if state["fails_left"] > 0:
+                    state["fails_left"] -= 1
+                    raise OSError(65, "No route to host")
+            return original_api(method, path, token, **kwargs)
+
+        def restore():
+            db_sync._api = original_api
+
+        return flaky_api, state, restore
+
+    def test_pull_retries_transient_download_failure(self):
+        """2026-10-20 freeze-proofing: one dropped connection during the
+        200 MB asset read used to raise a raw OSError — the nightly home run
+        SystemExit'd and the contact sweep skipped for days. The pull retries
+        the transient failure and lands the catalog."""
+        self.make_local_db(games=9)
+        db_sync.STATE_PATH.write_text("77\n")
+        self.assertEqual(db_sync.main(["db_sync.py", "push"]), 0)
+        stored = FakeGitHubHandler.assets[db_sync.ASSET_DB]
+
+        flaky, state, restore = self._asset_flakiness_patch(fail_times=1)
+        db_sync._api = flaky
+        db_sync.DB_PATH.unlink()
+        try:
+            real_sleep = db_sync.time.sleep
+            db_sync.time.sleep = lambda *a, **k: None  # keep the test fast
+            try:
+                rc = db_sync.main(["db_sync.py", "pull"])
+            finally:
+                db_sync.time.sleep = real_sleep
+            self.assertEqual(rc, 0)
+            self.assertEqual(state["asset_gets"], 2)
+            conn = sqlite3.connect(str(db_sync.DB_PATH))
+            try:
+                n = conn.execute("SELECT COUNT(*) FROM game_analytics").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(n, 9)
+            self.assertEqual(FakeGitHubHandler.assets[db_sync.ASSET_DB], stored)
+        finally:
+            restore()
+
+    def test_pull_fails_cleanly_after_persistent_download_failure(self):
+        """A persistent failure must NOT surface the raw OSError —\n        callers see the SyncError path (non-zero main) and fail visibly."""
+        self.make_local_db(games=9)
+        db_sync.STATE_PATH.write_text("77\n")
+        self.assertEqual(db_sync.main(["db_sync.py", "push"]), 0)
+
+        flaky, state, restore = self._asset_flakiness_patch(fail_times=10)
+        db_sync._api = flaky
+        stdout = io.StringIO()
+        try:
+            real_sleep = db_sync.time.sleep
+            db_sync.time.sleep = lambda *a, **k: None
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(err):
+                    rc = db_sync.main(["db_sync.py", "pull"])
+            finally:
+                db_sync.time.sleep = real_sleep
+            self.assertEqual(rc, 1, "persistent failure is a visible non-zero")
+            self.assertEqual(state["asset_gets"], 3, "exactly the 3 retries")
+            self.assertIn("failed after 3 attempts", stdout.getvalue() + err.getvalue())
+        finally:
+            restore()
+
     def test_pull_recovers_incoming_asset_after_midswap_crash(self):
         """The 2026-09-17 outage: a push that died between deleting the old
         catalog and renaming the incoming one left only <name>.incoming on
