@@ -444,7 +444,11 @@ def _remove_hashes_from_manifest(manifest: set, doomed: set) -> None:
         ]
         data["passwords"] = remaining
         data["count"] = len(remaining)
-        data["terminated_hashes"] = sorted(doomed)
+        # UNION, not replace: every earlier termination must stay in the audit
+        # list, otherwise a later revoke silently drops the enforcement layer
+        # that works on deployments with a fresh (unsynced) state file.
+        prior = {str(h).strip().lower() for h in (data.get("terminated_hashes") or [])}
+        data["terminated_hashes"] = sorted(prior | {str(h).strip().lower() for h in doomed})
         path.write_text(json.dumps(data, indent=1) + "\n", encoding="utf-8")
     except Exception:
         pass
