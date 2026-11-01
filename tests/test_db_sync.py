@@ -386,6 +386,33 @@ class TestPush(DBSyncTest):
         blob = FakeGitHubHandler.assets[db_sync.ASSET_DB]
         self.assertEqual(len(blob), db_sync.DB_PATH.stat().st_size)
 
+    def test_push_refuses_to_shrink_the_store(self):
+        """2026-11-01 clobber: a runner that pulled before another writer's
+        push re-ships its older catalog under a HIGHER counter, so the
+        counter check cannot catch it — the game count must. Rows are only
+        soft-deleted, so a smaller local catalog is always a stale one."""
+        self.make_local_db(games=8)
+        db_sync.STATE_PATH.write_text("100\n")
+        self.assertEqual(db_sync.main(["db_sync.py", "push"]), 0)
+        keeper = FakeGitHubHandler.assets[db_sync.ASSET_DB]
+
+        # The racy run: an older (smaller) catalog, but its counter moved on.
+        self.make_local_db(games=3)
+        db_sync.STATE_PATH.write_text("101\n")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(db_sync.main(["db_sync.py", "push"]), 1)
+        self.assertIn("refusing to push", stderr.getvalue())
+        self.assertIn("3 games", stderr.getvalue())   # local (stale) count
+        self.assertIn("8 games", stderr.getvalue())   # store count named
+        # The store still holds the LARGER catalog, byte for byte.
+        self.assertEqual(FakeGitHubHandler.assets[db_sync.ASSET_DB], keeper)
+
+        # --force is the explicit escape hatch for an intentional shrink.
+        self.assertEqual(db_sync.main(["db_sync.py", "push", "--force"]), 0)
+        self.assertEqual(len(FakeGitHubHandler.assets[db_sync.ASSET_DB]),
+                         db_sync.DB_PATH.stat().st_size)
+
     def test_push_reapplies_newer_store_bundle_after_pull_race(self):
         """2026-10-19 freeze fix: a run that pulled the store BEFORE another
         writer's push re-ships the OLD contacts bundle with a HIGHER sync

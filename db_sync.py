@@ -443,6 +443,42 @@ def _update_release_stats_line(rel: dict, token: str, payloads: dict[str, dict])
 
 
 # --------------------------------------------------------------------------
+# Game counts (content guard for the push)
+# --------------------------------------------------------------------------
+
+def _local_game_count() -> int | None:
+    """Rows in the local catalog; None when unreadable (guard degrades to
+    the counter check rather than blocking a legitimate push)."""
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        try:
+            return int(conn.execute(
+                "SELECT COUNT(*) FROM game_analytics").fetchone()[0])
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def _store_game_count(rel: dict, token: str) -> int | None:
+    """Game count recorded by the store's stats.json (None when absent or
+    unreadable — an empty store has nothing to protect)."""
+    asset = next(
+        (a for a in rel.get("assets", []) if a.get("name") == ASSET_STATS),
+        None,
+    )
+    if not asset:
+        return None
+    try:
+        raw = _api("GET", asset["url"], token, expect_json=False,
+                   accept="application/octet-stream")
+        games = json.loads((raw or b"").decode("utf-8", "replace") or "{}").get("games")
+        return int(games) if games is not None else None
+    except (SyncError, ValueError, TypeError):
+        return None
+
+
+# --------------------------------------------------------------------------
 # Local side
 # --------------------------------------------------------------------------
 
@@ -745,6 +781,25 @@ def cmd_push(force: bool = False) -> int:
             "to refresh your local copy first, or pass --force (or set "
             "RBXSCOUT_FORCE_PUSH=1) only if you really mean to overwrite."
         )
+    # Content guard (2026-11-01 clobber): the counter alone cannot tell a
+    # fresh catalog from a stale one — a runner that pulled BEFORE another
+    # writer's push still bumps the counter, so an in-flight run replaced a
+    # 27,576-game catch-up with its 27,031-game copy three minutes later and
+    # the dashboard looked days behind again. Game rows are only ever
+    # soft-deleted (the removal sweep sets removed=1), so the store's count
+    # must never go DOWN: a smaller local catalog is a stale one.
+    if not force:
+        local_games = _local_game_count()
+        store_games = _store_game_count(rel, token)
+        if (local_games is not None and store_games is not None
+                and local_games < store_games):
+            raise SyncError(
+                f"refusing to push: this catalog has {local_games:,} games but "
+                f"the store already holds {store_games:,} games — this copy is "
+                "stale and pushing it would delete every game discovered since "
+                "it was pulled. Run `python db_sync.py pull` first, or pass "
+                "--force (RBXSCOUT_FORCE_PUSH=1) if the shrink is intentional."
+            )
     try:
         replace_catalog_asset(rel, token, ASSET_DB, blob)
         if contacts_blob is not None:
