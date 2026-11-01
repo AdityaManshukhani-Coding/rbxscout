@@ -2596,6 +2596,26 @@ class RobloxPlatformScout:
             log.warning("icon backfill failed: %s", exc)
         return out
 
+    def _icon_less_among(self, universe_ids) -> List[int]:
+        """Which of these catalog rows still have no thumbnail (chunked
+        lookup so a 900+ id batch stays under SQLite's variable limit)."""
+        ids = [int(u) for u in universe_ids]
+        out: List[int] = []
+        try:
+            with self._connect() as conn:
+                for i in range(0, len(ids), 900):
+                    chunk = ids[i : i + 900]
+                    marks = ",".join("?" for _ in chunk)
+                    out.extend(int(r[0]) for r in conn.execute(
+                        "SELECT universe_id FROM game_analytics "
+                        "WHERE (icon_url IS NULL OR icon_url = '') "
+                        f"AND universe_id IN ({marks})",
+                        chunk,
+                    ).fetchall())
+        except sqlite3.Error as exc:
+            log.debug("icon-less lookup failed: %s", exc)
+        return out
+
     def upsert_icons(self, icons: Dict[int, str]) -> None:
         """Persist icon URLs without touching the game rows' metrics.
 
@@ -3397,13 +3417,19 @@ class RobloxPlatformScout:
         for uid in to_check:
             if uid not in qualified and uid not in below_gate:
                 self._mark_discovery_outcome(uid, "metrics_failed")
-        if qualified:
-            # Thumbnails for the new qualifiers: the drain used to store rows
-            # without icons, so every Atlas-discovered game rendered the
-            # placeholder tile until a much later hydrator pass happened to
-            # fill it (this is why recent Atlas games showed no thumbnail).
-            report(0.93, f"Fetching icons for {len(qualified)} new games…")
-            self.upsert_icons(self.fetch_game_icons(list(qualified)))
+        # Thumbnails for EVERY row this batch touched that still has none.
+        # 2026-11-01: only *qualified* rows were fetched, so the two paths
+        # that create a row without an icon — first-paint provisional rows
+        # (which reach this point as `existing`) and expansion_hidden rows
+        # (which never fetched icons at all) — rendered the 🎮 placeholder
+        # forever. Live coverage was 1.1% for atlas_dev and 0% for
+        # expansion_hidden while every path that called fetch_game_icons
+        # sat at 100%. Selecting by "lacks an icon" instead of "is newly
+        # qualified" also repairs rows still sitting in the backlog.
+        icon_less = self._icon_less_among(ids)
+        if icon_less:
+            report(0.93, f"Fetching icons for {len(icon_less)} games…")
+            self.upsert_icons(self.fetch_game_icons(icon_less))
         report(
             0.9,
             f"Queue drained: {stats['qualified']} qualified · "

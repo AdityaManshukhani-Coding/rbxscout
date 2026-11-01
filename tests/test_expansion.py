@@ -180,6 +180,54 @@ def test_drain_skips_ids_already_in_catalog(tmp_path):
     assert outcome == "already_in_catalog"
 
 
+def test_drain_fills_icons_for_hidden_and_provisional_rows(tmp_path):
+    """2026-11-01: the drain fetched thumbnails only for *qualified* rows, so
+    the two paths that create a row without an icon stayed icon-less forever
+    — first-paint provisional rows (which reach the drain as 'already in
+    catalog') and expansion_hidden rows. Live coverage was 1.1% for
+    atlas_dev and 0% for expansion_hidden while every path that called
+    fetch_game_icons sat at 100%."""
+    db = str(tmp_path / "t.db")
+
+    class IconScout(ExpansionScout):
+        def _get_json(self, url, retries=1):
+            if url.startswith("https://thumbnails.roblox.com/v1/games/icons"):
+                ids = [int(u) for u in
+                       url.split("universeIds=")[1].split("&")[0].split(",")]
+                return 200, {"data": [
+                    {"targetId": uid, "state": "Completed",
+                     "imageUrl": f"https://tr.rbxcdn.com/{uid}/150/150/Image/Png"}
+                    for uid in ids
+                ]}
+            return super()._get_json(url, retries=retries)
+
+    scout = IconScout({
+        "metrics:811": _game(811, ccu=40, visits=250_000, title="Qualifier"),
+        "metrics:812": _game(812, ccu=5, visits=500, title="Small"),
+    }, db)
+    with sqlite3.connect(db) as conn:
+        # 810 is already cataloged WITHOUT an icon: a first-paint provisional
+        # row, so this drain only ever sees it as a duplicate.
+        conn.execute(
+            "INSERT INTO game_analytics (universe_id, ccu, visits) VALUES (810, 120, 900000)"
+        )
+        for uid in (810, 811, 812):
+            conn.execute(
+                "INSERT INTO discovery_queue (universe_id, source, priority, status) "
+                f"VALUES ({uid}, 'atlas_dev', 1, 'pending')"
+            )
+
+    stats = scout.drain_discovery_queue(batches=1)
+    assert stats["duplicates"] == 1 and stats["qualified"] == 1
+
+    with sqlite3.connect(db) as conn:
+        icons = dict(conn.execute(
+            "SELECT universe_id, icon_url FROM game_analytics").fetchall())
+    assert icons[811], "a qualified row needs a thumbnail"
+    assert icons[812], "a hidden (below-gate) row needs one too"
+    assert icons[810], "a provisional row seen as a duplicate needs one too"
+
+
 def test_drain_respects_priority_and_claims_atomically(tmp_path):
     db = str(tmp_path / "t.db")
     scout = ExpansionScout({}, db)
