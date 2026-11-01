@@ -994,19 +994,28 @@ def test_stuck_hidden_row_gets_ce_rescue_not_just_hot_tiers(tmp_path, monkeypatc
     such stuck rows, not hot tiers alone."""
     scout = RobloxPlatformScout(db_path=str(tmp_path / "hidden.db"))
     import sqlite3
+
+    # Timestamps are RELATIVE to now on purpose. The stuck-row gate is a
+    # rolling 21-day window, so a hardcoded date silently flips this test from
+    # green to red exactly 21 days after it was written — that time bomb took
+    # the expander's discovery steps offline on 2026-10-30 and cut the new-game
+    # intake for days. Never pin these to a literal date.
+    now = time.time()
+    stuck_stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 40 * 86400))
+    fresh_stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 2 * 86400))
     with sqlite3.connect(scout.db_path) as conn:
         conn.execute(
             "INSERT INTO game_analytics (universe_id, title, ccu, visits, tier, "
             "last_updated, found_via) VALUES (?, 'Hidden Giant', 2042, 18185603, "
-            "7, '2026-09-03 17:41:05', 'atlas_dev')",
-            (10408282469,),
+            "7, ?, 'atlas_dev')",
+            (10408282469, stuck_stamp),
         )
         # A hot-tier row that Roblox missed too.
         conn.execute(
             "INSERT INTO game_analytics (universe_id, title, ccu, visits, tier, "
             "last_updated, found_via) VALUES (?, 'Hot Miss', 300, 40000, "
-            "2, '2026-10-09 16:00:00', 'atlas_dev')",
-            (99900000001,),
+            "2, ?, 'atlas_dev')",
+            (99900000001, fresh_stamp),
         )
     assert scout._is_stuck_row(10408282469) is True
     assert scout._is_stuck_row(99900000001) is False  # 21-day window not met

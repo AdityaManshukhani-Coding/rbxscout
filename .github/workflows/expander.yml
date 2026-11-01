@@ -112,7 +112,16 @@ jobs:
       - name: Pull catalog from release store
         run: python db_sync.py pull
 
-      - name: Run test suite (protects the catalog from bad pushes)
+      - name: Run test suite (reports red without stalling intake)
+        id: tests
+        # 2026-11-01: this step used to run WITHOUT continue-on-error, so one
+        # red unit test skipped every following step that lacked
+        # `if: always()` — the Atlas harvest and the queue drain among them —
+        # while the always() push still shipped an unchanged catalog. A stale
+        # date-bound assertion quietly zeroed new-game intake for days while
+        # the job only looked "red". Tests now report through the gate at the
+        # end of the job, so a red suite can never stop discovery again.
+        continue-on-error: true
         run: python -m pytest tests -q
 
       # ------------------------------------------------------------------
@@ -140,13 +149,16 @@ jobs:
       # fails loudly (non-zero exit) so the queue stays safe from a direct
       # 403 storm. Exit is gated: set ATLAS_MIN_PROXY_POOL=0 in repo
       # Variables to re-enable direct harvesting as the old fallback.
-      # 2026-10-12: the 1,000/mo free-credit bucket is exhausted locally —
-      # until it tops up, keep ATLAS_MIN_PROXY_POOL unset (fail-loud on the
-      # malformed small-pool path) so a dead-token day cannot silently
-      # zero the discovery queue; the parser now accepts prufer's bare
-      # ip:port pool export (run #722 discarded ALL 191 working proxies).
-      - name: Validate free-proxy pool for Atlas fetches
-        run: python prufer.py > atlas_proxies.txt; test -n "$(cat atlas_proxies.txt)"
+      #
+      # 2026-11-01 SUPERSEDED: atlasdev.gg now 403s the home IP too, so no
+      # free/runner route works and the owned Cloudflare Worker mirror
+      # (cloudflare-worker/, /https://atlasdev.gg/...) is the only route that
+      # still serves listings. scout_core prepends it to the pool by default,
+      # so a dead free-proxy directory (prufer yield 0 through
+      # 2026-10-27..11-01) is a bonus fallback, not a prerequisite.
+      - name: Validate free-proxy pool for Atlas fetches (bonus fallback only)
+        # `|| true`: an empty pool must never skip the harvest again.
+        run: python prufer.py > atlas_proxies.txt || true
 
       - name: Run expander (Atlas harvest + queue drain)
         env:
@@ -160,21 +172,9 @@ jobs:
           RBXSCOUT_SCRAPE_DO_TOKEN: ${{ secrets.SCRAPE_DO_TOKEN || '' }}
         run: |
           POOL=$(grep -c . atlas_proxies.txt || true)
-          echo "validated proxies: ${POOL}"
-          if [ "${POOL}" -ge 20 ]; then
-            export RBXSCOUT_SEARCH_PROXY_URLS="$(paste -sd, atlas_proxies.txt)${RBXSCOUT_SCRAPE_DO_TOKEN:+,https://api.scrape.do?token=${RBXSCOUT_SCRAPE_DO_TOKEN}&url={url}}${RBXSCOUT_SEARCH_PROXY_URLS:+,${RBXSCOUT_SEARCH_PROXY_URLS}}"
-            echo "harvesting via ${POOL} free proxies (Scrape.do = last-resort failover)"
-          elif [ -n "${RBXSCOUT_SCRAPE_DO_TOKEN}" ]; then
-            export RBXSCOUT_SEARCH_PROXY_URLS="https://api.scrape.do?token=${RBXSCOUT_SCRAPE_DO_TOKEN}&url={url},direct"
-            echo "pool too small (${POOL}); harvesting via Scrape.do failover"
-          elif [ "${ATLAS_MIN_PROXY_POOL:-20}" -gt "${POOL}" ]; then
-            echo "proxy pool too small (${POOL}) and NO Scrape.do token — refusing direct harvest (guaranteed 403s on runner IPs)."
-            echo "Set ATLAS_MIN_PROXY_POOL=0 or add SCRAPE_DO_TOKEN to re-enable direct."
-            exit 1
-          else
-            export RBXSCOUT_SEARCH_PROXY_URLS="direct"
-            echo "ATLAS_MIN_PROXY_POOL=0 — harvesting direct as the legacy fallback"
-          fi
+          echo "validated free proxies: ${POOL} (bonus fallback; the owned Cloudflare mirror is the primary Atlas route)"
+          # Effective order: owned mirror -> free proxies -> Scrape.do -> direct.
+          export RBXSCOUT_SEARCH_PROXY_URLS="$(paste -sd, atlas_proxies.txt 2>/dev/null)${RBXSCOUT_SCRAPE_DO_TOKEN:+,https://api.scrape.do?token=${RBXSCOUT_SCRAPE_DO_TOKEN}&url={url}}"
           python live_sync.py --only expander --min-visits 20000 --min-ccu 25
 
       # ------------------------------------------------------------------
@@ -231,3 +231,12 @@ jobs:
       - name: Push catalog to release store
         if: always()
         run: python db_sync.py push
+
+      # Red stays visible without ever stalling intake: the test step above is
+      # continue-on-error, so the run is marked failed HERE, after discovery
+      # and the push have already done their work.
+      - name: Fail the run if the test suite failed
+        if: always() && steps.tests.outcome == 'failure'
+        run: |
+          echo "::error::Test suite failed — discovery and push still ran so intake never stalls, but the code is red. Fix the suite."
+          exit 1

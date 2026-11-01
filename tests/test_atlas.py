@@ -688,11 +688,47 @@ def test_kill_switch_disables_everything(scout, monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
-def test_proxy_pool_direct_by_default(scout, monkeypatch):
-    # CI exports repo Variables (e.g. RBXSCOUT_SEARCH_PROXY_URLS) into the
-    # environment; the default-direct contract must hold without them.
+@pytest.fixture(autouse=True)
+def _isolate_owned_atlas_mirror(monkeypatch):
+    """Keep the pool-parsing contracts below env-only.
+
+    ``_atlas_proxy_pool`` prepends the owned Cloudflare Atlas mirror unless
+    ``RBXSCOUT_ATLAS_MIRROR_URL`` is set (``''`` disables it); mirror ordering
+    has its own tests. Clearing it here keeps every other pool assertion about
+    the operator/free-proxy parsing it was written for.
+    """
+    monkeypatch.setenv(scout_core.ATLAS_MIRROR_URL_ENV, "")
+
+
+def test_proxy_pool_owned_mirror_leads_by_default(scout, monkeypatch):
+    """2026-11-01 outage: atlasdev.gg 403s the home IP and the runner IPs
+    alike, so the owned Cloudflare Worker relay is the only route that works.
+    It must lead the pool by DEFAULT — the old trailing-env-only wiring meant
+    a dead free-proxy day produced a guaranteed-403 wave and zero intake."""
     monkeypatch.delenv("RBXSCOUT_SEARCH_PROXY_URLS", raising=False)
+    monkeypatch.delenv(scout_core.ATLAS_MIRROR_URL_ENV, raising=False)
+    assert scout._atlas_proxy_pool() == [scout_core.ATLAS_MIRROR_URL_DEFAULT, "direct"]
+
+
+def test_proxy_pool_owned_mirror_can_be_disabled(scout, monkeypatch):
+    monkeypatch.delenv("RBXSCOUT_SEARCH_PROXY_URLS", raising=False)
+    monkeypatch.setenv(scout_core.ATLAS_MIRROR_URL_ENV, "")
     assert scout._atlas_proxy_pool() == ["direct"]
+
+
+def test_proxy_pool_mirror_leads_free_pool_and_scrape_do(scout, monkeypatch):
+    """Order contract: owned mirror first (the only working route), then the
+    free pool, then Scrape.do, then direct — a dead proxy ahead of the mirror
+    would cost a backoff sleep on every single page."""
+    monkeypatch.delenv(scout_core.ATLAS_MIRROR_URL_ENV, raising=False)
+    monkeypatch.setenv("RBXSCOUT_SEARCH_PROXY_URLS", "http://10.0.0.1:8080")
+    monkeypatch.setenv("RBXSCOUT_SCRAPE_DO_TOKEN", "tok-123")
+    assert scout._atlas_proxy_pool() == [
+        scout_core.ATLAS_MIRROR_URL_DEFAULT,
+        "http://10.0.0.1:8080",
+        "https://api.scrape.do?token=tok-123&url={url}",
+        "direct",
+    ]
 
 
 def test_proxy_flip_routes_through_pool(scout, monkeypatch):
@@ -870,26 +906,29 @@ def _workflow_policy_test(env, *, expect_routes="", expect_fail=False):
 
 
 def test_workflow_big_pool_harvests_through_proxies():
-    """Pool ≥ 20: the full validated pool routes the harvest; the Scrape.do
-    token (when set) rides as a trailing last-resort failover entry."""
+    """Any validated free pool rides along behind the owned mirror; the
+    Scrape.do token (when set) stays the last-resort failover entry."""
     _workflow_policy_test(
         (200, "tok-123"), expect_routes="api.scrape.do?token=tok-123&url={url}"
     )
 
 
-def test_workflow_tiny_pool_routes_scrape_do():
-    """Pool < 20 with a token: the WHOLE harvest runs through Scrape.do,
-    direct as terminal fallback — no guaranteed-403 direct wave."""
+def test_workflow_tiny_pool_directory_still_harvests():
+    """Pool < 20 with a token: identical route. The harvest no longer
+    branches on pool size — the owned mirror is the primary route and the
+    free pool is only a bonus fallback."""
     _workflow_policy_test(
-        (5, "tok-123"), expect_routes="https://api.scrape.do?token=tok-123&url={url},direct"
+        (5, "tok-123"), expect_routes="api.scrape.do?token=tok-123&url={url}"
     )
 
 
-def test_workflow_tiny_pool_no_token_fails_loud():
-    """2026-10-11 fail-loud policy: a small pool with NO token refuses to
-    run the harvest (exit non-zero) instead of wasting ~100+ guaranteed-403
-    direct requests and possibly a whole discovery day."""
-    _workflow_policy_test((5, ""), expect_fail=True)
+def test_workflow_empty_pool_no_token_still_harvests():
+    """Replaces the 2026-10-11 fail-loud policy. A dead free-proxy directory
+    (prufer yield 0, the 2026-10-27..11-01 outage) must NOT fail the job: the
+    expander always runs, because the owned mirror is the route that actually
+    works. Exiting non-zero here is what silently skipped the intake."""
+    _workflow_policy_test((0, ""), expect_fail=False)
+    _workflow_policy_test((5, ""), expect_fail=False)
 
 
 

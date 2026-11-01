@@ -292,6 +292,19 @@ ATLAS_REQUEST_DELAY_DEFAULT = 3.0   # polite per-request delay (seconds)
 ATLAS_USER_AGENT = "UpScaleScoutingTool/1.0 (Roblox game discovery; contact via repo)"
 ATLAS_PROXY_URLS_ENV = "RBXSCOUT_SEARCH_PROXY_URLS"  # flip-ready: shared pool var
 ATLAS_SCRAPE_DO_TOKEN_ENV = "RBXSCOUT_SCRAPE_DO_TOKEN"  # paid-API failover (Scrape.do)
+# Owned Cloudflare Worker path-mirror (cloudflare-worker/src/index.js relays
+# /https://atlasdev.gg/... through Cloudflare egress). 2026-10-27: atlasdev.gg
+# began 403ing the home IP and the GitHub runner IPs alike — every harvest
+# aborted at page 1 (0 pages, pointers untouched) for five days while this
+# relay kept serving the full listing (verified 2026-11-01: direct 403,
+# mirror 200 with 50 IDs on pages 1 and 2). It had been only a trailing
+# optional env entry, and local runs did not carry it at all, so the intake
+# silently stopped whenever the free-proxy pool died. It is the PRIMARY route
+# now; set RBXSCOUT_ATLAS_MIRROR_URL='' to disable it.
+ATLAS_MIRROR_URL_ENV = "RBXSCOUT_ATLAS_MIRROR_URL"
+ATLAS_MIRROR_URL_DEFAULT = (
+    "https://rbx-search-proxy.thegamingbuddiesarethebest.workers.dev"
+)
 
 
 def _env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -3483,10 +3496,11 @@ class RobloxPlatformScout:
     def _atlas_proxy_pool(self) -> List[str]:
         """Flip-ready proxy pool for Atlas fetches (mirrors _search_proxy_urls).
 
-        Default is direct (robots.txt allows crawling, volume is tiny); if
-        Atlas ever throttles runner IPs, set RBXSCOUT_SEARCH_PROXY_URLS and
-        traffic shifts through the mirrors with zero code change. ``direct``
-        is the terminal entry, exactly like the search pool.
+        The owned Cloudflare Worker mirror leads the pool — atlasdev.gg 403s
+        home and runner IPs alike, and that relay is the only route that
+        serves listings. ``RBXSCOUT_SEARCH_PROXY_URLS`` entries and the
+        Scrape.do template follow as fallbacks. ``direct`` is the terminal
+        entry, exactly like the search pool.
 
         Setting RBXSCOUT_SCRAPE_DO_TOKEN appends the Scrape.do scraping-API
         template (https://api.scrape.do?token=…&url={url}) as a failover
@@ -3539,6 +3553,18 @@ class RobloxPlatformScout:
                     # Token with NO pool: Scrape.do first (the always-on
                     # harvest source), direct last as the terminal fallback.
                     entries.insert(0, template)
+        # Owned relay leads: it is the only route atlasdev.gg does not 403,
+        # and it must be FIRST — every dead free proxy ahead of it costs a
+        # backoff sleep per page. Disable with RBXSCOUT_ATLAS_MIRROR_URL=''
+        # (tests and air-gapped runs).
+        mirror = (
+            os.environ[ATLAS_MIRROR_URL_ENV]
+            if ATLAS_MIRROR_URL_ENV in os.environ
+            else ATLAS_MIRROR_URL_DEFAULT
+        )
+        mirror = (mirror or "").strip().rstrip("/")
+        if mirror and mirror not in entries:
+            entries.insert(0, mirror)
         if "direct" not in entries:
             entries.append("direct")
         return entries
