@@ -1904,6 +1904,7 @@ class RobloxPlatformScout:
         budget_batches: int = HYDRATION_BUDGET_PER_SYNC,
         readmit_stale_hours: float = READMIT_STALE_HOURS_DEFAULT,
         readmit_batches: int = READMIT_BATCHES_DEFAULT,
+        readmit_only: bool = False,
     ) -> Dict[str, Any]:
         """Pick which known games deserve re-hydration this sync.
 
@@ -2030,7 +2031,15 @@ class RobloxPlatformScout:
                 + groups["t3"] + groups["t4"] + groups["t7"]
             )
         )
-        if len(hot_ids) >= cap:
+        if readmit_only:
+            # The expander carries the re-admission rotation as well
+            # (2026-11-11): the 5-minute hydrator dispatch has been dead for
+            # hours at a time, and the bench must not depend on the one
+            # workflow that fails quietly. Bounded and readmit-only.
+            selected = groups["readmit"][
+                : max(0, int(readmit_batches) * int(batch_size))
+            ]
+        elif len(hot_ids) >= cap:
             selected = hot_ids[:cap]
         else:
             room = cap - len(hot_ids)
@@ -4543,6 +4552,18 @@ class RobloxPlatformScout:
             if do_hydrate:
                 schedule = self.load_tier_refresh_ids(
                     sync_number=sync_number, budget_batches=HYDRATION_BUDGET_PER_SYNC
+                )
+            elif do_expand:
+                # Expander-carried re-admission (2026-11-11). The rotation
+                # otherwise rides the hydrator alone, and that workflow's
+                # 5-minute dispatch has been dead for hours at a time (its
+                # last run was 86 minutes old and fired from GitHub's
+                # irregular hourly cron instead of the worker). The expander
+                # dispatches reliably every 10 minutes, so it carries a
+                # bounded readmit-only slice too: the bench clears on either
+                # workflow, and neither is a single point of failure.
+                schedule = self.load_tier_refresh_ids(
+                    sync_number=sync_number, readmit_only=True
                 )
             else:
                 schedule = {"ids": [], "groups": {}, "tier_counts": {}}

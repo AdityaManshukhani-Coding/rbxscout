@@ -1455,6 +1455,28 @@ def test_scheduler_readmits_benched_games(tmp_path):
     assert schedule["groups"]["readmit"] >= 1
 
 
+def test_scheduler_readmit_only_ignores_hot_tiers(tmp_path):
+    """The expander's pass carries ONLY the re-admission slice, so the bench
+    clears even while the 5-minute hydrator dispatch is dead."""
+    db = str(tmp_path / "t.db")
+    scout = RobloxPlatformScout(db_path=db)
+    stale = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 10 * 3600))
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO game_analytics (universe_id, tier, ccu, visits, hidden, last_updated) "
+            "VALUES (911, 1, 4, 30000, 1, ?)", (stale,)
+        )
+        conn.execute(
+            "INSERT INTO game_analytics (universe_id, tier, ccu, visits, hidden, last_updated) "
+            "VALUES (912, 1, 90, 30000, 0, '1970-01-01')"
+        )
+
+    schedule = scout.load_tier_refresh_ids(batch_size=50, readmit_only=True)
+
+    assert schedule["ids"] == [911]        # benched only — no hot-tier spend
+    assert schedule["groups"]["readmit"] == 1
+
+
 def test_scheduler_budget_caps_selection(tmp_path):
     """The scheduler never selects more universes than the per-sync budget
     (batch_size * budget_batches) allows."""
