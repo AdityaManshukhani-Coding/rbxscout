@@ -1410,6 +1410,51 @@ def test_scheduler_per_tier_cadence_and_t8_rotation(tmp_path):
     assert expected_t8.issubset(set(schedule["ids"]))
 
 
+def test_metrics_write_unbenches_a_recovered_game(tmp_path):
+    """2026-11-11: hidden rows are excluded from every tier group, so the bench
+    only drained when an accidental touch revived a game. Writing live metrics
+    must retire the bench the instant the game clears the gate again."""
+    db = str(tmp_path / "t.db")
+    scout = RobloxPlatformScout(db_path=db)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO game_analytics (universe_id, ccu, visits, hidden) "
+            "VALUES (501, 5, 40000, 1)"
+        )
+
+    scout.upsert_metrics_only({501: {"ccu": 40, "visits": 40000}})
+
+    with sqlite3.connect(db) as conn:
+        hidden, ccu = conn.execute(
+            "SELECT hidden, ccu FROM game_analytics WHERE universe_id=501"
+        ).fetchone()
+    assert ccu == 40 and hidden == 0
+
+
+def test_scheduler_readmits_benched_games(tmp_path):
+    """A benched row must come back into the refresh rotation on its own — it
+    used to sit at a median 47h (worst 100h) with no re-check scheduled."""
+    db = str(tmp_path / "t.db")
+    scout = RobloxPlatformScout(db_path=db)
+    stale = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - 10 * 3600))
+    fresh = time.strftime("%Y-%m-%d %H:%M:%S")
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO game_analytics (universe_id, tier, ccu, visits, hidden, last_updated) "
+            "VALUES (901, 1, 4, 30000, 1, ?)", (stale,)
+        )
+        conn.execute(
+            "INSERT INTO game_analytics (universe_id, tier, ccu, visits, hidden, last_updated) "
+            "VALUES (902, 1, 4, 30000, 1, ?)", (fresh,)
+        )
+
+    schedule = scout.load_tier_refresh_ids(batch_size=50, budget_batches=10)
+
+    assert 901 in schedule["ids"]          # stale benched row is re-checked
+    assert 902 not in schedule["ids"]      # freshly checked one is left alone
+    assert schedule["groups"]["readmit"] >= 1
+
+
 def test_scheduler_budget_caps_selection(tmp_path):
     """The scheduler never selects more universes than the per-sync budget
     (batch_size * budget_batches) allows."""

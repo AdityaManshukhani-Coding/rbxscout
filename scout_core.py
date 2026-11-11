@@ -256,6 +256,20 @@ EXPANSION_TARGET_VISITS = 20_000   # strict gate: nothing below target is stored
 EXPANSION_TARGET_CCU = 25
 EXPAND_QUEUE_BATCHES_DEFAULT = 20        # 20 x 50 = 1,000 queued candidates hydrated/run — a full deep-sweep flood (≈10k seeds) clears in ~5 runs instead of 20
 EXPANSION_QUEUE_MAX_ROWS = 2_000_000     # dedup-memory ceiling (trim oldest)
+# Re-admission rotation (2026-11-11). A below-gate row used to be benched for
+# good: hidden rows are EXCLUDED from every tier group ("cost zero budget") and
+# the discovery queue's dedup memory blocked Atlas from re-seeding them, so a
+# recovery only happened if an unrelated sweep touched the row by accident.
+# Measured on the live catalog: benched rows sat a median 47h (oldest 100h)
+# without a re-check while 19.3% of them were above the 25-CCU target at that
+# moment — the dashboard showed 7,635 games against Atlas's 13,437 for the
+# identical filter. Benched rows now ride a bounded rotation of their own, and
+# fresh metrics retire the bench the instant a game clears the gate again.
+READMIT_STALE_HOURS_DEFAULT = 3.0    # re-check a benched row at most this often
+READMIT_BATCHES_DEFAULT = 8          # 8 x 50 = 400 benched re-checks per pass
+READMIT_MIN_BACKLOG = 500            # dead-man switch: below this, silence is fine
+ATLAS_REQUEUE_MAX_DEFAULT = 400      # processed queue rows re-opened per sweep
+ATLAS_REQUEUE_AFTER_HOURS_DEFAULT = 72.0  # ...and only if that verdict is this old
 
 # --------------------------------------------------------------------------- #
 # Atlas Dev seed ingestion (ATLAS_PLAN_REVIEW.md — proven live 2026-09-19).
@@ -1888,6 +1902,8 @@ class RobloxPlatformScout:
         sync_number: Optional[int] = None,
         batch_size: int = 50,
         budget_batches: int = HYDRATION_BUDGET_PER_SYNC,
+        readmit_stale_hours: float = READMIT_STALE_HOURS_DEFAULT,
+        readmit_batches: int = READMIT_BATCHES_DEFAULT,
     ) -> Dict[str, Any]:
         """Pick which known games deserve re-hydration this sync.
 
@@ -1908,8 +1924,10 @@ class RobloxPlatformScout:
         n = int(sync_number if sync_number is not None else self._sync_seq)
         cap = max(0, int(batch_size) * int(budget_batches))
         groups: Dict[str, List[int]] = {
-            "t1_t2": [], "t2": [], "t3": [], "t4": [], "t5": [], "t6": [], "t7": [], "t8": []
+            "t1_t2": [], "t2": [], "t3": [], "t4": [], "t5": [], "t6": [],
+            "t7": [], "t8": [], "readmit": [],
         }
+        readmit_cap = max(0, int(readmit_batches) * int(batch_size))
         counts: Dict[int, int] = {}
         try:
             with self._connect() as conn:
@@ -1972,6 +1990,27 @@ class RobloxPlatformScout:
                     (bucket_count, bucket),
                     "last_updated ASC, universe_id ASC",
                 )
+                # Re-admission rotation (2026-11-11): benched rows are the one
+                # group deliberately EXCLUDED from the tier groups above, which
+                # made the bench a one-way door — a game that dipped under 25
+                # CCU once was re-checked only when an unrelated sweep happened
+                # to touch it (median 47h, worst 100h), while 19.3% of the
+                # bench was above the target the whole time. Bounded and
+                # stalest-first, so the whole bench cycles in ~3h instead of
+                # never, and a recovery un-hides itself on the next re-check.
+                if readmit_cap:
+                    groups["readmit"] = [
+                        int(r[0])
+                        for r in conn.execute(
+                            "SELECT universe_id FROM game_analytics "
+                            "WHERE COALESCE(hidden, 0) = 1 "
+                            "AND COALESCE(removed, 0) = 0 "
+                            "AND COALESCE(last_updated, '1970-01-01') <= ? "
+                            "ORDER BY COALESCE(last_updated, '1970-01-01') ASC, "
+                            "universe_id ASC LIMIT ?",
+                            (_stale(readmit_stale_hours), readmit_cap),
+                        ).fetchall()
+                    ]
         except sqlite3.Error as exc:
             log.debug("tier scheduler failed: %s", exc)
         selected: List[int] = []
@@ -1995,14 +2034,25 @@ class RobloxPlatformScout:
             selected = hot_ids[:cap]
         else:
             room = cap - len(hot_ids)
+            # Re-admission ranks ABOVE the T8 cold rotation: a benched game is
+            # a known target we are hiding from the dashboard, a T8 game is
+            # merely unclassified. Its own cap keeps the cost bounded, and it
+            # is taken before T8 so hot demand can never starve it.
+            take_readmit = groups["readmit"][:room]
+            room -= len(take_readmit)
             leftover: List[int] = []
             for key in ("t8",):
                 leftover.extend(groups[key])
-            selected = hot_ids + list(dict.fromkeys(leftover))[:room]
+            selected = (
+                hot_ids
+                + take_readmit
+                + list(dict.fromkeys(leftover))[: max(0, room)]
+            )
         selected = list(dict.fromkeys(selected))[:cap]
         return {
             "ids": selected,
             "groups": {k: len(v) for k, v in groups.items()},
+            "readmit_due": len(groups["readmit"]),
             "tier_counts": counts,
             "hot_demand": hot_demand,
             "ring_fenced": len(hot_ids) >= cap,
@@ -2049,16 +2099,38 @@ class RobloxPlatformScout:
                         favorites = record.get("favorites")
                         if ccu is None and visits is None and favorites is None:
                             continue
+                        # Gate re-evaluation on fresh metrics (2026-11-11):
+                        # writing live numbers is the one moment the target
+                        # gate can be decided on truth, so it retires the
+                        # bench the instant a game recovers. A live write
+                        # never BENCHES a row (that stays upsert_game's job,
+                        # where the full identity is known) — otherwise one
+                        # quiet sample would hide a healthy game for days,
+                        # which is exactly how the bench grew to 14,973 rows.
+                        # Hidden rows also take the freshness stamp: they are
+                        # excluded from every tier group, so moving their
+                        # last_updated only advances the re-admission rotation
+                        # (ordered last_updated ASC). Visible rows keep their
+                        # tier schedule untouched, as documented.
                         cursor = conn.execute(
                             "UPDATE game_analytics SET "
                             "ccu       = COALESCE(?, game_analytics.ccu), "
                             "visits    = COALESCE(?, game_analytics.visits), "
-                            "favorites = COALESCE(?, game_analytics.favorites) "
+                            "favorites = COALESCE(?, game_analytics.favorites), "
+                            "hidden    = CASE WHEN COALESCE(?, game_analytics.visits, 0) >= ? "
+                            "                  AND COALESCE(?, game_analytics.ccu, 0) >= ? "
+                            "             THEN 0 ELSE COALESCE(game_analytics.hidden, 0) END, "
+                            "last_updated = CASE WHEN COALESCE(game_analytics.hidden, 0) = 1 "
+                            "               THEN CURRENT_TIMESTAMP ELSE game_analytics.last_updated END "
                             "WHERE universe_id = ?",
                             (
                                 int(ccu) if ccu is not None else None,
                                 int(visits) if visits is not None else None,
                                 int(favorites) if favorites is not None else None,
+                                int(visits) if visits is not None else None,
+                                EXPANSION_TARGET_VISITS,
+                                int(ccu) if ccu is not None else None,
+                                EXPANSION_TARGET_CCU,
                                 int(uid),
                             ),
                         )
@@ -3113,7 +3185,12 @@ class RobloxPlatformScout:
     # is ever stored in game_analytics; discards live in discovery_queue)
     # ------------------------------------------------------------------ #
 
-    def _enqueue_discovery(self, items: Iterable[Tuple[int, str, int]]) -> int:
+    def _enqueue_discovery(
+        self,
+        items: Iterable[Tuple[int, str, int]],
+        revive_processed: int = 0,
+        requeue_after_hours: float = ATLAS_REQUEUE_AFTER_HOURS_DEFAULT,
+    ) -> int:
         """Insert or ignore a batch of discovery-queue rows (new games to evaluate).
 
         Each item is (universe_id, source, priority). Dedup is automatic —
@@ -3184,7 +3261,68 @@ class RobloxPlatformScout:
                     inserted = len(rows)
         except sqlite3.Error as exc:
             log.warning("discovery_queue insert failed: %s", exc)
+        # Rolling dedup memory (2026-11-11): a processed ID used to be
+        # remembered FOREVER, so a game Atlas rejected once — below the gate on
+        # the day it was checked — could never be re-seeded even after it grew
+        # into a target. The queue held 42,980 IDs as "processed" with 3
+        # pending while the dashboard showed 7,635 games against Atlas's
+        # 13,437 for the same filter. Atlas lists that game again on every
+        # sweep, so re-open the ones it is still listing, bounded per run and
+        # oldest verdict first.
+        self.last_requeued = 0
+        if revive_processed > 0 and uid_list:
+            self.last_requeued = self._revive_processed_ids(
+                uid_list, int(revive_processed), float(requeue_after_hours)
+            )
         return inserted
+
+    def _revive_processed_ids(
+        self, universe_ids: Iterable[int], limit: int, after_hours: float
+    ) -> int:
+        """Re-open up to ``limit`` already-evaluated queue rows for a re-check.
+
+        Only rows whose last verdict is older than ``after_hours`` are revived,
+        and only for IDs the caller is looking at right now (the Atlas sweep),
+        so the queue can never flood itself from history.
+        """
+        ids = [int(u) for u in universe_ids]
+        if not ids or limit <= 0:
+            return 0
+        cutoff = time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.gmtime(time.time() - after_hours * 3600)
+        )
+        revived = 0
+        try:
+            with self._connect() as conn:
+                for i in range(0, len(ids), 900):
+                    if revived >= limit:
+                        break
+                    chunk = ids[i : i + 900]
+                    marks = ",".join("?" for _ in chunk)
+                    picks = [
+                        int(r[0])
+                        for r in conn.execute(
+                            "SELECT universe_id FROM discovery_queue "
+                            f"WHERE universe_id IN ({marks}) "
+                            "AND status = 'processed' "
+                            "AND COALESCE(evaluated_at, seen_at, '1970-01-01') <= ? "
+                            "ORDER BY COALESCE(evaluated_at, seen_at) ASC LIMIT ?",
+                            (*chunk, cutoff, limit - revived),
+                        ).fetchall()
+                    ]
+                    if not picks:
+                        continue
+                    pmarks = ",".join("?" for _ in picks)
+                    cur = conn.execute(
+                        "UPDATE discovery_queue SET status='pending', outcome=NULL, "
+                        "evaluated_at=NULL, seen_at=CURRENT_TIMESTAMP "
+                        f"WHERE universe_id IN ({pmarks})",
+                        picks,
+                    )
+                    revived += max(0, int(cur.rowcount if cur.rowcount is not None else len(picks)))
+        except sqlite3.Error as exc:
+            log.warning("discovery_queue revive failed: %s", exc)
+        return revived
 
     def _mark_discovery_outcome(self, uid: int, outcome: str) -> None:
         """Record the strict-gate verdict for one queued ID."""
@@ -4046,6 +4184,9 @@ class RobloxPlatformScout:
         stats["enqueued"] = self._enqueue_discovery(
             (uid, "atlas_dev", queue_priority) for uid in harvested
         )
+        # Atlas re-seeds what it still lists: processed rows whose verdict is
+        # stale get one more gate check (bounded, oldest first).
+        stats["requeued"] = int(getattr(self, "last_requeued", 0) or 0)
 
         # ---- commit pointers ONLY after a successful harvest ---------------
         self._set_atlas_pointer("atlas_last_run", now)

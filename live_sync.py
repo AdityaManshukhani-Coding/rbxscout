@@ -40,7 +40,7 @@ from pathlib import Path
 APP_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(APP_DIR))
 
-from scout_core import RobloxPlatformScout  # noqa: E402
+from scout_core import READMIT_MIN_BACKLOG, RobloxPlatformScout  # noqa: E402
 import expansion_pilot  # noqa: E402
 DB_PATH = str(APP_DIR / "rbx_scout.db")
 
@@ -94,6 +94,10 @@ def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float, mode: st
     if counts:
         tiers = " · ".join(f"T{t}: {n:,}" for t, n in sorted(counts.items()))
         print(f"tier distribution : {tiers}")
+    benched_due = sched.get("readmit")
+    if benched_due is not None:
+        print(f"re-admission      : {benched_due:,} benched game(s) re-checked this pass "
+              "(auto-un-hidden the moment they clear 20k visits / 25 CCU again)")
     if scan.get("blowup_watch_count"):
         print(f"🚀 BLOW-UP WATCH  : {scan['blowup_watch_count']} game(s) flagged — New and Upcoming")
     metrics = diag.get("metrics") or {}
@@ -124,6 +128,28 @@ def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float, mode: st
         else:
             print(f"{line} · within cadence×3 ✓")
 
+    # Dead-man switch (2026-11-11): the bench must never become a one-way
+    # door again. The old scheduler excluded hidden rows from every group, so
+    # nothing re-checked them and the visible list drained 9,975 → 7,635 while
+    # every run stayed green. If a hydration pass schedules ZERO re-checks
+    # while the bench is real, the rotation is broken — fail the run instead
+    # of hiding the shrinkage.
+    if mode in ("hydrator", "full"):
+        try:
+            import sqlite3 as _sqlite3
+
+            with _sqlite3.connect(DB_PATH) as conn:
+                bench_backlog = int(conn.execute(
+                    "SELECT COUNT(*) FROM game_analytics "
+                    "WHERE COALESCE(hidden, 0) = 1 AND COALESCE(removed, 0) = 0"
+                ).fetchone()[0])
+            if bench_backlog >= READMIT_MIN_BACKLOG and not (sched.get("readmit") or 0):
+                print(f"re-admission      : ❌ {bench_backlog:,} benched games but NONE "
+                      "scheduled — the re-check rotation is broken")
+                ok = False
+        except Exception as exc:  # telemetry must never mask a sync
+            print(f"re-admission      : check skipped ({exc})")
+
     # Catalog-expansion summary — only on expander runs, where
     # scan['expansion'] is populated.
     expansion = scan.get("expansion") or {}
@@ -135,6 +161,7 @@ def summarize(scout: RobloxPlatformScout, before: dict, elapsed: float, mode: st
         print("-" * 62)
         print(f"atlas dev         : {atlas.get('pages_fetched', 0)} pages · "
               f"{atlas.get('fetched_ids', 0):,} IDs · {atlas.get('enqueued', 0):,} NEW enqueued · "
+              f"{atlas.get('requeued', 0):,} re-opened · "
               f"{atlas.get('provisional_rows', 0)} first-paint rows"
               + ("  · THROTTLED (next window)" if atlas.get("throttled") else "")
               + ("  · ABORTED (retry next run)" if atlas.get("aborted") else ""))

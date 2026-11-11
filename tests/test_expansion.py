@@ -228,6 +228,46 @@ def test_drain_fills_icons_for_hidden_and_provisional_rows(tmp_path):
     assert icons[810], "a provisional row seen as a duplicate needs one too"
 
 
+def test_enqueue_revives_a_stale_processed_verdict(tmp_path):
+    """2026-11-11: the queue's dedup memory used to be permanent, so a game
+    Atlas rejected once (below the gate on the day it was checked) could never
+    be re-seeded even after it grew into a target — 42,980 IDs sat processed
+    with 3 pending while the dashboard showed 7,635 games vs Atlas's 13,437."""
+    db = str(tmp_path / "t.db")
+    scout = ExpansionScout({}, db)
+    old = "2026-01-01 00:00:00"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "INSERT INTO discovery_queue "
+            "(universe_id, source, priority, status, seen_at, evaluated_at) "
+            "VALUES (700, 'atlas_dev', 2, 'processed', ?, ?)", (old, old)
+        )
+
+    inserted = scout._enqueue_discovery(
+        [(700, "atlas_dev", 2)], revive_processed=10, requeue_after_hours=72
+    )
+
+    assert inserted == 0                 # still deduped: never a duplicate row
+    assert scout.last_requeued == 1      # ...but re-opened for one more check
+    with sqlite3.connect(db) as conn:
+        status, outcome = conn.execute(
+            "SELECT status, outcome FROM discovery_queue WHERE universe_id=700"
+        ).fetchone()
+    assert status == "pending" and outcome is None
+
+    # A FRESH verdict is not re-opened — the window protects the API budget.
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE discovery_queue SET status='processed', "
+            "outcome='below_gate_hidden', evaluated_at=CURRENT_TIMESTAMP "
+            "WHERE universe_id=700"
+        )
+    scout._enqueue_discovery(
+        [(700, "atlas_dev", 2)], revive_processed=10, requeue_after_hours=72
+    )
+    assert scout.last_requeued == 0
+
+
 def test_drain_respects_priority_and_claims_atomically(tmp_path):
     db = str(tmp_path / "t.db")
     scout = ExpansionScout({}, db)
