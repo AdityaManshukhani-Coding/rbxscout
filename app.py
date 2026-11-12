@@ -2003,14 +2003,22 @@ def game_cell_html(row: pd.Series) -> str:
     )
 
 
-def discord_cell_html(url) -> str:
-    """One cell: Discord logo + clickable invite, or "No Discord Server".
+def discord_cell_html(url, checked_at=None) -> str:
+    """One cell: invite link, "No Discord Server", or "Not checked yet".
 
-    A bare dash read like a cell still loading, so a real label replaces it
-    (user request): games without a resolved invite say so in plain text.
+    An unchecked game is NOT a confirmed negative (2026-11-12): printing
+    "No Discord Server" for a verdict that was never made is how 865 targets
+    sat invisible behind the Discord filter while the table insisted they had
+    no server. Unknown now says so, and the filter excludes it from both
+    narrowed views instead of quietly filing it under "No".
     """
     url_text = _text(url)
     if not url_text:
+        unchecked = checked_at is None or str(checked_at).strip() in (
+            "", "None", "NaT", "nan", "NaN"
+        )
+        if unchecked:
+            return '<span class="ss-none">Not checked yet</span>'
         return '<span class="ss-none">No Discord Server</span>'
     link = _esc(url_text)
     label = _esc(truncate(url_text, 44))
@@ -2344,7 +2352,7 @@ def render_table(frame: pd.DataFrame) -> None:
             f"<td><span class='ss-genre'>{_esc(_text(row.get('genre'), 'Unknown'))}</span></td>"
             f"<td class='ss-num'>{_num_cell(row.get('visits'))}</td>"
             f"<td class='ss-num'>{_ccu_cell(row.get('ccu'))}</td>"
-            f"<td>{discord_cell_html(row.get('discord_url'))}</td>"
+            f"<td>{discord_cell_html(row.get('discord_url'), row.get('contacts_checked_at'))}</td>"
             f"<td>{copy_cell_html(row)}</td>"
             f"<td>{_potential_cell(row)}</td>"
             f"<td class='ss-num'>{_ccu_cell(row.get('avg_ccu_1d'))}</td>"

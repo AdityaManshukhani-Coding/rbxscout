@@ -1665,11 +1665,16 @@ def test_load_catalog_matches_discord_filter_orders_visits_ascending(tmp_path):
     scout.upsert_game({"universe_id": 4, "title": "No Discord", "ccu": 50, "visits": 5,
                        "has_discord": False, "status": "No Contact Found"})
 
+    # A never-checked game is UNKNOWN, not "no Discord" (2026-11-12): it must
+    # stay out of BOTH narrowed views while still appearing unfiltered.
+    scout.upsert_game({"universe_id": 5, "title": "Unchecked", "ccu": 50, "visits": 500})
+
     df = scout.load_catalog_matches(0, 0, discord=True)
     assert list(df["universe_id"]) == [2, 3, 1]  # ascending visits
 
     complement = scout.load_catalog_matches(0, 0, discord=False)
-    assert list(complement["universe_id"]) == [4]
+    assert list(complement["universe_id"]) == [4]  # confirmed absent only
+    assert 5 in set(scout.load_catalog_matches(0, 0)["universe_id"])
 
 
 def test_load_catalog_matches_no_target_only_observed_games(tmp_path):

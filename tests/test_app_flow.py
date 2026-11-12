@@ -454,11 +454,14 @@ def test_table_column_order_discord_before_averages():
 
 
 def test_missing_discord_says_no_discord_server():
-    """Games without a resolved invite must read 'No Discord Server' —
-    a bare dash looked like a cell still loading."""
+    """A CHECKED game without a resolved invite reads 'No Discord Server';
+    an UNCHECKED one reads 'Not checked yet' (2026-11-12). Unknown is not the
+    same claim as confirmed-absent — conflating them hid 865 dashboard targets
+    from the Discord filter while the table insisted they had no server."""
     frame = _demo_frame()
     frame.loc[0, "discord_url"] = None
     frame.loc[0, "has_discord"] = False
+    frame["contacts_checked_at"] = "2026-11-12 09:00:00"  # every verdict known
     at = _fresh_app()
     at.run()
     at.session_state["onboarding_complete"] = True
@@ -471,6 +474,18 @@ def test_missing_discord_says_no_discord_server():
     assert not at.exception
     table_html = _table_html(at)
     assert "No Discord Server" in table_html
+    assert "Not checked yet" not in table_html
+
+    # The same missing invite, but never checked: honest label, no verdict.
+    unchecked = _demo_frame()
+    unchecked.loc[0, "discord_url"] = None
+    unchecked.loc[0, "has_discord"] = False
+    unchecked["contacts_checked_at"] = None
+    at.session_state["data"] = unchecked
+    at.run()
+
+    assert not at.exception
+    assert "Not checked yet" in _table_html(at)
 
 
 def test_game_url_fallback_uses_discover_not_dead_search_route():

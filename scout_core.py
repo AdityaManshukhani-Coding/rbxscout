@@ -1474,7 +1474,12 @@ class RobloxPlatformScout:
         if discord is True:
             where.append("COALESCE(has_discord, 0) = 1")
         elif discord is False:
-            where.append("COALESCE(has_discord, 0) != 1")
+            # CONFIRMED absent only (2026-11-12). A NULL verdict means the
+            # game was never checked, which is not the same claim as "no
+            # Discord" — treating them alike made the filter a guess and hid
+            # the coverage gap: 865 dashboard targets had never been looked
+            # at while the table presented them as checked negatives.
+            where.append("has_discord = 0")
         if min_visits == 0 and min_ccu == 0:
             # Degenerate "no target" session: only games the pipeline has
             # actually hydrated (every hydration writes a ccu_history

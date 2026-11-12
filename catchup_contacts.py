@@ -305,6 +305,12 @@ def main() -> int:
                              "qualified backlog then the decayed band; a shard "
                              "worker takes a single pool so two accounts can "
                              "split the catalog")
+    parser.add_argument("--fail-if-backlog-over", type=int, default=0,
+                        help="exit non-zero when this many qualified targets "
+                             "still have no verdict after the pass (0 = no guard). "
+                             "The pipeline uses it as a dead-man switch: if the "
+                             "bounded pass stops keeping up, the run goes red "
+                             "instead of silently drifting out of date.")
     parser.add_argument("--reverse", action="store_true",
                         help="walk the pool(s) from the end — lets a shard "
                              "start where the primary will finish, so the two "
@@ -491,6 +497,20 @@ def _run_backfill(args: argparse.Namespace, *, resumed: bool = False) -> int:
         f"{hits:,} with Discord ({hits / max(1, q_total) * 100:.1f}% hit rate)"
     )
     log(f"checked this run: ~{total_checked:,} games · {total_hits:,} new hits")
+
+    # Coverage dead-man switch (2026-11-12): the pipeline runs this script
+    # bounded (100/run) so new games are checked as they are discovered. If
+    # the qualified backlog ever exceeds the allowance, the pass is no longer
+    # keeping up (or every lookup is failing) — fail visibly instead of
+    # letting the dashboard drift behind the catalog for another week.
+    backlog = max(0, q_total - q_checked)
+    if args.fail_if_backlog_over and backlog > args.fail_if_backlog_over:
+        log(
+            f"BACKLOG GUARD: {backlog:,} qualified targets still have no verdict "
+            f"(allowance {args.fail_if_backlog_over:,}) — the contact pass is not "
+            "keeping up, or lookups are failing"
+        )
+        return 4
 
     if args.no_push:
         log("--no-push: catalog stays local")

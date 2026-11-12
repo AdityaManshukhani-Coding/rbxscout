@@ -225,6 +225,25 @@ jobs:
         run: |
           python rotrends_sweep.py || echo "rotrends sweep failed (fail-open; next run continues)"
 
+      # ------------------------------------------------------------------
+      # Discord contact pass (2026-11-12): coverage used to depend on a manual
+      # laptop script, so discovered games entered the catalog with
+      # has_discord NULL and the "Discord available" filter silently excluded
+      # them — measured live: 337 of the 400 targets in the 20k-70k band had
+      # never been checked, which is why the Discord list jumped 20k → 70k.
+      # Bounded and backlog-first: 100 qualified + 100 decayed per run against
+      # an inflow of ~100 new targets a DAY, so it drains a backlog and stays
+      # drained at 6 runs/h. --no-push: the catalog push below ships verdicts.
+      # continue-on-error: a Roblox block must never stall discovery; the
+      # backlog guard is what makes sustained failure visible.
+      # ------------------------------------------------------------------
+      - name: Discord contact pass (bounded, backlog-first)
+        if: always()
+        continue-on-error: true
+        run: >
+          python catchup_contacts.py --limit 100 --pool all --no-pull --no-push
+          --fail-if-backlog-over 500
+
       # One-way door: an expansion pass that evaluated IDs but failed to
       # persist would re-evaluate the same seeds next run (the Atlas cursor
       # only advances after a successful DB write). Fail visibly.
