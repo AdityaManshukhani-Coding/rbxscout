@@ -117,21 +117,20 @@ def _walk_to_message_step(at: AppTest) -> None:
 
 
 def test_increates_templates_shape():
-    """Five rotations, [Game Name] kept, no identity tags. Since the
-    2026-10-15 universal set, BOTH studios share the SAME five starters —
-    the guard is that Increates's alias serves the universal set, not the
-    old deals-pitch wording."""
+    """Five rotations, [Game Name] kept, no identity tags. Both studios
+    share the SAME five starters — the guard is that Increates's alias
+    serves the universal set, not a separate deals-pitch wording."""
     assert INCREASES_MESSAGE_TEMPLATES is DEFAULT_MESSAGE_TEMPLATES
     assert len(INCREASES_MESSAGE_TEMPLATES) == 5
     for template in INCREASES_MESSAGE_TEMPLATES:
         assert "[Game Name]" in template
         assert "🫡" not in template
         assert "[Your Name]" not in template  # lead with enthusiasm, not identity
-        assert template.splitlines()[0].split()[0].rstrip(",") in ("Hey", "Hi", "Hello"), template.splitlines()[0]
+        assert template.splitlines()[0].split()[0].rstrip(",!") in ("Hey", "Hi", "Hello"), template.splitlines()[0]
     # Message 1 is the owner's exact copy (modulo the tag).
     first = INCREASES_MESSAGE_TEMPLATES[0]
-    assert first.startswith("Hey, I really like what you are doing with **[Game Name]**")
-    assert "hearing an offer for it" in first
+    assert first.startswith("Hey, I was wondering if you'd be open to a partnership for **[Game Name]**")
+    assert "temporary revenue split" in first
     # All five differ.
     assert len(set(INCREASES_MESSAGE_TEMPLATES)) == 5
 
@@ -248,10 +247,10 @@ def test_master_copy_pool_follows_active_studio():
     assert "ss-table" in table_html, "results table renders after onboarding"
     assert "data-alts" in table_html, "copy buttons embed the rotation pool"
     # The pool carries the universal starters: every entry names the game
-    # (title filled) and pitches an offer.
+    # (title filled) and names the temporary revenue split.
     import html as html_module
     match = re.search(r'data-alts="([^"]+)"', table_html)
     pool = json.loads(html_module.unescape(match.group(1)))
     assert len(pool) == 5
-    assert all("offer" in entry["t"].lower() for entry in pool)
+    assert all("revenue" in entry["t"].lower() for entry in pool)
     assert all("[Game Name]" not in entry["t"] for entry in pool)

@@ -156,25 +156,49 @@ DISCORD_LOGO_URL = "https://cdn.simpleicons.org/discord/5865F2"
 # but the tags must stay for auto-fill to keep working.
 #
 # Universal outreach starters, shared by every studio (owner request
-# 2026-10-15: one message set instead of the old UpScale/Increates split,
-# in the owner's exact wording). The **[Game Name]** tag is filled in
-# automatically when the user copies a message (game title from the row).
-# The set deliberately carries no [Your Name] tag — these messages lead
-# with enthusiasm, not identity — though render_outreach_message still
-# honors a [Your Name] tag if a scout adds one to a customized template.
-# Five distinct phrasings keep Discord's anti-spam heuristics from seeing
-# one identical message pasted at many servers.
+# 2026-11-15: UpScale's partnership pitch, in the owner's exact wording).
+# The **[Game Name]** tag is filled in automatically when the user copies a
+# message (game title from the row). The set deliberately carries no
+# [Your Name] tag — these messages lead with the game, not identity —
+# though render_outreach_message still honors a [Your Name] tag if a scout
+# adds one to a customized template. Five distinct phrasings keep Discord's
+# anti-spam heuristics from seeing one identical message pasted at many
+# servers.
+#
+# Every variant names the deal plainly (partnership, temporary revenue
+# split, 100% ownership/revenue back to the owner) so the pitch is clear
+# before the owner replies.
 UNIVERSAL_MESSAGE_TEMPLATES = (
     """\
-Hey, I really like what you are doing with **[Game Name]** and I was hoping you are interested in hearing an offer for it""",
+Hey, I was wondering if you'd be open to a partnership for **[Game Name]**?
+
+We can help boost your analytics. We only take a temporary revenue split, and 100% of the ownership stays yours once the term ends.
+
+Thanks so much for your time!""",
     """\
-Hi, I love playing **[Game Name]**, are you down to hear an offer for it?""",
+Hey, quick question, are you open to collaborating on **[Game Name]**?
+
+Our team helps scale games through active LiveOps, new thumbnails, and marketing. We work on a set revenue-split period, then 100% revenue returns right back to you.
+
+Let me know if you'd be interested in chatting!""",
     """\
-Hello, really well done with **[Game Name]**, open to hearing an offer for it?""",
+Hey! Interested in a short-term growth partnership for **[Game Name]**?
+
+We can jump in to revamp thumbnails, run LiveOps, and discuss scaling strategies. We take a temporary split on game revenue during the deal, with 0 permanent ownership transfer.
+
+Looking to hear back from you!""",
     """\
-Hey **[Game Name]** looks awesome, are you open to talk about an offer for it?""",
+Hey, love what you've built with **[Game Name]**! Open to partnering up to grow it?
+
+We handle things like LiveOps, thumbnails, and scaling strategies. It's just a simple revenue share for a fixed duration, after which 100% returns back to you completely.
+
+Hope to hear from you soon!""",
     """\
-Hi, love what you've done with **[Game Name]** and I wanted to see if you're open to offers?""",
+Hey, are you open to a quick partnership deal for **[Game Name]**?
+
+We can provide hands-on help with scaling strategies, thumbnails, and LiveOps. We take a revenue share for a limited timeframe, and 100% revenue goes straight back to you after.
+
+Thanks so much for your time!""",
 )
 
 # The studio-agnostic set the whole app reads.

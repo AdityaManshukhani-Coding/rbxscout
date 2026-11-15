@@ -114,9 +114,8 @@ def test_render_fills_name_and_game_tags():
     assert "**Blox Fruits**" in message
     assert "[Game Name]" not in message
     assert "dev_razor10" not in message  # no name tag to fill
-    assert message == (
-        "Hey, I really like what you are doing with **Blox Fruits** "
-        "and I was hoping you are interested in hearing an offer for it"
+    assert message.startswith(
+        "Hey, I was wondering if you'd be open to a partnership for **Blox Fruits**?"
     )
 
 
@@ -137,25 +136,25 @@ def test_render_case_insensitive_tags():
 
 def test_render_empty_template_falls_back_to_default():
     message = render_outreach_message("   ", "ace", "Speed Run")
-    # Universal templates (2026-10-15): no [Your Name] tag — the fallback is
+    # Universal templates (2026-11-15): no [Your Name] tag — the fallback is
     # the owner's exact wording with the game name filled in.
     assert "Speed Run" in message
-    assert "I really like what you are doing with **Speed Run**" in message
+    assert "open to a partnership for **Speed Run**" in message
     assert "ace" not in message  # no name tag to fill
 
 
 def test_default_templates_open_with_plain_greeting():
-    """(2026-09-28, updated 2026-10-15) The [User] placeholder is gone and
+    """(2026-09-28, updated 2026-11-15) The [User] placeholder is gone and
     each of the 5 universal starters opens with a greeting word, keeps the
-    【Game Name】 tag for auto-fill, and mentions an offer — no studio
+    [Game Name] tag for auto-fill, and pitches a partnership — no studio
     name, no identity tag in any of them."""
     for template in DEFAULT_MESSAGE_TEMPLATES:
         assert "[User]" not in template
         assert "UpScale" not in template and "Increates" not in template
         assert "[Your Name]" not in template
         assert "[Game Name]" in template, template
-        assert "offer" in template.lower(), template
-        assert template.splitlines()[0].split()[0].rstrip(",") in ("Hey", "Hi", "Hello"), template.splitlines()[0]
+        assert "revenue" in template.lower(), template
+        assert template.splitlines()[0].split()[0].rstrip(",!") in ("Hey", "Hi", "Hello"), template.splitlines()[0]
 
 
 def _tagged_template():
@@ -592,7 +591,7 @@ def test_copy_button_rotates_all_variants_never_repeating():
         assert "Blox Fruits" in text
         assert "[Game Name]" not in text
         assert "[Your Name]" not in text
-        assert "offer" in text.lower()
+        assert "revenue" in text.lower()
 
     # The client script does the no-repeat pick in localStorage.
     scripts = re.findall(r"<script>(.*?)</script>", table_html, re.S)
